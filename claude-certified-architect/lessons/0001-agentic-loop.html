@@ -491,61 +491,145 @@ flowchart LR
   <!-- ── Python exercises ── -->
   <h2>Python Exercises</h2>
 
-  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
     Three exercises, each with a broken <code>problem.py</code> and a working <code>solution.py</code>.
-    Run the problem version first — observe it fail — then read the solution to understand why.
+    Click an exercise, toggle between problem and solution, then run it locally.
   </p>
 
-  <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem;">
-    <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1em 1.2em; margin-bottom: 0.8em;">
-      <strong>Setup</strong><br>
-      <code>pip install anthropic</code><br>
-      <code>export ANTHROPIC_API_KEY="your-key"</code><br>
-      <code style="color: var(--muted); font-size: 0.8rem;">cd exercises/lesson-01-agentic-loop/</code>
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>pip install anthropic</code> &nbsp;·&nbsp;
+    <code>export ANTHROPIC_API_KEY="sk-…"</code>
+  </div>
+
+  <!-- Exercise viewer -->
+  <div id="ex-viewer" style="border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+
+    <!-- Exercise tabs -->
+    <div style="display:flex; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="ex-tab ex-tab-active" data-ex="01-fix-the-loop"
+        title="stop_reason termination anti-pattern">
+        01 — Fix the loop
+      </button>
+      <button class="ex-tab" data-ex="02-pretooluse-hook"
+        title="PreToolUse gate — Official Sample Q1">
+        02 — PreToolUse hook
+      </button>
+      <button class="ex-tab" data-ex="03-stop-reason-handler"
+        title="Handle all 4 stop_reason values">
+        03 — All stop_reasons
+      </button>
     </div>
+
+    <!-- Exercise description bar -->
+    <div id="ex-desc" style="padding: 0.6em 1em; background: #fffdf5; border-bottom: 1px solid var(--border); font-size: 0.82rem; color: var(--muted);"></div>
+
+    <!-- Problem / Solution toggle -->
+    <div style="display:flex; align-items:center; gap:0.5em; padding: 0.5em 1em; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="file-toggle file-toggle-active" data-file="problem" style="font-size:0.8rem;">problem.py</button>
+      <button class="file-toggle" data-file="solution" style="font-size:0.8rem;">solution.py</button>
+      <span id="ex-copy-btn"
+        style="margin-left:auto; cursor:pointer; font-size:0.78rem; color: var(--elephant); user-select:none;"
+        title="Copy to clipboard">⎘ copy</span>
+    </div>
+
+    <!-- Code display -->
+    <div style="position:relative; max-height: 520px; overflow-y: auto;">
+      <pre id="ex-code" style="margin:0; padding: 1em 1.2em; font-size: 0.8rem; line-height: 1.6; background: #1e1e2e; color: #cdd6f4; overflow-x: auto; white-space: pre;"><code id="ex-code-inner">Loading…</code></pre>
+    </div>
+
+    <!-- Status bar -->
+    <div id="ex-status" style="padding: 0.4em 1em; background: var(--code-bg); border-top: 1px solid var(--border); font-size: 0.76rem; color: var(--muted);"></div>
   </div>
 
-  <table>
-    <thead>
-      <tr><th>#</th><th>Exercise</th><th>Anti-pattern it fixes</th><th>Exam concept</th></tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>01</td>
-        <td>
-          <strong>Fix the broken loop</strong><br>
-          <code style="font-size:0.78rem;">01-fix-the-loop/problem.py</code>
-        </td>
-        <td>Text-matching termination (<code>if "Task complete" in response</code>)</td>
-        <td>stop_reason is the only reliable exit signal</td>
-      </tr>
-      <tr>
-        <td>02</td>
-        <td>
-          <strong>PreToolUse hook</strong><br>
-          <code style="font-size:0.78rem;">02-pretooluse-hook/problem.py</code>
-        </td>
-        <td>Relying on system prompt to enforce tool ordering</td>
-        <td>Official Sample Q1 — programmatic gate = 100% deterministic</td>
-      </tr>
-      <tr>
-        <td>03</td>
-        <td>
-          <strong>Handle all four stop_reasons</strong><br>
-          <code style="font-size:0.78rem;">03-stop-reason-handler/problem.py</code>
-        </td>
-        <td>Silently returning truncated text on max_tokens</td>
-        <td>max_tokens ≠ end_turn — different required action</td>
-      </tr>
-    </tbody>
-  </table>
+  <style>
+    .ex-tab {
+      flex: 1; padding: 0.65em 0.5em; font-size: 0.8rem; font-weight: 600;
+      border: none; border-right: 1px solid var(--border); background: transparent;
+      cursor: pointer; color: var(--muted); transition: background 0.1s;
+    }
+    .ex-tab:last-child { border-right: none; }
+    .ex-tab:hover { background: #eee; color: var(--text); }
+    .ex-tab-active { background: #fff; color: var(--elephant); border-bottom: 2px solid var(--elephant); }
+    .file-toggle {
+      padding: 0.3em 0.8em; font-size: 0.8rem; font-weight: 600;
+      border: 1px solid var(--border); border-radius: 4px; background: transparent;
+      cursor: pointer; color: var(--muted);
+    }
+    .file-toggle:hover { background: #e8f0fe; color: var(--elephant); }
+    .file-toggle-active { background: var(--elephant); color: #fff; border-color: var(--elephant); }
+  </style>
 
-  <div class="callout warning" style="margin-top: 1em;">
-    <div class="label">Git location</div>
-    Exercises are version-controlled at:<br>
-    <code>tutorials/claude-certified-architect/exercises/lesson-01-agentic-loop/</code><br>
-    Each exercise has its own <code>README.md</code> explaining the bug and the exam connection.
-  </div>
+  <script>
+  (function () {
+    const BASE = '../exercises/lesson-01-agentic-loop/';
+    const descriptions = {
+      '01-fix-the-loop':
+        'BUG: loop exits on "Task complete" text match — sometimes hangs forever. FIX: use stop_reason == "end_turn".',
+      '02-pretooluse-hook':
+        'BUG: process_refund fires without identity verification. FIX: programmatic PreToolUse gate. Mirrors Official Sample Q1.',
+      '03-stop-reason-handler':
+        'BUG: max_tokens silently returns truncated text as if complete. FIX: handle all 4 stop_reason values with correct actions.',
+    };
+
+    let currentEx   = '01-fix-the-loop';
+    let currentFile = 'problem';
+
+    function setStatus(msg) {
+      document.getElementById('ex-status').textContent = msg;
+    }
+
+    async function loadFile() {
+      const path = `${BASE}${currentEx}/${currentFile}.py`;
+      setStatus(`Loading ${path}…`);
+      try {
+        const r = await fetch(path);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        document.getElementById('ex-code-inner').textContent = text;
+        setStatus(`${path}  ·  ${text.split('\n').length} lines  ·  ${(text.length / 1024).toFixed(1)} KB`);
+      } catch (e) {
+        document.getElementById('ex-code-inner').textContent = `Could not load file: ${e.message}`;
+        setStatus('Error loading file');
+      }
+    }
+
+    // Exercise tab clicks
+    document.querySelectorAll('.ex-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.ex-tab').forEach(b => b.classList.remove('ex-tab-active'));
+        btn.classList.add('ex-tab-active');
+        currentEx = btn.dataset.ex;
+        document.getElementById('ex-desc').textContent = descriptions[currentEx] || '';
+        loadFile();
+      });
+    });
+
+    // Problem / Solution toggle
+    document.querySelectorAll('.file-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        btn.classList.add('file-toggle-active');
+        currentFile = btn.dataset.file;
+        loadFile();
+      });
+    });
+
+    // Copy button
+    document.getElementById('ex-copy-btn').addEventListener('click', () => {
+      const text = document.getElementById('ex-code-inner').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('ex-copy-btn');
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = '⎘ copy'; }, 1500);
+      });
+    });
+
+    // Initial description + load
+    document.getElementById('ex-desc').textContent = descriptions[currentEx];
+    loadFile();
+  })();
+  </script>
 
   <!-- ── What's next ── -->
   <h2>What's next</h2>
