@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 6: pgx v5 — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 6</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="0005-concurrency.html">← Lesson 5</a></span>
+  </div>
+
+  <h1>pgx v5 — The Right Driver for a Scanner</h1>
+
+  <p>
+    The previous lessons built a working scanner using Go's standard <code>database/sql</code>
+    package. It connects, queries, and processes results — but at 3,000 concurrent targets the
+    seams show: <code>rows.Scan()</code> demands compile-time column knowledge, DSN string
+    construction is brittle, and a failed connection returns a plain <code>error</code> that
+    tells you nothing about <em>why</em> it failed. This lesson migrates the scanner to
+    <strong>pgx v5</strong> — a PostgreSQL-native Go driver that solves all three problems.
+  </p>
+
+  <!-- ── 1. Why database/sql fails ── -->
+  <h2>1. Why database/sql Is Not the Right Tool for a Scanner</h2>
+
+  <p>
+    <code>database/sql</code> was designed for long-lived applications with stable schemas and
+    persistent connection pools. A scanner has neither: it opens a single connection per target,
+    runs TOML-driven queries whose columns change between deployments, and must classify
+    connection failures precisely. Four specific mismatches make it the wrong tool:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Pool-first design.</strong> <code>sql.Open()</code> creates a <em>connection pool</em>,
+      not a single connection. Pool internals manage reconnection logic a scanner never needs and
+      cannot control cleanly.
+    </li>
+    <li>
+      <strong><code>rows.Scan()</code> requires compile-time knowledge.</strong> You must declare
+      destination variables whose types match the query columns exactly — impossible when a TOML
+      file can add or remove columns between deployments.
+    </li>
+    <li>
+      <strong>No clean GUC path.</strong> Setting <code>statement_timeout</code> or
+      <code>application_name</code> requires appending query parameters to the DSN string or
+      sending <code>SET</code> commands after connecting — both fragile at scale.
+    </li>
+    <li>
+      <strong>Opaque error types.</strong> <code>database/sql</code> returns a plain
+      <code>error</code>. You cannot tell whether the server refused the connection, rejected
+      the password, or hit a timeout without parsing the error message string — which changes
+      between PostgreSQL versions.
+    </li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="label">The Scan() Problem</div>
+    Every TOML query you add is a compile-time contract. Change a column and the scanner breaks:
+    <pre><code><span class="cm">// database/sql — must know columns at compile time</span>
+<span class="kw">var</span> count   <span class="nm">int</span>
+<span class="kw">var</span> maxConn <span class="nm">int</span>
+rows.<span class="fn">Scan</span>(&amp;count, &amp;maxConn) <span class="cm">// breaks if query adds or removes a column</span></code></pre>
+    A TOML-driven scanner cannot predict its columns at compile time. <code>database/sql</code>
+    has no answer to this.
+  </div>
+
+  <!-- ── Mermaid: side-by-side comparison ── -->
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant App as Scanner
+    participant SQL as database/sql
+    participant PGX as pgx v5
+    participant DB as PostgreSQL
+
+    Note over App,DB: Path A - database/sql
+    App->>SQL: sql.Open(driver, dsn_string)
+    SQL->>DB: TCP connect
+    App->>SQL: db.QueryContext(ctx, query)
+    SQL->>DB: query
+    DB-->>SQL: rows
+    App->>SQL: rows.Scan(dest_a, dest_b, dest_c)
+    Note over SQL: column types must be declared at compile time
+
+    Note over App,DB: Path B - pgx v5
+    App->>PGX: pgx.ParseConfig("") + struct fields
+    PGX->>DB: TCP connect + SET GUCs via RuntimeParams
+    App->>PGX: conn.Query(ctx, query)
+    PGX->>DB: query
+    DB-->>PGX: rows
+    App->>PGX: rows.Values() returns []any
+    Note over PGX: any columns - TOML queries work
+    </div>
+    <div class="diagram-caption">database/sql requires compile-time column declarations and DSN string construction; pgx v5 returns <code>[]any</code> and delivers GUCs via struct fields before the first query</div>
+  </div>
+
+  <!-- ── 2. pgx v5 advantages ── -->
+  <h2>2. pgx v5 — What It Gives the Scanner</h2>
+
+  <p>
+    pgx v5 is a pure-Go PostgreSQL driver that speaks the wire protocol directly — no
+    <code>cgo</code>, no C library. For a scanner, four features matter:
+  </p>
+
+  <table>
+    <thead><tr><th>Feature</th><th>pgx v5 API</th><th>What it solves</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Dynamic columns</strong></td>
+        <td><code>rows.Values()</code> → <code>[]any</code></td>
+        <td>Reads any result set without declaring destination variables</td>
+      </tr>
+      <tr>
+        <td><strong>Typed server errors</strong></td>
+        <td><code>*pgconn.PgError</code></td>
+        <td>Server errors carry <code>.Code</code>, <code>.Message</code>, <code>.Detail</code>, <code>.Hint</code></td>
+      </tr>
+      <tr>
+        <td><strong>Struct-based config</strong></td>
+        <td><code>pgx.ConnectConfig()</code></td>
+        <td>Set host, port, user, password, timeout as typed fields — no DSN string to construct</td>
+      </tr>
+      <tr>
+        <td><strong>GUC injection</strong></td>
+        <td><code>config.RuntimeParams</code></td>
+        <td>Sends <code>SET</code> commands before the first query — guaranteed GUC delivery</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── 3. ConnectConfig pattern ── -->
+  <h2>3. ConnectConfig — The Scanner's Connect Function</h2>
+
+  <p>
+    The pgx connect pattern replaces every DSN string with a typed struct. All connection
+    parameters — including the GUCs that protect the target server from runaway queries —
+    are set before the connection is made:
+  </p>
+
+  <pre><code><span class="kw">import</span> (
+    <span class="st">"github.com/jackc/pgx/v5"</span>
+    <span class="st">"github.com/jackc/pgx/v5/pgconn"</span>
+)
+
+<span class="kw">func</span> <span class="fn">connectSafe</span>(ctx context.Context, s Server) (*pgx.Conn, <span class="nm">error</span>) {
+    config, err := pgx.<span class="fn">ParseConfig</span>(<span class="st">""</span>) <span class="cm">// start from an empty config</span>
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return nil</span>, err
+    }
+    config.Host           = s.Host
+    config.Port           = <span class="nm">uint16</span>(s.Port)
+    config.User           = <span class="st">"pg_monitor"</span>
+    config.Password       = s.Password
+    config.Database       = <span class="st">"postgres"</span>
+    config.ConnectTimeout = <span class="nm">5</span> * time.Second
+    config.RuntimeParams  = <span class="kw">map</span>[<span class="nm">string</span>]<span class="nm">string</span>{
+        <span class="st">"statement_timeout"</span>:                  <span class="st">"5000"</span>, <span class="cm">// ms</span>
+        <span class="st">"lock_timeout"</span>:                       <span class="st">"1000"</span>, <span class="cm">// ms</span>
+        <span class="st">"application_name"</span>:                   <span class="st">"health-scanner"</span>,
+        <span class="st">"idle_in_transaction_session_timeout"</span>: <span class="st">"5000"</span>,
+    }
+    <span class="kw">return</span> pgx.<span class="fn">ConnectConfig</span>(ctx, config)
+}</code></pre>
+
+  <p>
+    <code>pgx.ParseConfig("")</code> returns a default <code>pgx.Config</code> struct rather than
+    parsing a DSN. Setting fields explicitly — instead of string-encoding them into a DSN — means
+    no quoting bugs, no URL encoding issues, and no risk of a password containing <code>@</code>
+    or <code>/</code> breaking the parser. The function returns a live <code>*pgx.Conn</code>
+    (a single connection, not a pool) ready to query.
+  </p>
+
+  <div class="callout info">
+    <div class="label">What RuntimeParams Does</div>
+    Each key-value pair in <code>config.RuntimeParams</code> becomes a
+    <code>SET key = value</code> command sent to PostgreSQL immediately after the connection
+    is established, as part of the startup handshake. The server enforces these GUCs for the
+    lifetime of that connection. <code>statement_timeout = 5000</code> means every query on
+    that connection will be cancelled by the server if it runs longer than 5 seconds —
+    protecting 3,000 target servers from a scanner query that accidentally touches a
+    100-million-row table.
+  </div>
+
+  <!-- ── 4. rows.Values() ── -->
+  <h2>4. rows.Values() — The Scanner's Core Pattern</h2>
+
+  <p>
+    The function below replaces every type-specific <code>rows.Scan()</code> call. It runs any
+    SQL query, reads any columns, and returns the result as a slice of maps — ready to be
+    serialised to JSON or evaluated by the alerting layer:
+  </p>
+
+  <pre><code><span class="kw">func</span> <span class="fn">runQuery</span>(ctx context.Context, conn *pgx.Conn, sql <span class="nm">string</span>) ([]<span class="kw">map</span>[<span class="nm">string</span>]<span class="nm">any</span>, <span class="nm">error</span>) {
+    rows, err := conn.<span class="fn">Query</span>(ctx, sql)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        <span class="kw">return nil</span>, err
+    }
+    <span class="kw">defer</span> rows.<span class="fn">Close</span>()
+
+    cols := rows.<span class="fn">FieldDescriptions</span>() <span class="cm">// []pgconn.FieldDescription — one entry per SELECT column</span>
+
+    <span class="kw">var</span> results []<span class="kw">map</span>[<span class="nm">string</span>]<span class="nm">any</span>
+    <span class="kw">for</span> rows.<span class="fn">Next</span>() {
+        vals, err := rows.<span class="fn">Values</span>()
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            <span class="kw">return nil</span>, err
+        }
+        row := <span class="fn">make</span>(<span class="kw">map</span>[<span class="nm">string</span>]<span class="nm">any</span>, <span class="fn">len</span>(cols))
+        <span class="kw">for</span> i, col := <span class="kw">range</span> cols {
+            row[<span class="nm">string</span>(col.Name)] = vals[i]
+        }
+        results = <span class="fn">append</span>(results, row)
+    }
+    <span class="kw">return</span> results, rows.<span class="fn">Err</span>()
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">The Core Insight</div>
+    <code>rows.Values()</code> is the reason to use pgx. It decouples your scanner from column
+    definitions — any TOML query, any server, any PostgreSQL version. The i-th entry in
+    the <code>[]any</code> slice corresponds to the i-th <code>pgconn.FieldDescription</code>
+    returned by <code>rows.FieldDescriptions()</code>, so you always know which value maps
+    to which column name without declaring a single destination variable.
+  </div>
+
+  <!-- ── 5. Error classification ── -->
+  <h2>5. Error Classification with pgx</h2>
+
+  <p>
+    When a connect or query call fails, the scanner needs to know <em>why</em>. A retry makes
+    sense for a transient network blip but not for a wrong password. pgx surfaces server-side
+    failures as a typed <code>*pgconn.PgError</code> value that carries the full SQLSTATE code:
+  </p>
+
+  <pre><code><span class="kw">import</span> <span class="st">"errors"</span>
+<span class="kw">import</span> <span class="st">"github.com/jackc/pgx/v5/pgconn"</span>
+
+<span class="kw">func</span> <span class="fn">classifyErr</span>(err <span class="nm">error</span>) <span class="nm">string</span> {
+    <span class="kw">if</span> err == <span class="kw">nil</span> {
+        <span class="kw">return</span> <span class="st">"ok"</span>
+    }
+    <span class="kw">var</span> pgErr *pgconn.PgError
+    <span class="kw">if</span> errors.<span class="fn">As</span>(err, &amp;pgErr) {
+        <span class="kw">switch</span> pgErr.Code {
+        <span class="kw">case</span> <span class="st">"28000"</span>, <span class="st">"28P01"</span>: <span class="kw">return</span> <span class="st">"auth_failure"</span>    <span class="cm">// invalid_authorization_specification</span>
+        <span class="kw">case</span> <span class="st">"3D000"</span>:           <span class="kw">return</span> <span class="st">"db_not_found"</span>    <span class="cm">// invalid_catalog_name</span>
+        <span class="kw">case</span> <span class="st">"57014"</span>:           <span class="kw">return</span> <span class="st">"query_cancelled"</span> <span class="cm">// query_canceled — statement_timeout fired</span>
+        <span class="kw">case</span> <span class="st">"55P03"</span>:           <span class="kw">return</span> <span class="st">"lock_timeout"</span>
+        }
+        <span class="kw">return</span> <span class="st">"pg_error:"</span> + pgErr.Code
+    }
+    <span class="kw">if</span> errors.<span class="fn">Is</span>(err, context.DeadlineExceeded) {
+        <span class="kw">return</span> <span class="st">"connect_timeout"</span>
+    }
+    <span class="kw">return</span> <span class="st">"network_error"</span>
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">SQLSTATE Codes</div>
+    Every PostgreSQL error carries a 5-character SQLSTATE code. The first two characters identify
+    the <em>class</em>: <code>28</code> = authorisation failure, <code>3D</code> = invalid
+    catalog name, <code>57</code> = operator intervention, <code>55</code> = object not in
+    prerequisite state. The full table of codes is in the
+    <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" target="_blank">PostgreSQL documentation appendix</a>.
+    Note that SQLSTATE <code>57014</code> is officially named <code>query_canceled</code>
+    (US spelling, single-l) — this is what fires when <code>statement_timeout</code> expires.
+    The PostgreSQL server cancels the query; pgx surfaces it as a <code>*pgconn.PgError</code>
+    with <code>.Code == "57014"</code>.
+  </div>
+
+  <p>
+    <code>errors.As(err, &amp;pgErr)</code> unwraps the error chain looking for a
+    <code>*pgconn.PgError</code>. If found, the server returned a structured protocol-level
+    error and the SQLSTATE code is available. If not, the failure happened at the network
+    layer — TCP refused, TLS handshake failed, context deadline exceeded — and no SQLSTATE
+    exists. The two branches require completely different scanner responses.
+  </p>
+
+  <!-- ── 6. Migration path ── -->
+  <h2>6. Migration Path from database/sql</h2>
+
+  <p>Migrating an existing scanner is a mechanical 5-step process:</p>
+
+  <ol>
+    <li>
+      <strong>Add the dependency.</strong>
+      <pre><code>go get github.com/jackc/pgx/v5</code></pre>
+    </li>
+    <li>
+      <strong>Replace the connect call.</strong> Swap <code>sql.Open("postgres", dsn)</code>
+      with the <code>connectSafe</code> function from Section 3. Delete the DSN string.
+    </li>
+    <li>
+      <strong>Replace the query call.</strong> Swap <code>db.QueryContext(ctx, sql)</code>
+      with <code>conn.Query(ctx, sql)</code>. The method signatures are similar; the return
+      type changes from <code>*sql.Rows</code> to <code>pgx.Rows</code>.
+    </li>
+    <li>
+      <strong>Replace <code>rows.Scan()</code>.</strong> Delete all destination variable
+      declarations. Replace <code>rows.Scan(&amp;a, &amp;b, &amp;c)</code> with the
+      <code>rows.Values()</code> + map construction pattern from Section 4.
+    </li>
+    <li>
+      <strong>Clean up the import side-effect.</strong> Remove
+      <code>_ "github.com/lib/pq"</code> or any other blank import used to register a
+      <code>database/sql</code> driver. pgx does not use the driver-registration pattern —
+      import it directly and call its functions.
+    </li>
+  </ol>
+
+  <p>
+    The resulting scanner is simpler: fewer types, no DSN string construction, and connection
+    failures that carry enough information to route into the right error bucket without
+    string parsing.
+  </p>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <a href="https://pkg.go.dev/github.com/jackc/pgx/v5" target="_blank">
+      <strong>pgx v5 package documentation — pkg.go.dev</strong>
+    </a> — Full API reference for <code>pgx.Conn</code>, <code>Rows</code>,
+    <code>ConnectConfig</code>, and the <code>pgconn</code> sub-package including
+    <code>PgError</code>.
+    <br><br>
+    <a href="https://github.com/jackc/pgx/wiki/Getting-started-with-pgx" target="_blank">
+      <strong>Getting Started with pgx — GitHub Wiki</strong>
+    </a> — Covers the connect-config pattern, row scanning, the pgx v5 type system,
+    and migration from <code>database/sql</code> in depth.
+    <br><br>
+    <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" target="_blank">
+      <strong>PostgreSQL Error Codes Appendix — postgresql.org</strong>
+    </a> — The authoritative list of every SQLSTATE code, with class descriptions and
+    the canonical symbol name for each code.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+  <ul>
+    <li><code>database/sql</code>'s <code>rows.Scan()</code> requires compile-time column declarations — incompatible with TOML-driven queries whose columns change between deployments</li>
+    <li><code>pgx.ParseConfig("")</code> plus struct fields replaces DSN string construction entirely; <code>config.RuntimeParams</code> delivers GUCs to the server via the startup handshake</li>
+    <li><code>rows.Values()</code> returns <code>[]any</code>; paired with <code>rows.FieldDescriptions()</code>, it reads any result set without a single destination variable declaration</li>
+    <li><code>*pgconn.PgError</code> carries the SQLSTATE code, making error classification exact: auth failure vs. query timeout vs. missing database vs. network error</li>
+    <li>SQLSTATE <code>57014</code> (<code>query_canceled</code>, US spelling) fires when <code>statement_timeout</code> expires — the server enforced the GUC you set in <code>RuntimeParams</code></li>
+    <li>Migration is mechanical: <code>sql.Open</code> → <code>pgx.ConnectConfig</code>, <code>db.QueryContext</code> → <code>conn.Query</code>, <code>rows.Scan</code> → <code>rows.Values()</code></li>
+  </ul>
+
+  <!-- ── Course Complete ── -->
+  <div class="callout key">
+    <div class="label">Course Complete — PostgreSQL for Scanner Builders</div>
+    You have covered all six lessons. Here is the full picture in six lines:
+    <ul>
+      <li><strong>Lesson 1:</strong> A PostgreSQL connection is a process-level OS resource — <code>max_connections</code> is the hard limit and your scanner must stay well below it per target server</li>
+      <li><strong>Lesson 2:</strong> <code>pg_stat_activity</code> exposes live connection state — use it to detect saturation, idle-in-transaction sessions, and long-running queries in one pass</li>
+      <li><strong>Lesson 3:</strong> One replication query works on any server role; vacuum health via <code>n_dead_tup</code> catches the slow silent accumulation before it becomes a crisis</li>
+      <li><strong>Lesson 4:</strong> Classify every failure by type at connect time — auth failure, timeout, and network error require different responses and must never be lumped together</li>
+      <li><strong>Lesson 5:</strong> A semaphore-bounded goroutine-per-server pattern fans out to 3,000 concurrent targets safely without overwhelming individual servers or the scanner host</li>
+      <li><strong>Lesson 6:</strong> pgx v5 is the right driver — <code>rows.Values()</code> decouples the scanner from column definitions and <code>*pgconn.PgError</code> makes every failure observable</li>
+    </ul>
+  </div>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Why can't database/sql's rows.Scan() work with TOML-driven queries?"
+         data-correct="B"
+         data-feedback-correct="Correct. rows.Scan() requires pointers to pre-declared variables whose types match the query columns exactly. A TOML-driven scanner can't know those columns at compile time — they change between deployments."
+         data-feedback-wrong="Not quite. database/sql works fine with PostgreSQL. The problem is that rows.Scan() requires pre-declared destination variables — impossible when column types are unknown at compile time.">
+      <div class="quiz-option" data-key="A">Scan() only works with prepared statements</div>
+      <div class="quiz-option" data-key="B">Scan() requires pre-declared destination variables — impossible when column types are unknown at compile time</div>
+      <div class="quiz-option" data-key="C">database/sql doesn't support PostgreSQL</div>
+      <div class="quiz-option" data-key="D">Scan() can only read string columns</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does config.RuntimeParams[&quot;statement_timeout&quot;] = &quot;5000&quot; do?"
+         data-correct="B"
+         data-feedback-correct="Correct. RuntimeParams entries become SET commands sent during the PostgreSQL startup handshake. statement_timeout = 5000 tells the server to cancel any query on that connection that runs longer than 5 seconds."
+         data-feedback-wrong="Not quite. RuntimeParams values are sent to the PostgreSQL server as SET commands — they are server-side GUCs, not Go-side or TCP-level timeouts.">
+      <div class="quiz-option" data-key="A">Sets a Go-side timeout of 5 seconds on the connection object</div>
+      <div class="quiz-option" data-key="B">Sends SET statement_timeout = 5000 to PostgreSQL as the first command after connecting</div>
+      <div class="quiz-option" data-key="C">Sets the TCP socket read deadline to 5 seconds</div>
+      <div class="quiz-option" data-key="D">Limits statement execution to 5,000 bytes of output</div>
+    </div>
+
+    <div class="quiz"
+         data-question="rows.Values() returns []any. How do you know which value maps to which column?"
+         data-correct="B"
+         data-feedback-correct="Correct. rows.FieldDescriptions() returns one FieldDescription per SELECT column, in order. The i-th FieldDescription.Name matches the i-th value in the []any slice — positional index links every value to its column name."
+         data-feedback-wrong="Not quite. pgx does not sort columns alphabetically or add suffixes. Use rows.FieldDescriptions() — the positional index links each value to its column name.">
+      <div class="quiz-option" data-key="A">Values are always returned in alphabetical column order</div>
+      <div class="quiz-option" data-key="B">Use rows.FieldDescriptions() — the i-th FieldDescription matches the i-th value</div>
+      <div class="quiz-option" data-key="C">The first value is always the primary key</div>
+      <div class="quiz-option" data-key="D">pgx adds a "_column" suffix to each value indicating its name</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A server returns SQLSTATE 57014. What caused it?"
+         data-correct="C"
+         data-feedback-correct="Correct. SQLSTATE 57014 is query_canceled (US spelling). It fires when the server cancels a query because statement_timeout expired — the GUC you set via RuntimeParams did its job."
+         data-feedback-wrong="Not quite. SQLSTATE 57014 is in class 57 (operator intervention) and specifically means query_canceled — the server cancelled the query because statement_timeout fired. It has nothing to do with max_connections or authentication.">
+      <div class="quiz-option" data-key="A">The connection was refused because max_connections was reached</div>
+      <div class="quiz-option" data-key="B">Authentication failed — wrong password</div>
+      <div class="quiz-option" data-key="C">statement_timeout fired and PostgreSQL cancelled the query</div>
+      <div class="quiz-option" data-key="D">The database named in config.Database does not exist</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You call conn.Query(ctx, sql) and get a *pgconn.PgError with Code &quot;28P01&quot;. What should the scanner do?"
+         data-correct="B"
+         data-feedback-correct="Correct. SQLSTATE 28P01 is invalid_password — the credentials are wrong. No amount of retrying will fix this. Log auth_failure, skip the server, and move on."
+         data-feedback-wrong="Not quite. SQLSTATE 28P01 is invalid_password. This is a permanent failure for these credentials — retrying or waiting will not help. Classify it as auth_failure and skip the server.">
+      <div class="quiz-option" data-key="A">Retry — this is a transient network error</div>
+      <div class="quiz-option" data-key="B">Skip this server and log "auth_failure" — wrong credentials, retrying won't help</div>
+      <div class="quiz-option" data-key="C">Wait 30 seconds and retry — the server may be temporarily overloaded</div>
+      <div class="quiz-option" data-key="D">Fall back to database/sql for this server</div>
+    </div>
+
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example:
+    <em>"What is pgxpool and should my scanner use it instead of individual connections?"</em> or
+    <em>"What is SQLSTATE and where do I find all the codes for every PostgreSQL error?"</em> or
+    <em>"How does pgx handle PostgreSQL type conversion — what Go type does a timestamptz or numeric column become?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <a href="0005-concurrency.html">← Lesson 5: Concurrency</a>
+    <a href="../MISSION.md">You're done! →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

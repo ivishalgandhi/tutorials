@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 5: Concurrency — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 5</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="0004-error-handling.html">← Lesson 4</a></span>
+  </div>
+
+  <h1>Concurrency at Scale: Scanning 3,000 Servers Safely</h1>
+
+  <p>
+    Lesson 4 covered what to do when individual servers fail — timeouts, connection errors,
+    and bad credentials. This lesson covers the other axis of scale: running your scanner
+    against <strong>thousands of servers concurrently</strong> without overwhelming your
+    own machine or the targets. The solution is controlled concurrency — goroutines,
+    channels, and context cancellation working in concert.
+  </p>
+
+  <div class="callout key">
+    <div class="label">Core Insight</div>
+    Concurrency is not parallelism. Your scanner is I/O bound — goroutines spend most of
+    their time waiting for network responses. 50–100 concurrent goroutines can drive
+    thousands of servers because they are mostly idle. A pool of 50 goroutines checking
+    3,000 servers is not 50× slower than checking them all at once; it is <em>safer</em>
+    and nearly as fast.
+  </div>
+
+  <!-- ── 1. Naive fan-out ── -->
+  <h2>1. Why Naive Goroutine Fan-out Fails at Scale</h2>
+
+  <p>
+    The first instinct: launch one goroutine per server. For 10 servers this works fine.
+    For 3,000 it causes cascading failures.
+  </p>
+
+  <pre><code><span class="cm">// DANGEROUS — launches 3,000 goroutines simultaneously</span>
+<span class="kw">for</span> _, s := <span class="kw">range</span> servers {
+    <span class="kw">go</span> <span class="fn">checkServer</span>(ctx, s)
+}</code></pre>
+
+  <div class="callout warning">
+    <div class="label">Three things break at once</div>
+    <strong>PostgreSQL <code>max_connections</code>.</strong> Most servers allow 100–500
+    simultaneous connections. Sending 3,000 connection attempts in the same instant means
+    thousands of those attempts are refused with <em>"too many connections"</em> — which
+    logs noise or triggers alerts on the very servers you are supposed to monitor silently.
+    <br><br>
+    <strong>OS file descriptor limits.</strong> Each TCP connection consumes a file
+    descriptor. The default <code>ulimit -n</code> on many Linux systems is 1,024.
+    Launching 3,000 goroutines can exhaust this instantly, crashing your scanner process
+    with <code>EMFILE: too many open files</code>.
+    <br><br>
+    <strong>Memory.</strong> Each goroutine carries stack space plus a live TCP connection
+    object. At roughly 5 MB per goroutine (stack + TCP send/receive buffers + TLS state +
+    pgx connection struct), 3,000 concurrent goroutines consume approximately
+    3,000 × 5 MB = <strong>15 GB</strong> — likely more RAM than your scanner host has
+    available.
+  </div>
+
+  <!-- ── 2. Semaphore ── -->
+  <h2>2. The Semaphore Pattern (Buffered Channel)</h2>
+
+  <p>
+    The idiomatic Go solution uses a buffered channel as a <strong>counting semaphore</strong>.
+    Sending to the channel acquires a slot; receiving from it releases one.
+  </p>
+
+  <pre><code>sem := <span class="fn">make</span>(<span class="kw">chan struct</span>{}, <span class="nm">50</span>) <span class="cm">// max 50 concurrent</span>
+
+<span class="kw">var</span> wg sync.WaitGroup
+<span class="kw">for</span> _, s := <span class="kw">range</span> servers {
+    wg.<span class="fn">Add</span>(<span class="nm">1</span>)
+    sem &lt;- <span class="kw">struct</span>{}{} <span class="cm">// acquire slot — blocks when channel is full</span>
+    <span class="kw">go</span> <span class="kw">func</span>(srv Server) {
+        <span class="kw">defer</span> wg.<span class="fn">Done</span>()
+        <span class="kw">defer</span> <span class="kw">func</span>() { &lt;-sem }() <span class="cm">// release slot when goroutine exits</span>
+        <span class="fn">checkServer</span>(ctx, srv)
+    }(s)
+}
+wg.<span class="fn">Wait</span>()</code></pre>
+
+  <p>
+    How it works: the buffered channel has capacity 50. When 50 goroutines are already
+    running, the 51st <code>sem &lt;- struct{}{}</code> <strong>blocks the loop</strong> —
+    no new goroutine is launched until a running one exits and executes
+    <code>&lt;-sem</code> in its deferred release. At any moment, at most 50 goroutines
+    are alive. The loop automatically resumes as slots free up.
+  </p>
+
+  <!-- ── 3. Worker Pool ── -->
+  <h2>3. The Worker Pool Pattern (Channel of Work)</h2>
+
+  <p>
+    Instead of throttling goroutine creation, pre-create a fixed number of goroutines and
+    feed them work through a channel.
+  </p>
+
+  <pre><code>work := <span class="fn">make</span>(<span class="kw">chan</span> Server, <span class="fn">len</span>(servers))
+<span class="kw">for</span> _, s := <span class="kw">range</span> servers {
+    work &lt;- s
+}
+<span class="fn">close</span>(work) <span class="cm">// signal: no more items will ever be sent</span>
+
+<span class="kw">var</span> wg sync.WaitGroup
+<span class="kw">for</span> i := <span class="nm">0</span>; i &lt; <span class="nm">50</span>; i++ {
+    wg.<span class="fn">Add</span>(<span class="nm">1</span>)
+    <span class="kw">go</span> <span class="kw">func</span>() {
+        <span class="kw">defer</span> wg.<span class="fn">Done</span>()
+        <span class="kw">for</span> s := <span class="kw">range</span> work { <span class="cm">// range exits when channel is closed and empty</span>
+            <span class="fn">checkServer</span>(ctx, s)
+        }
+    }()
+}
+wg.<span class="fn">Wait</span>()</code></pre>
+
+  <p>
+    How it works: all 3,000 server entries are loaded into a buffered channel upfront, then
+    the channel is closed. Exactly 50 goroutines are launched. Each loops over the channel
+    with <code>range</code> — pulling the next server, checking it, pulling the next.
+    When the channel is both closed <em>and</em> empty, <code>range</code> exits naturally
+    and the goroutine calls <code>wg.Done()</code>.
+  </p>
+
+  <!-- ── Mermaid diagram ── -->
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    subgraph NAIVE["Naive Fan-out  (avoid)"]
+        direction TB
+        n1([3000 servers]) --> n2["3000 goroutines\nlaunched at once"]
+        n2 --> n3(["connection storm\nOOM / EMFILE"])
+    end
+    subgraph SEM["Semaphore Pattern  (good)"]
+        direction TB
+        s1([3000 servers]) --> s2["send to sem\nblocks when full"]
+        s2 --> s3["max 50 goroutines\nrunning"]
+        s3 -.->|"defer release"| s2
+    end
+    subgraph POOL["Worker Pool Pattern  (good)"]
+        direction TB
+        p1([3000 servers]) --> p2["fill work channel\nclose before workers"]
+        p2 --> p3["50 fixed workers\nrange over channel"]
+        p3 --> p4(["channel empty\nwg.Wait returns"])
+    end
+    </div>
+    <div class="diagram-caption">Three concurrency patterns side by side — naive fan-out is dangerous; semaphore and worker pool both cap goroutines at N</div>
+  </div>
+
+  <!-- ── 4. Trade-offs ── -->
+  <h2>4. Pattern Trade-offs</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Goroutine count</th>
+        <th>Best for</th>
+        <th>Scanner verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Semaphore</strong></td>
+        <td>Up to N per run</td>
+        <td>I/O-bound, uneven latency</td>
+        <td>Good fit</td>
+      </tr>
+      <tr>
+        <td><strong>Worker pool</strong></td>
+        <td>Exactly N always</td>
+        <td>Steady throughput, CPU+I/O mix</td>
+        <td>Also good</td>
+      </tr>
+      <tr>
+        <td><strong>Naive fan-out</strong></td>
+        <td>1 per server</td>
+        <td>Never at scale</td>
+        <td>Dangerous</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    For a scanner, both the semaphore and worker pool are valid. The semaphore is simpler
+    to retrofit into existing code that already iterates over servers. The worker pool gives
+    slightly more predictable memory usage because goroutine count is fixed from the start.
+    Choose either; avoid the naive pattern entirely.
+  </p>
+
+  <!-- ── 5. Sizing the pool ── -->
+  <h2>5. Sizing the Pool</h2>
+
+  <p>
+    How do you pick the right N? Use <strong>Little's Law</strong>, which relates throughput,
+    concurrency, and latency:
+  </p>
+
+  <pre><code>concurrency ≈ target_rate × avg_latency</code></pre>
+
+  <p>
+    For your scanner: 3,000 servers in 60 seconds = 50 servers/sec. If each server takes
+    ~2 seconds on average (5-second <code>statement_timeout</code>, most finish in 1–3 s):
+  </p>
+
+  <pre><code>N = <span class="nm">50</span> servers/sec × <span class="nm">2</span> s/server = <span class="nm">100</span> concurrent goroutines</code></pre>
+
+  <p>
+    Start at 50–100 and measure actual throughput. Increase N only if you are falling short
+    of the time budget and your infrastructure supports it.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">The max_connections ceiling</div>
+    Your scanner opens <em>one connection per server</em> — but so does every application
+    process running on that server. If a target has <code>max_connections = 100</code>,
+    keeping your scanner's concurrency at 10–20 leaves the vast majority of available
+    connections for real application traffic. A practical rule: stay at 10–20% of the
+    lowest <code>max_connections</code> you expect to see on targets. Matching or exceeding
+    the limit competes directly with live workloads.
+  </div>
+
+  <!-- ── 6. Context propagation ── -->
+  <h2>6. Context Propagation and Cancellation</h2>
+
+  <p>
+    Controlling goroutine count is necessary but not sufficient. You also need a way to
+    stop all in-flight work — for example, when a user presses Ctrl+C, or when a
+    whole-scan deadline expires. Go's <code>context</code> package handles this with
+    a two-level timeout.
+  </p>
+
+  <pre><code>ctx, cancel := context.<span class="fn">WithTimeout</span>(context.<span class="fn">Background</span>(), <span class="nm">90</span>*time.Second) <span class="cm">// whole scan timeout</span>
+<span class="kw">defer</span> <span class="fn">cancel</span>()
+
+<span class="cm">// Per-server timeout layered on top</span>
+<span class="kw">func</span> <span class="fn">checkServer</span>(parentCtx context.Context, s Server) <span class="nm">error</span> {
+    ctx, cancel := context.<span class="fn">WithTimeout</span>(parentCtx, <span class="nm">10</span>*time.Second)
+    <span class="kw">defer</span> <span class="fn">cancel</span>()
+    conn, err := pgx.<span class="fn">ConnectConfig</span>(ctx, config)
+    <span class="cm">// ...</span>
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">Two-level timeout</div>
+    The <strong>outer context</strong> (90 s) is created once for the whole scan and passed
+    into every goroutine as <code>parentCtx</code>. The <strong>inner context</strong> (10 s)
+    is created fresh inside <code>checkServer</code> as a child of the outer. When the outer
+    context is cancelled — because 90 seconds elapsed or because <code>cancel()</code> was
+    called explicitly — every child context is cancelled immediately, regardless of where
+    its per-server timer stands. A single <code>cancel()</code> call from
+    <code>main</code> tears down all in-flight connections at once. No goroutine leaks.
+  </div>
+
+  <p>
+    The pattern composes cleanly with both concurrency designs. Pass the outer
+    <code>ctx</code> into each goroutine in the semaphore loop or the worker pool.
+    Every blocking call — <code>pgx.ConnectConfig</code>, query execution, even
+    the <code>sem &lt;- struct{}{}</code> acquire — respects context cancellation when
+    you use <code>select</code> with <code>ctx.Done()</code> for the acquire step in
+    latency-sensitive code.
+  </p>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <a href="https://pkg.go.dev/golang.org/x/sync/semaphore" target="_blank">
+      <strong>golang.org/x/sync/semaphore — pkg.go.dev</strong>
+    </a> — The official weighted semaphore package; a richer alternative to the buffered-channel pattern for cases where you need variable-weight slots or context-aware acquisition.
+    <br><br>
+    <a href="https://go.dev/blog/pipelines" target="_blank">
+      <strong>Go Concurrency Patterns: Pipelines and Cancellation — The Go Blog</strong>
+    </a> — The canonical reference for building worker pipelines with channels and context cancellation in Go, by Sameer Ajmani.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+  <ul>
+    <li>Launching one goroutine per server at 3,000 targets exhausts <code>max_connections</code>, OS file descriptors, and memory — never do this at scale</li>
+    <li>The <strong>semaphore pattern</strong> uses a buffered channel: <code>send</code> acquires a slot and blocks the loop when full; <code>receive</code> in a deferred function releases the slot</li>
+    <li>The <strong>worker pool pattern</strong> uses a fixed number of goroutines that <code>range</code> over a closed work channel until it is empty</li>
+    <li>Both patterns cap concurrency at N; the semaphore is simpler to retrofit, the worker pool gives a fixed goroutine count from the start</li>
+    <li>Pool size formula: <code>N ≈ target_rate × avg_latency</code>; for 3,000 servers in 60 s at 2 s average, N ≈ 100; start at 50–100 and measure</li>
+    <li>Stay at 10–20% of the lowest <code>max_connections</code> on target servers to leave headroom for real application traffic</li>
+    <li>Use a two-level context: 90 s outer for the whole scan, 10 s inner per server; cancelling the outer tears down all in-flight work immediately with no goroutine leaks</li>
+  </ul>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="The buffered channel make(chan struct{}, 50) blocks when full. What does this achieve?"
+         data-correct="B"
+         data-feedback-correct="Correct. A full buffered channel blocks the sender. The for loop cannot launch a new goroutine until an existing one finishes and reads from the channel — capping concurrent goroutines at exactly 50."
+         data-feedback-wrong="Not quite. A full channel blocks the sender — it does not panic, it does not queue work in FIFO order beyond the buffer, and it does not set a total scan limit. It limits how many goroutines can be alive simultaneously.">
+      <div class="quiz-option" data-key="A">It causes goroutines to panic when the limit is reached</div>
+      <div class="quiz-option" data-key="B">It limits concurrent goroutines to 50 by making the 51st sender wait</div>
+      <div class="quiz-option" data-key="C">It queues up work and processes it FIFO</div>
+      <div class="quiz-option" data-key="D">It prevents more than 50 servers from being scanned total</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In the worker pool pattern, why is close(work) called before launching workers?"
+         data-correct="B"
+         data-feedback-correct="Correct. When a goroutine uses 'for s := range work', range only exits when the channel is both closed and empty. Without close(), workers would block forever waiting for more items even after all servers have been processed."
+         data-feedback-wrong="Not quite. close() does not prevent new items being added — the fill loop ending already ensures that. Its purpose is to let workers know when to stop: range over a channel exits only after the channel is closed and drained.">
+      <div class="quiz-option" data-key="A">To prevent new servers being added mid-scan</div>
+      <div class="quiz-option" data-key="B">So workers can range over the channel — range exits when the channel is closed and empty</div>
+      <div class="quiz-option" data-key="C">To trigger garbage collection of the channel</div>
+      <div class="quiz-option" data-key="D">close() is required before reading from a buffered channel</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your scanner runs against servers with max_connections=100. What concurrency limit is sensible?"
+         data-correct="C"
+         data-feedback-correct="Correct. Keeping concurrency at 10–20 leaves the vast majority of the server's connection capacity for real application traffic. Your scanner opens one connection per server; competing with live workloads by matching or exceeding the limit would be disruptive."
+         data-feedback-wrong="Not quite. Matching max_connections exactly leaves zero headroom for application connections. Goroutines being cheap in Go is irrelevant — the limit is on the server side. Serial scanning is safe but far too slow. The right answer is 10–20: stay well below the target's limit.">
+      <div class="quiz-option" data-key="A">100 — match the limit exactly</div>
+      <div class="quiz-option" data-key="B">200 — goroutines are cheap</div>
+      <div class="quiz-option" data-key="C">10–20 — leave headroom for real application connections</div>
+      <div class="quiz-option" data-key="D">1 — serial is the only safe option</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A server takes 5s (statement_timeout fires). With concurrency=50, how does this affect throughput?"
+         data-correct="B"
+         data-feedback-correct="Correct. Each goroutine slot is independent. While one slot is blocked waiting for the 5-second timeout, the other 49 slots continue processing their servers normally. Throughput for the other servers is unaffected."
+         data-feedback-wrong="Not quite. Goroutines are independent — a slow server blocks only the one goroutine handling it. statement_timeout only affects the single connection it was set on; it does not propagate to other goroutines or pause the whole scan.">
+      <div class="quiz-option" data-key="A">The whole scan pauses for 5s while that goroutine finishes</div>
+      <div class="quiz-option" data-key="B">That goroutine slot is blocked for 5s; the other 49 keep running</div>
+      <div class="quiz-option" data-key="C">The semaphore rejects the next 49 servers as a safety measure</div>
+      <div class="quiz-option" data-key="D">statement_timeout cancels all in-flight goroutines</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You want to cancel a 90-second scan after 30 seconds. What's the right mechanism?"
+         data-correct="C"
+         data-feedback-correct="Correct. Cancelling the parent context immediately propagates to all child contexts — every in-flight checkServer call sees its context cancelled, causing pgx to abort the connection. This is the cleanest, leak-free teardown."
+         data-feedback-wrong="Not quite. os.Exit(1) is abrupt and leaks resources. Closing the work channel stops new work from being picked up but does not interrupt goroutines already running. A shorter statement_timeout only affects the database query layer, not the goroutine itself. The right tool is context cancellation.">
+      <div class="quiz-option" data-key="A">os.Exit(1) from the main goroutine</div>
+      <div class="quiz-option" data-key="B">Close the work channel from outside the worker pool</div>
+      <div class="quiz-option" data-key="C">Cancel the parent context — all child per-server contexts cancel immediately</div>
+      <div class="quiz-option" data-key="D">Set a shorter statement_timeout on each connection</div>
+    </div>
+
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example:
+    <em>"What is the difference between a goroutine and a thread?"</em> or
+    <em>"How do I measure scan throughput — servers per second — while the scanner is running?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <a href="0004-error-handling.html">← Lesson 4: Error Handling</a>
+    <a href="0006-pgx-v5.html">Lesson 6: pgx v5 →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

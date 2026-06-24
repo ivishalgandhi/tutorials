@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Glossary — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .glos-entry { margin: 0; padding: 0.9em 0; border-bottom: 1px solid var(--border); }
+    .glos-entry:last-child { border-bottom: none; }
+    .glos-term {
+      font-family: 'Menlo', 'Consolas', monospace;
+      font-size: 0.92rem;
+      font-weight: 700;
+      color: var(--elephant);
+    }
+    .glos-category {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      margin-left: 0.5em;
+    }
+    .glos-def { font-size: 0.92rem; margin-top: 0.3em; }
+    .glos-scan { font-size: 0.82rem; color: var(--elephant); margin-top: 0.3em; font-style: italic; }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>Updated: 2026-06-22</span>
+  </div>
+
+  <h1>Glossary</h1>
+  <p>Core vocabulary for PostgreSQL connection management and health checking. Every term here appears in the lessons.</p>
+
+  <h2>Connection Model</h2>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">backend process</span> <span class="glos-category">connection model</span></div>
+    <div class="glos-def">The OS process PostgreSQL forks for every client connection. Each backend handles exactly one connection. It persists until the connection closes.</div>
+    <div class="glos-scan">Scanner implication: opening a connection on a production server spawns a new OS process. Always close connections promptly.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">max_connections</span> <span class="glos-category">GUC / configuration</span></div>
+    <div class="glos-def">Server-wide limit on simultaneous client connections. Default: 100. Includes superuser_reserved_connections (default 3). Exceeding it produces: <code>FATAL: sorry, too many clients already</code>.</div>
+    <div class="glos-scan">Scanner implication: your scanner uses 1 connection per server while checking it. Never hold it open longer than needed.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">connection pool</span> <span class="glos-category">pattern</span></div>
+    <div class="glos-def">A cache of open database connections reused across multiple requests. Avoids the cost of TCP handshake + authentication on every query. Used in long-running services (web servers, APIs).</div>
+    <div class="glos-scan">Scanner implication: for a health-check scanner, you typically do NOT pool — you open one connection, run checks, close it. A pool makes sense if you run checks repeatedly against the same server.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pgxpool</span> <span class="glos-category">Go library</span></div>
+    <div class="glos-def">The connection pool implementation in the pgx Go driver. Manages a set of <code>*pgx.Conn</code> connections. Safe for concurrent use by many goroutines.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">goroutine</span> <span class="glos-category">Go concurrency</span></div>
+    <div class="glos-def">Go's lightweight concurrent execution unit. Cheaper than an OS thread (~2KB stack vs ~2MB). The Go runtime multiplexes many goroutines onto a small number of OS threads.</div>
+    <div class="glos-scan">Scanner implication: you can spawn thousands of goroutines — but you must <em>rate-limit</em> how many actually hold open database connections at once.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">semaphore (buffered channel)</span> <span class="glos-category">Go concurrency</span></div>
+    <div class="glos-def">A counting semaphore limits how many goroutines can proceed past a point simultaneously. In Go, implemented as a buffered channel: <code>sem := make(chan struct{}, N)</code>. Sending blocks when the buffer is full; receiving frees a slot.</div>
+    <div class="glos-scan">Scanner implication: your concurrency limiter is a semaphore. Set N to something that won't overload your scanner host's outbound connections.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">worker pool</span> <span class="glos-category">pattern</span></div>
+    <div class="glos-def">A fixed set of goroutines that pull work items from a shared channel. Unlike spawning one goroutine per item, this caps memory and concurrency precisely.</div>
+  </div>
+
+  <h2>Timeouts &amp; Safety Parameters</h2>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">connect_timeout</span> <span class="glos-category">GUC / DSN parameter</span></div>
+    <div class="glos-def">Maximum time in seconds to wait for a connection to be established. Set in the connection string: <code>connect_timeout=5</code>. A value of 0 means unlimited.</div>
+    <div class="glos-scan">Scanner implication: always set this. A dead or firewall-blocked server will hang forever without it.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">statement_timeout</span> <span class="glos-category">GUC / runtime parameter</span></div>
+    <div class="glos-def">Maximum time a single SQL statement may run before being cancelled with an error. Set in milliseconds: <code>SET statement_timeout = '5000'</code>. Applies per-session when set as a RuntimeParam in pgx.</div>
+    <div class="glos-scan">Scanner implication: the single most important safety knob. Without it, a slow catalog query can block for minutes on a loaded server.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">lock_timeout</span> <span class="glos-category">GUC / runtime parameter</span></div>
+    <div class="glos-def">Maximum time to wait to acquire a lock. If the lock cannot be acquired within this time, the statement fails. Set in milliseconds.</div>
+    <div class="glos-scan">Scanner implication: some catalog queries acquire brief locks. Set this to 1000ms to avoid your scanner being blocked by table-level locks on production.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">idle_in_transaction_session_timeout</span> <span class="glos-category">GUC / runtime parameter</span></div>
+    <div class="glos-def">Terminates sessions that sit idle inside an open transaction longer than the specified time. Prevents abandoned transactions from holding locks indefinitely.</div>
+    <div class="glos-scan">Scanner implication: set this as a safety net in case a bug causes your scanner to open a transaction and crash without closing it.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">application_name</span> <span class="glos-category">GUC / runtime parameter</span></div>
+    <div class="glos-def">A string identifying the client application. Visible in <code>pg_stat_activity.application_name</code>. Has no functional effect — purely for observability.</div>
+    <div class="glos-scan">Scanner implication: always set this (e.g. <code>healthchecker-v1</code>). It lets DBAs see your scanner in pg_stat_activity and know it is not a rogue connection.</div>
+  </div>
+
+  <h2>Privileges &amp; Roles</h2>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pg_monitor</span> <span class="glos-category">built-in role (PG 10+)</span></div>
+    <div class="glos-def">A predefined role that grants read access to all monitoring views (<code>pg_stat_*</code>, <code>pg_locks</code>, etc.) without superuser. The minimal-privilege choice for health-check tools.</div>
+    <div class="glos-scan">Scanner implication: ask DBAs to grant <code>pg_monitor</code> to your scanner user instead of superuser. Never run health checks as a superuser if you can avoid it.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">superuser_reserved_connections</span> <span class="glos-category">GUC</span></div>
+    <div class="glos-def">Number of connections reserved exclusively for superusers. Default: 3. Even if <code>max_connections</code> is exhausted, superusers can still connect to fix the problem.</div>
+    <div class="glos-scan">Scanner implication: your scanner should not use superuser credentials — or it could eat into these reserved slots.</div>
+  </div>
+
+  <h2>Catalog Views</h2>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pg_stat_activity</span> <span class="glos-category">catalog view</span></div>
+    <div class="glos-def">One row per backend process. Columns include: <code>state</code>, <code>query</code>, <code>wait_event_type</code>, <code>application_name</code>, <code>backend_start</code>, <code>query_start</code>. The primary view for connection health checks.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pg_settings</span> <span class="glos-category">catalog view</span></div>
+    <div class="glos-def">One row per configuration parameter (GUC). Columns: <code>name</code>, <code>setting</code>, <code>unit</code>, <code>context</code>. Use <code>SHOW parameter_name</code> as a shorthand for single lookups.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pg_stat_replication</span> <span class="glos-category">catalog view</span></div>
+    <div class="glos-def">One row per active streaming replication connection. Columns: <code>sent_lsn</code>, <code>replay_lsn</code>, <code>write_lag</code>, <code>flush_lag</code>, <code>replay_lag</code>. Only populated on primaries.</div>
+  </div>
+
+  <div class="glos-entry">
+    <div><span class="glos-term">pg_stat_user_tables</span> <span class="glos-category">catalog view</span></div>
+    <div class="glos-def">One row per user table. Tracks autovacuum, dead tuples, sequential scans, index scans, etc. Key source for vacuum health checks.</div>
+  </div>
+
+  <div class="lesson-nav">
+    <span></span>
+    <a href="../lessons/0001-what-is-a-postgres-connection.html">Lesson 1: The PostgreSQL Connection →</a>
+  </div>
+
+</div>
+</body>
+</html>

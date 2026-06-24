@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: The PostgreSQL Connection — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="lesson-meta">
+    <span class="tag">Lesson 1</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+  </div>
+
+  <h1>The PostgreSQL Connection: Why Every Connection Has a Cost</h1>
+
+  <p>
+    You are scanning 3,000 PostgreSQL servers concurrently. Before every query, your scanner opens a connection.
+    To keep your scanner safe — and to keep production DBAs trusting you — you need to understand exactly what happens
+    the moment you call <code>pgx.Connect()</code>.
+  </p>
+
+  <div class="callout key">
+    <div class="label">The Core Insight</div>
+    Every PostgreSQL connection is a real OS process on the server you are connecting to. Not a thread. Not a file descriptor. A full, forked process. This is the most important fact about PostgreSQL connection management.
+  </div>
+
+  <!-- ── 1. The Process Model ── -->
+  <h2>1. PostgreSQL's Process Model</h2>
+
+  <p>
+    Most databases use threads for connections. PostgreSQL is different: it uses <strong>processes</strong>.
+    The architecture looks like this:
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant SC as Your scanner (Go)
+    participant PM as postmaster
+    participant B1 as backend #1
+    participant B2 as backend #2
+    participant B3 as backend #3
+
+    SC->>PM: goroutine 1 — TCP connect
+    PM->>B1: fork() → new OS process
+    B1-->>SC: ready  (~2–5 MB RAM)
+
+    SC->>PM: goroutine 2 — TCP connect
+    PM->>B2: fork() → new OS process
+    B2-->>SC: ready  (~2–5 MB RAM)
+
+    SC->>PM: goroutine 3 — TCP connect
+    PM->>B3: fork() → new OS process
+    B3-->>SC: ready  (~2–5 MB RAM)
+    </div>
+    <div class="diagram-caption">Each TCP connect from your scanner forks a real OS process on the server</div>
+  </div>
+
+  <p>
+    The <strong>postmaster</strong> is the parent process. When your scanner connects, postmaster
+    calls <code>fork()</code> to create a new child process — the
+    <a href="../reference/glossary.html#backend-process"><strong>backend process</strong></a> —
+    dedicated to your connection. That process lives until your connection closes.
+  </p>
+
+  <div class="callout info">
+    <div class="label">Why does PostgreSQL use processes instead of threads?</div>
+    Isolation. If one backend crashes (e.g. due to a corrupt query), it cannot corrupt memory shared by other connections. The postmaster simply cleans up the dead process. Threads in the same address space don't have this protection.
+    See: <a href="https://www.citusdata.com/blog/2020/10/08/analyzing-connection-scalability" target="_blank">Analyzing the Limits of Connection Scalability in Postgres (Citus Data)</a>
+  </div>
+
+  <!-- ── 2. The Cost ── -->
+  <h2>2. What Each Connection Costs the Server</h2>
+
+  <p>Opening a connection is not free. It costs the <em>server you are connecting to</em>:</p>
+
+  <table>
+    <thead>
+      <tr><th>Resource</th><th>Cost per connection</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>RAM</strong></td>
+        <td>~2–5 MB (idle)</td>
+        <td>More if a query uses <code>work_mem</code> (default 4 MB) for sorts/hashes. An AWS study measured ~1.5 MB idle, ~14.5 MB under load per connection. <a href="https://aws.amazon.com/blogs/database/resources-consumed-by-idle-postgresql-connections/" target="_blank">[source]</a></td>
+      </tr>
+      <tr>
+        <td><strong>CPU (context switches)</strong></td>
+        <td>Small but real</td>
+        <td>Every SQL round-trip requires a kernel context switch to the backend process. At 1,000+ connections this becomes measurable overhead.</td>
+      </tr>
+      <tr>
+        <td><strong>Shared data structures</strong></td>
+        <td>Slot in procarray &amp; lock table</td>
+        <td>PostgreSQL's lock table and process array are fixed-size. Every connection — even idle — holds a slot. This is why 10,000 connections hurts even with plenty of RAM.</td>
+      </tr>
+      <tr>
+        <td><strong>Authentication time</strong></td>
+        <td>~1–10 ms</td>
+        <td>TCP handshake + TLS + password hash. For your scanner, multiplied by 3,000 servers.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">The max_connections Hard Limit</div>
+    Every PostgreSQL server has a <a href="../reference/glossary.html#max_connections"><code>max_connections</code></a> setting (default: <strong>100</strong>, production servers often set to 200–500). If your scanner opens a connection and the server is already at its limit, you get:
+    <pre><code>FATAL: sorry, too many clients already</code></pre>
+    Worse: your scanner could be the connection that pushes a production server over its limit, blocking legitimate application traffic.
+  </div>
+
+  <!-- ── 3. What This Means for Your Scanner ── -->
+  <h2>3. The Scanner Is Different from a Web App</h2>
+
+  <p>
+    A typical web application uses a <strong>connection pool</strong>: it opens 10–50 connections at startup and
+    reuses them for the lifetime of the application. This amortizes the connection cost over thousands of requests.
+  </p>
+
+  <p>
+    Your scanner is fundamentally different:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Web application</th><th>Your scanner</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Target servers</strong></td>
+        <td>1 (or a few)</td>
+        <td>3,000+</td>
+      </tr>
+      <tr>
+        <td><strong>Connection lifetime</strong></td>
+        <td>Hours/days (pooled)</td>
+        <td>Seconds (open, check, close)</td>
+      </tr>
+      <tr>
+        <td><strong>Queries per connection</strong></td>
+        <td>Thousands</td>
+        <td>40–50 (then done)</td>
+      </tr>
+      <tr>
+        <td><strong>Pool strategy</strong></td>
+        <td>One pool per database, <br>MaxConns = 20–50</td>
+        <td>No persistent pool; <br>one ephemeral connection per server</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    For your scanner, the right pattern is: <strong>connect → run all checks → close immediately</strong>.
+    Each server gets exactly one connection for the duration of its health check.
+  </p>
+
+  <!-- ── 4. The Five Safety Rules ── -->
+  <h2>4. The Five Rules of a Polite Scanner</h2>
+
+  <p>
+    You are a guest on production servers you do not own. These five rules ensure you leave no trace and cause no harm.
+  </p>
+
+  <h3>Rule 1: Always set <code>connect_timeout</code></h3>
+  <p>
+    Without a timeout, your goroutine will hang indefinitely if a server is down or firewalled.
+    3,000 servers means you will encounter many dead hosts.
+  </p>
+
+  <h3>Rule 2: Always set <code>statement_timeout</code></h3>
+  <p>
+    Some catalog queries (<code>pg_stat_user_tables</code>, bloat queries) can run for seconds or minutes on
+    a loaded server with millions of tables. Without this, your scanner becomes the problem.
+    Set it to <strong>5,000 ms</strong> (5 seconds) as a starting point.
+  </p>
+
+  <h3>Rule 3: Always set <code>lock_timeout</code></h3>
+  <p>
+    A few monitoring queries acquire brief row-level locks on catalog tables. If another transaction holds that lock,
+    your query waits. Set <code>lock_timeout</code> to <strong>1,000 ms</strong> to fail fast instead of blocking.
+  </p>
+
+  <h3>Rule 4: Always set <code>application_name</code></h3>
+  <p>
+    Every DBA watches <code>pg_stat_activity</code>. If they see an unknown connection running queries,
+    they will kill it. Set <code>application_name</code> to something identifiable like <code>healthchecker-v1</code>.
+    This is the equivalent of introducing yourself before sitting at someone's desk.
+  </p>
+
+  <h3>Rule 5: Use the <code>pg_monitor</code> role</h3>
+  <p>
+    Ask DBAs to grant <code>pg_monitor</code> to your scanner user. It gives read access to all <code>pg_stat_*</code>
+    views without superuser privileges. Never run health checks as a superuser — it wastes reserved connection slots
+    and is a larger blast radius if something goes wrong.
+  </p>
+
+  <!-- ── 5. The Code ── -->
+  <h2>5. Putting It Together in Go (pgx v5)</h2>
+
+  <p>Here is the minimal safe connection pattern for your scanner:</p>
+
+  <pre><code><span class="kw">import</span> (
+    <span class="st">"context"</span>
+    <span class="st">"fmt"</span>
+    <span class="st">"time"</span>
+    <span class="st">"github.com/jackc/pgx/v5"</span>
+)
+
+<span class="kw">func</span> <span class="fn">checkServer</span>(host, dbname, user, password <span class="nm">string</span>) <span class="nm">error</span> {
+    <span class="cm">// Build DSN with connect_timeout in the URL</span>
+    dsn := fmt.<span class="fn">Sprintf</span>(
+        <span class="st">"postgres://%s:%s@%s/%s?connect_timeout=5&amp;sslmode=prefer"</span>,
+        user, password, host, dbname,
+    )
+
+    config, err := pgx.<span class="fn">ParseConfig</span>(dsn)
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return</span> err }
+
+    <span class="cm">// Safety parameters — set before any query runs</span>
+    config.RuntimeParams[<span class="st">"application_name"</span>]                  = <span class="st">"healthchecker-v1"</span>
+    config.RuntimeParams[<span class="st">"statement_timeout"</span>]                   = <span class="st">"5000"</span>  <span class="cm">// 5s, in ms</span>
+    config.RuntimeParams[<span class="st">"lock_timeout"</span>]                        = <span class="st">"1000"</span>  <span class="cm">// 1s, in ms</span>
+    config.RuntimeParams[<span class="st">"idle_in_transaction_session_timeout"</span>]  = <span class="st">"10000"</span> <span class="cm">// 10s, in ms</span>
+
+    <span class="cm">// Context carries a hard outer deadline</span>
+    ctx, cancel := context.<span class="fn">WithTimeout</span>(context.<span class="fn">Background</span>(), <span class="nm">30</span>*time.Second)
+    <span class="kw">defer</span> <span class="fn">cancel</span>()
+
+    conn, err := pgx.<span class="fn">ConnectConfig</span>(ctx, config)
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="st">"connect: %w"</span>, err) }
+    <span class="kw">defer</span> conn.<span class="fn">Close</span>(context.<span class="fn">Background</span>()) <span class="cm">// always close!</span>
+
+    <span class="cm">// Run your 40-50 health check queries here...</span>
+    <span class="kw">return</span> <span class="fn">runChecks</span>(ctx, conn)
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">Why RuntimeParams?</div>
+    Setting <code>statement_timeout</code> via <code>RuntimeParams</code> in pgx v5 sends a <code>SET</code> command as part of the connection startup message — before any query runs. This is safer than sending <code>SET statement_timeout = ...</code> as a separate query, because it is atomic with the connection establishment.
+  </div>
+
+  <h3>Concurrency: The Worker Pool Pattern</h3>
+  <p>
+    You have 3,000 servers to scan. You should <em>not</em> spawn 3,000 goroutines all opening connections at once.
+    Instead, use a <strong>semaphore</strong> (buffered channel) to cap the number of simultaneous connections:
+  </p>
+
+  <pre><code><span class="kw">const</span> maxConcurrent = <span class="nm">200</span> <span class="cm">// tune this: start at 100, increase if safe</span>
+
+<span class="kw">func</span> <span class="fn">scanAll</span>(servers []Server) {
+    sem := <span class="fn">make</span>(<span class="kw">chan</span> <span class="kw">struct</span>{}, maxConcurrent)
+    <span class="kw">var</span> wg sync.WaitGroup
+
+    <span class="kw">for</span> _, server := <span class="kw">range</span> servers {
+        wg.<span class="fn">Add</span>(<span class="nm">1</span>)
+        sem &lt;- <span class="kw">struct</span>{}{}        <span class="cm">// acquire a slot (blocks when maxConcurrent reached)</span>
+
+        <span class="kw">go func</span>(s Server) {
+            <span class="kw">defer</span> wg.<span class="fn">Done</span>()
+            <span class="kw">defer func</span>() { &lt;-sem }() <span class="cm">// release slot when done</span>
+            <span class="kw">if</span> err := <span class="fn">checkServer</span>(s.Host, s.DBName, s.User, s.Password); err != <span class="kw">nil</span> {
+                <span class="cm">// log err, mark server as failed</span>
+            }
+        }(server)
+    }
+
+    wg.<span class="fn">Wait</span>()
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">Why a semaphore and not just a worker pool?</div>
+    Both work. A semaphore is simpler when the work items (servers) are already in a slice. A channel-based worker pool is better when items arrive as a stream. You are already using the semaphore pattern — this is just giving it a name and explaining why it is correct.
+  </div>
+
+  <!-- ── Primary Source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source for This Lesson</div>
+    <a href="https://blog.anarazel.de/2020/10/07/measuring-the-memory-overhead-of-a-postgres-connection/" target="_blank">
+      <strong>Measuring the Memory Overhead of a Postgres Connection</strong>
+    </a> — Andres Freund (PostgreSQL core contributor), 2020.
+    This is the definitive, empirical analysis of what each connection actually costs.
+    It debunks common myths about 10MB per connection and explains the process/fork model clearly.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+
+  <ul>
+    <li>Every PostgreSQL connection = a forked OS process (~2–5 MB RAM, holds a lock-table slot)</li>
+    <li><code>max_connections</code> is a hard limit; exceeding it produces a fatal error</li>
+    <li>Your scanner uses ephemeral connections: open → check → close immediately</li>
+    <li>Five safety rules: <code>connect_timeout</code>, <code>statement_timeout</code>, <code>lock_timeout</code>, <code>application_name</code>, <code>pg_monitor</code> role</li>
+    <li>Use a semaphore (buffered channel) to cap concurrent connections from your scanner</li>
+  </ul>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="What does PostgreSQL create when your scanner opens a connection?"
+         data-correct="B"
+         data-feedback-correct="Correct. PostgreSQL forks a new OS process (backend process) per connection. Not a thread — a full process."
+         data-feedback-wrong="Not quite. PostgreSQL's connection model is process-based, not thread-based. Each connection gets its own forked OS process.">
+      <div class="quiz-option" data-key="A">A new OS thread in the postmaster process</div>
+      <div class="quiz-option" data-key="B">A forked OS process called a backend process</div>
+      <div class="quiz-option" data-key="C">A file descriptor in the shared buffer pool</div>
+      <div class="quiz-option" data-key="D">A goroutine inside the PostgreSQL binary</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your scanner connects to a server where max_connections = 100 and 100 connections are already open. What happens?"
+         data-correct="C"
+         data-feedback-correct="Correct. You get a FATAL error: 'sorry, too many clients already'. The connection is refused."
+         data-feedback-wrong="Not quite. PostgreSQL does not queue connections or drop old ones. It returns a FATAL error immediately.">
+      <div class="quiz-option" data-key="A">PostgreSQL queues your connection until one frees up</div>
+      <div class="quiz-option" data-key="B">PostgreSQL drops the oldest idle connection to make room</div>
+      <div class="quiz-option" data-key="C">PostgreSQL returns a FATAL error and refuses your connection</div>
+      <div class="quiz-option" data-key="D">PostgreSQL opens the connection but limits your query throughput</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which parameter kills a slow catalog query before it blocks your scanner for minutes?"
+         data-correct="B"
+         data-feedback-correct="Correct. statement_timeout cancels any SQL statement that runs longer than the specified duration."
+         data-feedback-wrong="Not quite. connect_timeout only covers the connection phase. Once connected, statement_timeout guards individual queries.">
+      <div class="quiz-option" data-key="A">connect_timeout = 5000</div>
+      <div class="quiz-option" data-key="B">statement_timeout = 5000</div>
+      <div class="quiz-option" data-key="C">max_connections = 5000</div>
+      <div class="quiz-option" data-key="D">idle_in_transaction_session_timeout = 5000</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why should your scanner always set application_name in RuntimeParams?"
+         data-correct="A"
+         data-feedback-correct="Correct. application_name is visible in pg_stat_activity. Without it, DBAs see an anonymous connection and may kill it."
+         data-feedback-wrong="Not quite. application_name has no effect on query performance or authentication. Its purpose is purely identification in pg_stat_activity.">
+      <div class="quiz-option" data-key="A">So DBAs can identify your scanner in pg_stat_activity</div>
+      <div class="quiz-option" data-key="B">So PostgreSQL grants your session higher query priority</div>
+      <div class="quiz-option" data-key="C">So the connection bypasses max_connections limits</div>
+      <div class="quiz-option" data-key="D">So pg_monitor role privileges are automatically applied</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In Go, what does sem := make(chan struct{}, 200) implement for your scanner?"
+         data-correct="D"
+         data-feedback-correct="Correct. A buffered channel of capacity N is Go's idiomatic semaphore — it limits how many goroutines can proceed past a point simultaneously."
+         data-feedback-wrong="Not quite. This is a concurrency primitive, not a queue or pool. A buffered channel with capacity N is a counting semaphore.">
+      <div class="quiz-option" data-key="A">A FIFO queue of 200 servers to check in order</div>
+      <div class="quiz-option" data-key="B">A connection pool with 200 pre-warmed connections</div>
+      <div class="quiz-option" data-key="C">A fixed set of 200 worker goroutines pulling from a queue</div>
+      <div class="quiz-option" data-key="D">A counting semaphore limiting 200 concurrent goroutines</div>
+    </div>
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Type a question to your agent — for example:
+    <em>"What value should I set maxConcurrent to for my scanner?"</em> or
+    <em>"What does pg_monitor actually let me read?"</em> or
+    <em>"How do I handle authentication errors vs connection errors differently in my scanner?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <span></span>
+    <a href="0002-pg-stat-activity.html">Lesson 2: pg_stat_activity →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

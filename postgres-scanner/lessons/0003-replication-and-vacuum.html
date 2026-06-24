@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: Replication &amp; Vacuum — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    .threshold td { padding: 0.4em 0.8em; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem; }
+    .t-green  { color: #155724; font-weight: 700; }
+    .t-yellow { color: #856404; font-weight: 700; }
+    .t-red    { color: #721c24; font-weight: 700; }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 3</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="0002-pg-stat-activity.html">← Lesson 2</a></span>
+  </div>
+
+  <h1>Replication Lag &amp; Vacuum Health</h1>
+
+  <p>
+    Lesson 2 covered connection health — the <em>right now</em> state of the server.
+    This lesson adds two more signals every scanner needs: <strong>replication lag</strong>
+    (is this server current with its primary?) and <strong>vacuum health</strong>
+    (is dead-tuple accumulation creeping toward a performance cliff?).
+    Together, these three areas — connections, replication, vacuum — cover the majority
+    of production PostgreSQL incidents.
+  </p>
+
+  <div class="callout key">
+    <div class="label">The Core Problem</div>
+    Your scanner connects to 3,000 servers without knowing in advance which are primaries
+    and which are replicas. The replication checks are completely different depending on
+    the role. The solution: write one query that works on <em>any</em> server and
+    returns meaningful values for both roles.
+  </div>
+
+  <!-- ── 1. Role detection ── -->
+  <h2>1. Primary vs Replica — Why It Matters</h2>
+
+  <p>
+    PostgreSQL streaming replication has two roles:
+  </p>
+
+  <table>
+    <thead><tr><th>Role</th><th>pg_is_in_recovery()</th><th>Where replication data lives</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Primary</strong></td>
+        <td><code>false</code></td>
+        <td><code>pg_stat_replication</code> — one row per connected replica, with lag measurements</td>
+      </tr>
+      <tr>
+        <td><strong>Replica</strong></td>
+        <td><code>true</code></td>
+        <td><code>pg_last_xact_replay_timestamp()</code> — timestamp of last WAL record applied</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The naive approach — two separate queries, one for each role — requires your scanner
+    to know the server's role before running the check. Instead, use <strong>one query
+    that handles both</strong>, returning <code>NULL</code> for columns that don't apply:
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    A([connect to server]) --> B{pg_is_in_recovery?}
+    B -- false\nprimary --> C["pg_stat_replication\n→ replica_count, max_lag"]
+    B -- true\nreplica --> D["pg_last_xact_replay_timestamp\n→ lag_seconds"]
+    C --> E([report results])
+    D --> E
+    </div>
+    <div class="diagram-caption">One query handles both roles — primary columns are NULL on replicas, replica columns are NULL on primaries</div>
+  </div>
+
+  <!-- ── 2. Replication query ── -->
+  <h2>2. The Replication Query (Works on Any Server)</h2>
+
+  <pre><code><span class="cm">-- Works on both primary and replica. NULL columns are expected.</span>
+<span class="kw">SELECT</span>
+  pg_is_in_recovery()                           <span class="kw">AS</span> is_replica,
+
+  <span class="cm">-- Replica-side: seconds behind primary</span>
+  <span class="kw">CASE</span>
+    <span class="kw">WHEN NOT</span> pg_is_in_recovery()    <span class="kw">THEN NULL</span>
+    <span class="kw">WHEN</span> pg_last_wal_receive_lsn() =
+         pg_last_wal_replay_lsn()   <span class="kw">THEN</span> <span class="nm">0</span>    <span class="cm">-- fully caught up</span>
+    <span class="kw">ELSE</span> extract(<span class="nm">epoch</span> <span class="kw">FROM</span>
+           now() - pg_last_xact_replay_timestamp())::<span class="nm">int</span>
+  <span class="kw">END</span>                                           <span class="kw">AS</span> replica_lag_seconds,
+
+  <span class="cm">-- Primary-side: how many replicas are streaming</span>
+  (<span class="kw">SELECT</span> <span class="fn">count</span>(*)
+   <span class="kw">FROM</span> pg_stat_replication)                   <span class="kw">AS</span> streaming_replicas,
+
+  <span class="cm">-- Primary-side: worst replay lag across all replicas</span>
+  (<span class="kw">SELECT</span> <span class="fn">max</span>(extract(<span class="nm">epoch</span> <span class="kw">FROM</span> replay_lag))::<span class="nm">int</span>
+   <span class="kw">FROM</span> pg_stat_replication)                   <span class="kw">AS</span> max_replica_lag_seconds;</code></pre>
+
+  <p>Sample output for each role:</p>
+
+  <table>
+    <thead><tr><th>Server role</th><th>is_replica</th><th>replica_lag_seconds</th><th>streaming_replicas</th><th>max_replica_lag_seconds</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Primary with 2 replicas</td>
+        <td><code>false</code></td>
+        <td><code>NULL</code></td>
+        <td><code>2</code></td>
+        <td><code>4</code></td>
+      </tr>
+      <tr>
+        <td>Replica, 12s behind</td>
+        <td><code>true</code></td>
+        <td><code>12</code></td>
+        <td><code>0</code></td>
+        <td><code>NULL</code></td>
+      </tr>
+      <tr>
+        <td>Standalone (no replication)</td>
+        <td><code>false</code></td>
+        <td><code>NULL</code></td>
+        <td><code>0</code></td>
+        <td><code>NULL</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">The LSN equality check</div>
+    <code>pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()</code> means the replica has
+    received and fully applied all WAL from the primary — lag is genuinely zero. Without this
+    check, <code>pg_last_xact_replay_timestamp()</code> grows stale on an idle primary even when
+    the replica is perfectly current, giving a false positive.
+    <a href="https://postgres.ai/docs/postgres-howtos/monitoring-troubleshooting/system-monitoring/how-to-determine-the-replication-lag" target="_blank">[source]</a>
+  </div>
+
+  <p>Thresholds for <strong>replica lag</strong>:</p>
+
+  <table class="threshold">
+    <thead><tr><th>Lag</th><th>Signal</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="t-green">&lt; 10s</td><td>Healthy</td><td>Normal streaming replication under load</td></tr>
+      <tr><td class="t-yellow">10s – 60s</td><td>Warning</td><td>Network pressure or replica I/O bound; investigate</td></tr>
+      <tr><td class="t-red">&gt; 60s</td><td>Critical</td><td>Replica is falling behind; risk of data loss on failover</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── 3. Vacuum health ── -->
+  <h2>3. Vacuum Health — The Slow Accumulating Risk</h2>
+
+  <p>
+    Every <code>UPDATE</code> and <code>DELETE</code> in PostgreSQL leaves behind
+    <strong>dead tuples</strong> — the old row versions that MVCC must keep until
+    no active transaction can see them. Autovacuum reclaims them on a schedule, but
+    it can fall behind. When it does, tables bloat, query plans degrade, and in
+    extreme cases the server approaches <strong>transaction ID wraparound</strong>
+    — a hard shutdown PostgreSQL enforces to protect data integrity.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">Why this matters for a scanner</div>
+    Vacuum problems are silent for weeks, then sudden. A table at 30% dead tuples looks
+    fine until a query plan switches from an index scan to a sequential scan and latency
+    spikes 10×. Your scanner is often the first tool to catch this — before the application
+    team notices.
+  </div>
+
+  <pre><code><span class="cm">-- Top 10 tables with the most dead tuple accumulation</span>
+<span class="kw">SELECT</span>
+  schemaname,
+  relname                                       <span class="kw">AS</span> table_name,
+  n_dead_tup,
+  n_live_tup,
+  <span class="fn">round</span>(<span class="nm">100.0</span> * n_dead_tup /
+    <span class="fn">NULLIF</span>(n_live_tup + n_dead_tup, <span class="nm">0</span>), <span class="nm">1</span>)     <span class="kw">AS</span> dead_pct,
+  last_autovacuum,
+  last_autoanalyze,
+  now() - last_autovacuum                       <span class="kw">AS</span> since_last_vacuum
+<span class="kw">FROM</span> pg_stat_user_tables
+<span class="kw">WHERE</span> n_dead_tup &gt; <span class="nm">10000</span>
+<span class="kw">ORDER BY</span> n_dead_tup <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="nm">10</span>;</code></pre>
+
+  <p>Thresholds for <strong>dead tuple percentage</strong>:</p>
+
+  <table class="threshold">
+    <thead><tr><th>dead_pct</th><th>Signal</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="t-green">&lt; 5%</td><td>Healthy</td><td>Autovacuum is keeping up</td></tr>
+      <tr><td class="t-yellow">5–20%</td><td>Warning</td><td>Autovacuum may be throttled or losing ground on high-churn tables</td></tr>
+      <tr><td class="t-red">&gt; 20%</td><td>Critical</td><td>Significant bloat; query plan degradation likely; manual VACUUM needed</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">What NULLIF(n_live_tup + n_dead_tup, 0) protects against</div>
+    Empty tables have zero live and dead tuples. Dividing by zero would crash the query.
+    <code>NULLIF(expr, 0)</code> returns <code>NULL</code> instead of zero, making the
+    division return <code>NULL</code> safely for empty tables.
+  </div>
+
+  <!-- ── 4. TOML files ── -->
+  <h2>4. Your TOML Files for These Checks</h2>
+
+  <pre><code><span class="cm"># checks/replication.toml</span>
+
+[[<span class="fn">checks</span>]]
+name        = <span class="st">"replication_status"</span>
+description = <span class="st">"Role detection, replica lag, and primary replica count"</span>
+sql         = <span class="st">"""
+  SELECT
+    pg_is_in_recovery() AS is_replica,
+    CASE
+      WHEN NOT pg_is_in_recovery() THEN NULL
+      WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
+      ELSE extract(epoch FROM now() - pg_last_xact_replay_timestamp())::int
+    END AS replica_lag_seconds,
+    (SELECT count(*) FROM pg_stat_replication)                    AS streaming_replicas,
+    (SELECT max(extract(epoch FROM replay_lag))::int
+     FROM pg_stat_replication)                                    AS max_replica_lag_seconds
+"""</span></code></pre>
+
+  <pre><code><span class="cm"># checks/vacuum.toml</span>
+
+[[<span class="fn">checks</span>]]
+name        = <span class="st">"vacuum_health"</span>
+description = <span class="st">"Tables with high dead tuple accumulation"</span>
+sql         = <span class="st">"""
+  SELECT schemaname, relname, n_dead_tup, n_live_tup,
+    round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+    last_autovacuum,
+    now() - last_autovacuum AS since_last_vacuum
+  FROM pg_stat_user_tables
+  WHERE n_dead_tup > 10000
+  ORDER BY n_dead_tup DESC
+  LIMIT 10
+"""</span></code></pre>
+
+  <div class="callout key">
+    <div class="label">Zero rows is a healthy result</div>
+    The vacuum query returns zero rows when no table has more than 10,000 dead tuples.
+    Your runner should treat an empty result as a pass, not an error. This is the same
+    pattern as the long-running queries and stuck-transactions checks from Lesson 2.
+  </div>
+
+  <!-- ── 5. Full scanner picture ── -->
+  <h2>5. The Full Three-Category Scanner</h2>
+
+  <p>
+    With all three check files in place, your scanner runs the same <code>runCategory</code>
+    function from Lesson 2 three times per server — one connection, three files:
+  </p>
+
+  <pre><code><span class="kw">func</span> <span class="fn">checkServer</span>(ctx context.Context, s Server) ([]CheckResult, <span class="nm">error</span>) {
+    conn, err := <span class="fn">connectSafe</span>(ctx, s) <span class="cm">// from Lesson 1: RuntimeParams + timeouts</span>
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, err }
+    <span class="kw">defer</span> conn.<span class="fn">Close</span>(ctx)
+
+    categories := []<span class="nm">string</span>{
+        <span class="st">"checks/activity.toml"</span>,
+        <span class="st">"checks/replication.toml"</span>,
+        <span class="st">"checks/vacuum.toml"</span>,
+    }
+
+    <span class="kw">var</span> all []CheckResult
+    <span class="kw">for</span> _, path := <span class="kw">range</span> categories {
+        results, err := <span class="fn">runCategory</span>(ctx, conn, path)
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            <span class="cm">// category failed (e.g. statement_timeout hit) — record and continue</span>
+            all = <span class="fn">append</span>(all, CheckResult{Name: path, Err: err})
+            <span class="kw">continue</span>
+        }
+        all = <span class="fn">append</span>(all, results...)
+    }
+    <span class="kw">return</span> all, <span class="kw">nil</span>
+}</code></pre>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant G as goroutine (1 of N)
+    participant S as target server
+
+    G->>S: connect (connect_timeout=5s, statement_timeout=5s)
+    Note over G,S: checks/activity.toml
+    G->>S: connection_saturation
+    S-->>G: total=47, active=12, idle_in_txn=0, max=200
+    G->>S: long_running_queries
+    S-->>G: count=0
+    G->>S: stuck_transactions
+    S-->>G: count=0
+    Note over G,S: checks/replication.toml
+    G->>S: replication_status
+    S-->>G: is_replica=true, lag=4s
+    Note over G,S: checks/vacuum.toml
+    G->>S: vacuum_health
+    S-->>G: (0 rows — healthy)
+    G->>S: close
+    </div>
+    <div class="diagram-caption">One connection, three category files, ~6 queries — then close. Repeated concurrently for each server in the inventory.</div>
+  </div>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <a href="https://postgres.ai/docs/postgres-howtos/monitoring-troubleshooting/system-monitoring/how-to-determine-the-replication-lag" target="_blank">
+      <strong>How to Determine Replication Lag — postgres.ai</strong>
+    </a> — Covers the LSN equality check and why time-based lag is misleading on idle primaries.
+    <br><br>
+    <a href="https://ivanluminaria.com/en/posts/postgresql/vacuum-autovacuum-postgresql/" target="_blank">
+      <strong>PostgreSQL VACUUM and Autovacuum — Ivan Luminaria</strong>
+    </a> — Clear explanation of the dead-tuple threshold formula and how to read pg_stat_user_tables.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+  <ul>
+    <li><code>pg_is_in_recovery()</code> tells you whether a server is a primary or replica — your scanner must check this before interpreting replication data</li>
+    <li>Write one replication query that returns meaningful columns for both roles, using <code>NULL</code> where a column doesn't apply</li>
+    <li>The LSN equality check prevents false-positive lag on idle primaries</li>
+    <li>Dead tuples accumulate silently — <code>pg_stat_user_tables.n_dead_tup</code> and <code>dead_pct</code> are the key signals</li>
+    <li>Zero rows from the vacuum query is a pass; many rows from the replication query is also fine (just replicas reporting lag)</li>
+    <li>Three TOML files, one connection, one <code>runCategory</code> loop — the full scanner pattern is complete</li>
+  </ul>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Your scanner connects to a server. pg_is_in_recovery() returns true. What does this mean?"
+         data-correct="B"
+         data-feedback-correct="Correct. pg_is_in_recovery() = true means the server is a replica (standby) applying WAL from a primary. It is in 'recovery' mode."
+         data-feedback-wrong="Not quite. pg_is_in_recovery() has nothing to do with backups or crash recovery. It returns true whenever the server is operating as a streaming replica.">
+      <div class="quiz-option" data-key="A">The server is running a crash recovery after an unclean shutdown</div>
+      <div class="quiz-option" data-key="B">The server is a replica applying WAL from a primary</div>
+      <div class="quiz-option" data-key="C">The server is performing a point-in-time restore from backup</div>
+      <div class="quiz-option" data-key="D">The server's autovacuum is currently running a recovery pass</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A replica's pg_last_wal_receive_lsn() equals pg_last_wal_replay_lsn(). What should replica_lag_seconds return?"
+         data-correct="A"
+         data-feedback-correct="Correct. Equal LSNs mean all received WAL has been applied — the replica is fully caught up. The check short-circuits to 0 before calling pg_last_xact_replay_timestamp()."
+         data-feedback-wrong="Not quite. Equal LSNs mean the replica has applied every WAL record it received. Lag is genuinely zero — not NULL, not unknown.">
+      <div class="quiz-option" data-key="A">0  — the replica is fully caught up</div>
+      <div class="quiz-option" data-key="B">NULL — lag cannot be determined without the primary</div>
+      <div class="quiz-option" data-key="C">The number of seconds since the last commit on the primary</div>
+      <div class="quiz-option" data-key="D">The same as max_replica_lag_seconds from pg_stat_replication</div>
+    </div>
+
+    <div class="quiz"
+         data-question="pg_stat_replication has zero rows on a server where pg_is_in_recovery() = false. What does this mean?"
+         data-correct="C"
+         data-feedback-correct="Correct. It's a standalone server (or primary with no replicas). pg_stat_replication only has rows when streaming replicas are actively connected."
+         data-feedback-wrong="Not quite. A primary with no connected replicas simply has an empty pg_stat_replication — that's normal for a standalone server.">
+      <div class="quiz-option" data-key="A">The server's replication is broken and needs investigation</div>
+      <div class="quiz-option" data-key="B">The server is a replica with no downstream cascading replicas</div>
+      <div class="quiz-option" data-key="C">The server is standalone or a primary with no active replicas</div>
+      <div class="quiz-option" data-key="D">pg_monitor role is missing and the view is hidden from the scanner</div>
+    </div>
+
+    <div class="quiz"
+         data-question="pg_stat_user_tables shows n_live_tup = 0 and n_dead_tup = 0 for a table. What does NULLIF(n_live_tup + n_dead_tup, 0) return?"
+         data-correct="D"
+         data-feedback-correct="Correct. NULLIF(0, 0) returns NULL. This prevents a division-by-zero error when calculating dead_pct for empty tables."
+         data-feedback-wrong="Not quite. NULLIF(expr, 0) returns NULL when the expression equals zero — specifically to prevent division by zero in the dead_pct calculation.">
+      <div class="quiz-option" data-key="A">0  — the sum of zero plus zero</div>
+      <div class="quiz-option" data-key="B">1  — a default safe divisor</div>
+      <div class="quiz-option" data-key="C">An error — division by zero is thrown immediately</div>
+      <div class="quiz-option" data-key="D">NULL — protecting the dead_pct division from crashing</div>
+    </div>
+
+    <div class="quiz"
+         data-question="The vacuum_health check returns zero rows for a server. How should your scanner treat this result?"
+         data-correct="B"
+         data-feedback-correct="Correct. The WHERE clause filters to tables with more than 10,000 dead tuples. Zero rows means no table crossed that threshold — a healthy result."
+         data-feedback-wrong="Not quite. Zero rows is not an error and does not mean the query failed. The WHERE n_dead_tup > 10000 filter simply found nothing to report.">
+      <div class="quiz-option" data-key="A">An error — the query must have failed or timed out</div>
+      <div class="quiz-option" data-key="B">A pass — no table crossed the 10,000 dead-tuple threshold</div>
+      <div class="quiz-option" data-key="C">Inconclusive — pg_stat_user_tables may not be populated yet</div>
+      <div class="quiz-option" data-key="D">A warning — autovacuum may not be running if nothing is accumulating</div>
+    </div>
+
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example:
+    <em>"What is transaction ID wraparound and how close is too close?"</em> or
+    <em>"How do I detect if autovacuum is actively running right now?"</em> or
+    <em>"What is replay_lag vs write_lag vs flush_lag in pg_stat_replication?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <a href="0002-pg-stat-activity.html">← Lesson 2: pg_stat_activity</a>
+    <a href="0004-error-handling.html">Lesson 4: Error Handling →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 4: Error Handling — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 4</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="0003-replication-and-vacuum.html">← Lesson 3</a></span>
+  </div>
+
+  <h1>Error Handling &amp; Timeouts</h1>
+
+  <p>
+    A scanner that hits 3,000 servers will encounter every class of failure PostgreSQL
+    can produce: servers that are down, servers that reject authentication, queries that
+    time out, networks that drop packets. The question is not whether errors will happen —
+    they will — but whether <strong>one failing server can corrupt, stall, or crash
+    the goroutine scanning the next server</strong>. It cannot. This lesson establishes
+    the patterns that make that guarantee.
+  </p>
+
+  <div class="callout key">
+    <div class="label">The Core Rule</div>
+    Per-server isolation: every error is contained to the goroutine that encountered it.
+    A connection refusal on server 412 must not affect server 413. A panic in a goroutine
+    must not propagate to the scan coordinator. <code>errors.As()</code> classifies the
+    error. A deferred recover captures panics. The coordinator only sees a typed result.
+  </div>
+
+  <!-- ── 1. Error taxonomy ── -->
+  <h2>1. The Four Error Classes</h2>
+
+  <p>
+    Every error your scanner receives falls into one of four classes. Each class has
+    a different cause, a different Go type, and a different correct response:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Class</th>
+        <th>Go type</th>
+        <th>Example causes</th>
+        <th>Scanner response</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Network error</strong></td>
+        <td><code>*net.OpError</code></td>
+        <td>Connection refused, host unreachable, TCP timeout</td>
+        <td>Skip server, log as <code>unreachable</code></td>
+      </tr>
+      <tr>
+        <td><strong>Server error</strong></td>
+        <td><code>*pgconn.PgError</code></td>
+        <td>Auth failure, missing permission, query cancelled</td>
+        <td>Classify by SQLSTATE code (see below)</td>
+      </tr>
+      <tr>
+        <td><strong>Context error</strong></td>
+        <td><code>context.DeadlineExceeded</code></td>
+        <td>connect_timeout fired in Go before TCP handshake</td>
+        <td>Skip server, log as <code>connect_timeout</code></td>
+      </tr>
+      <tr>
+        <td><strong>Statement timeout</strong></td>
+        <td><code>*pgconn.PgError</code> SQLSTATE 57014</td>
+        <td>Query exceeded <code>statement_timeout</code></td>
+        <td>Skip category, log as <code>statement_timeout</code>, continue other checks</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">SQLSTATE codes</div>
+    Every PostgreSQL error has a 5-character SQLSTATE code. The first two characters
+    are the class. For example: <code>28</code> = invalid authorisation,
+    <code>57</code> = operator intervention, <code>3D</code> = invalid catalog name.
+    The full table is at
+    <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" target="_blank">
+      postgresql.org/docs/current/errcodes-appendix.html</a>.
+    Key codes for a scanner:
+    <br><br>
+    <code>28000</code> / <code>28P01</code> — invalid authorisation (wrong password / pg_hba rejected)<br>
+    <code>3D000</code> — invalid catalog name (database does not exist)<br>
+    <code>57014</code> — query_canceled (statement_timeout or lock_timeout fired)<br>
+    <code>55P03</code> — lock_not_available (lock_timeout fired)<br>
+    <code>42501</code> — insufficient_privilege (user lacks SELECT on view)
+  </div>
+
+  <!-- ── 2. errors.As pattern ── -->
+  <h2>2. Classifying Errors with <code>errors.As()</code></h2>
+
+  <p>
+    pgx wraps errors. Never compare with <code>==</code>; always use
+    <code>errors.As()</code> or <code>errors.Is()</code> to unwrap:
+  </p>
+
+  <pre><code><span class="kw">import</span> (
+    <span class="st">"context"</span>
+    <span class="st">"errors"</span>
+    <span class="st">"net"</span>
+    <span class="st">"github.com/jackc/pgx/v5/pgconn"</span>
+)
+
+<span class="kw">type</span> ErrClass <span class="nm">string</span>
+
+<span class="kw">const</span> (
+    ErrOK               ErrClass = <span class="st">"ok"</span>
+    ErrUnreachable      ErrClass = <span class="st">"unreachable"</span>
+    ErrAuthFailure      ErrClass = <span class="st">"auth_failure"</span>
+    ErrDBNotFound       ErrClass = <span class="st">"db_not_found"</span>
+    ErrPermission       ErrClass = <span class="st">"permission_denied"</span>
+    ErrStatementTimeout ErrClass = <span class="st">"statement_timeout"</span>
+    ErrConnectTimeout   ErrClass = <span class="st">"connect_timeout"</span>
+    ErrUnknown          ErrClass = <span class="st">"unknown"</span>
+)
+
+<span class="kw">func</span> <span class="fn">classifyErr</span>(err <span class="nm">error</span>) ErrClass {
+    <span class="kw">if</span> err == <span class="kw">nil</span> { <span class="kw">return</span> ErrOK }
+
+    <span class="cm">// Server-reported error: inspect SQLSTATE code</span>
+    <span class="kw">var</span> pgErr *pgconn.PgError
+    <span class="kw">if</span> errors.<span class="fn">As</span>(err, &pgErr) {
+        <span class="kw">switch</span> pgErr.Code {
+        <span class="kw">case</span> <span class="st">"28000"</span>, <span class="st">"28P01"</span>: <span class="kw">return</span> ErrAuthFailure
+        <span class="kw">case</span> <span class="st">"3D000"</span>:           <span class="kw">return</span> ErrDBNotFound
+        <span class="kw">case</span> <span class="st">"42501"</span>:           <span class="kw">return</span> ErrPermission
+        <span class="kw">case</span> <span class="st">"57014"</span>, <span class="st">"55P03"</span>: <span class="kw">return</span> ErrStatementTimeout
+        }
+        <span class="kw">return</span> ErrUnknown
+    }
+
+    <span class="cm">// Go context deadline: connect_timeout fired client-side</span>
+    <span class="kw">if</span> errors.<span class="fn">Is</span>(err, context.DeadlineExceeded) {
+        <span class="kw">return</span> ErrConnectTimeout
+    }
+
+    <span class="cm">// Network error: server unreachable</span>
+    <span class="kw">var</span> netErr *net.OpError
+    <span class="kw">if</span> errors.<span class="fn">As</span>(err, &netErr) {
+        <span class="kw">return</span> ErrUnreachable
+    }
+
+    <span class="kw">return</span> ErrUnknown
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">errors.As vs errors.Is</div>
+    Use <code>errors.As(err, &target)</code> when you want to inspect a specific error
+    type (like <code>*pgconn.PgError</code> to read the SQLSTATE code).
+    Use <code>errors.Is(err, sentinel)</code> when you want to match a specific sentinel
+    value (like <code>context.DeadlineExceeded</code>).
+    Both unwrap error chains — they work even if pgx has wrapped the original error
+    several layers deep.
+  </div>
+
+  <!-- ── 3. Isolation pattern ── -->
+  <h2>3. Per-Server Isolation</h2>
+
+  <p>
+    Each goroutine must return a typed result — never panic, never call
+    <code>log.Fatal</code>, never propagate raw errors up through a channel.
+    The deferred <code>recover()</code> is the last line of defence:
+  </p>
+
+  <pre><code><span class="kw">type</span> ScanResult <span class="kw">struct</span> {
+    Server   Server
+    Checks   []CheckResult
+    ErrClass ErrClass
+    ErrMsg   <span class="nm">string</span>
+}
+
+<span class="kw">func</span> <span class="fn">checkServer</span>(ctx context.Context, s Server) (result ScanResult) {
+    result.Server = s
+
+    <span class="cm">// Catch any panic — a bug in one server's handler must not crash the scanner</span>
+    <span class="kw">defer func</span>() {
+        <span class="kw">if</span> r := <span class="fn">recover</span>(); r != <span class="kw">nil</span> {
+            result.ErrClass = ErrUnknown
+            result.ErrMsg = fmt.<span class="fn">Sprintf</span>(<span class="st">"panic: %v"</span>, r)
+        }
+    }()
+
+    conn, err := <span class="fn">connectSafe</span>(ctx, s)
+    <span class="kw">if</span> err != <span class="kw">nil</span> {
+        result.ErrClass = <span class="fn">classifyErr</span>(err)
+        result.ErrMsg = err.<span class="fn">Error</span>()
+        <span class="kw">return</span> <span class="cm">// named return — deferred recover still runs</span>
+    }
+    <span class="kw">defer</span> conn.<span class="fn">Close</span>(ctx)
+
+    <span class="kw">for</span> _, path := <span class="kw">range</span> []<span class="nm">string</span>{
+        <span class="st">"checks/activity.toml"</span>,
+        <span class="st">"checks/replication.toml"</span>,
+        <span class="st">"checks/vacuum.toml"</span>,
+    } {
+        checks, err := <span class="fn">runCategory</span>(ctx, conn, path)
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            <span class="cm">// Category failed (e.g. statement_timeout) — record and continue</span>
+            result.Checks = <span class="fn">append</span>(result.Checks, CheckResult{
+                Name:     path,
+                ErrClass: <span class="fn">classifyErr</span>(err),
+                ErrMsg:   err.<span class="fn">Error</span>(),
+            })
+            <span class="kw">continue</span>
+        }
+        result.Checks = <span class="fn">append</span>(result.Checks, checks...)
+    }
+    <span class="kw">return</span>
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">Named returns + defer</div>
+    The function returns a named <code>result ScanResult</code>. When an early
+    <code>return</code> fires, the deferred <code>recover()</code> still executes
+    and can modify <code>result</code> before the value is actually returned.
+    This is the idiomatic Go pattern for per-goroutine panic isolation.
+  </div>
+
+  <!-- ── 4. Permanent vs transient ── -->
+  <h2>4. Permanent vs Transient Errors</h2>
+
+  <p>
+    Two errors look similar but require completely different responses:
+  </p>
+
+  <table>
+    <thead><tr><th>Error</th><th>Class</th><th>Retry?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Auth failure (28P01)</td>
+        <td>Permanent</td>
+        <td>No</td>
+        <td>Wrong credentials will not self-heal. Retrying creates noise in pg_log.</td>
+      </tr>
+      <tr>
+        <td>Statement timeout (57014)</td>
+        <td>Permanent for this scan</td>
+        <td>No</td>
+        <td>If the health check itself is slow, the server is the problem to report, not retry.</td>
+      </tr>
+      <tr>
+        <td>Connection refused</td>
+        <td>Transient (maybe)</td>
+        <td>Once, after 2s</td>
+        <td>Server may be restarting. One retry is reasonable; more creates thundering herd risk.</td>
+      </tr>
+      <tr>
+        <td>Context cancelled</td>
+        <td>Permanent</td>
+        <td>No</td>
+        <td>The scan coordinator cancelled the context intentionally. Stop immediately.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">Never retry auth failures</div>
+    An authentication failure retried 3,000 times across 3,000 servers per scan run
+    will fill <code>pg_log</code> with noise, trigger fail2ban rules, and potentially
+    lock out the <code>pg_monitor</code> user on servers with <code>auth_delay</code>
+    configured. Auth failures are a configuration problem — fix the credentials, don't retry.
+  </div>
+
+  <!-- ── 5. Error budget ── -->
+  <h2>5. The Error Budget Concept</h2>
+
+  <p>
+    A single error is expected. A pattern of errors is a signal. After each scan run,
+    compute the error rate per class:
+  </p>
+
+  <pre><code><span class="kw">type</span> ScanSummary <span class="kw">struct</span> {
+    Total        <span class="nm">int</span>
+    Succeeded    <span class="nm">int</span>
+    ByErrClass   <span class="kw">map</span>[ErrClass]<span class="nm">int</span>
+}
+
+<span class="kw">func</span> <span class="fn">summarise</span>(results []ScanResult) ScanSummary {
+    s := ScanSummary{ByErrClass: <span class="kw">make</span>(<span class="kw">map</span>[ErrClass]<span class="nm">int</span>)}
+    <span class="kw">for</span> _, r := <span class="kw">range</span> results {
+        s.Total++
+        <span class="kw">if</span> r.ErrClass == ErrOK {
+            s.Succeeded++
+        } <span class="kw">else</span> {
+            s.ByErrClass[r.ErrClass]++
+        }
+    }
+    <span class="kw">return</span> s
+}
+
+<span class="cm">// Thresholds to alert on:</span>
+<span class="cm">// unreachable     > 5%   → network issue or inventory stale</span>
+<span class="cm">// auth_failure    > 1%   → credential rotation problem</span>
+<span class="cm">// stmt_timeout    > 2%   → check query too expensive for these servers</span></code></pre>
+
+  <!-- ── 6. Mermaid ── -->
+  <h2>6. The Decision Tree</h2>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart TD
+    A([error returned]) --> B{errors.As pgconn.PgError?}
+    B -- yes --> C{SQLSTATE code}
+    C -- 28000/28P01 --> D[auth_failure\nskip server\nno retry]
+    C -- 3D000 --> E[db_not_found\nskip server]
+    C -- 42501 --> F[permission_denied\ncheck pg_monitor role]
+    C -- 57014/55P03 --> G[statement_timeout\nskip category\ncontinue others]
+    C -- other --> H[unknown pg error\nlog code + message]
+    B -- no --> I{errors.Is DeadlineExceeded?}
+    I -- yes --> J[connect_timeout\nskip server]
+    I -- no --> K{errors.As net.OpError?}
+    K -- yes --> L[unreachable\nskip server]
+    K -- no --> M[unknown\nlog raw error]
+    </div>
+    <div class="diagram-caption">Every error path terminates with a classification — never a bare error string sent to the coordinator</div>
+  </div>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" target="_blank">
+      <strong>PostgreSQL Error Codes — official appendix</strong>
+    </a> — Complete SQLSTATE table. Bookmark this.
+    <br><br>
+    <a href="https://pkg.go.dev/errors" target="_blank">
+      <strong>Go errors package — pkg.go.dev</strong>
+    </a> — <code>errors.As</code>, <code>errors.Is</code>, and <code>errors.Unwrap</code> documentation.
+    <br><br>
+    <a href="https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#PgError" target="_blank">
+      <strong>pgconn.PgError — pkg.go.dev</strong>
+    </a> — Fields: Code, Message, Detail, Hint, Where, SchemaName, TableName.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+  <ul>
+    <li>Every error falls into one of four classes: network, server (PgError), context deadline, or statement timeout</li>
+    <li>Use <code>errors.As(err, &pgErr)</code> to get the SQLSTATE code; use <code>errors.Is</code> for sentinel values like <code>context.DeadlineExceeded</code></li>
+    <li>Each goroutine returns a typed <code>ScanResult</code> — never panics, never calls <code>log.Fatal</code></li>
+    <li>A deferred <code>recover()</code> catches panics and writes them into the result — named returns make this clean</li>
+    <li>Category-level errors (statement timeout on one check) should not abort the other categories for the same server</li>
+    <li>After a scan, compute error rates by class — a spike in <code>auth_failure</code> or <code>unreachable</code> is a systemic signal</li>
+    <li>Never retry auth failures. One retry for connection refused is acceptable; more creates a thundering herd</li>
+  </ul>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A server returns a *pgconn.PgError with Code '28P01'. What should your scanner do?"
+         data-correct="C"
+         data-feedback-correct="Correct. 28P01 is invalid_password — authentication failed. Retrying will not help. Log it as auth_failure and skip the server."
+         data-feedback-wrong="Not quite. 28P01 is an authentication failure. Retrying will not fix wrong credentials — it will only create noise in the server's pg_log.">
+      <div class="quiz-option" data-key="A">Retry up to 3 times with exponential backoff</div>
+      <div class="quiz-option" data-key="B">Fall back to a less privileged user</div>
+      <div class="quiz-option" data-key="C">Log auth_failure and skip the server — no retry</div>
+      <div class="quiz-option" data-key="D">Classify as unknown and continue to the next check</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your scanner uses named return values and a deferred recover(). A panic fires inside the goroutine. What happens?"
+         data-correct="B"
+         data-feedback-correct="Correct. The deferred recover() catches the panic, writes an error into the named result, and the function returns normally. The coordinator receives a ScanResult with ErrClass=unknown — never sees the panic."
+         data-feedback-wrong="Not quite. A deferred recover() inside the goroutine catches the panic before it propagates. The named return allows the recover block to still write a useful result.">
+      <div class="quiz-option" data-key="A">The panic propagates to the main goroutine and crashes the scan</div>
+      <div class="quiz-option" data-key="B">recover() catches it; the function returns a ScanResult with ErrClass=unknown</div>
+      <div class="quiz-option" data-key="C">The goroutine silently exits with a zero-value result</div>
+      <div class="quiz-option" data-key="D">The deferred conn.Close() fires but the panic still propagates</div>
+    </div>
+
+    <div class="quiz"
+         data-question="statement_timeout fires while running the vacuum_health check. What should the scanner do?"
+         data-correct="C"
+         data-feedback-correct="Correct. A statement timeout on one category should be recorded and the scanner should continue with the next category. The connection is still valid after statement_timeout — PostgreSQL cancelled the query, not the connection."
+         data-feedback-wrong="Not quite. A statement_timeout fires at the query level, not the connection level. The connection remains open. You can continue running other check categories.">
+      <div class="quiz-option" data-key="A">Close the connection and skip the entire server</div>
+      <div class="quiz-option" data-key="B">Retry the vacuum_health query with a longer timeout</div>
+      <div class="quiz-option" data-key="C">Record the timeout for that category, continue with other categories</div>
+      <div class="quiz-option" data-key="D">Re-establish the connection and retry the whole server</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why should you use errors.As(err, &pgErr) rather than a type assertion err.(*pgconn.PgError)?"
+         data-correct="A"
+         data-feedback-correct="Correct. pgx wraps errors in multiple layers. A direct type assertion only works on the outermost type. errors.As unwraps the entire chain until it finds a matching type."
+         data-feedback-wrong="Not quite. pgx wraps errors. A direct type assertion only works if *pgconn.PgError is the outermost type — which it often isn't after wrapping.">
+      <div class="quiz-option" data-key="A">errors.As unwraps the error chain — pgx wraps PgError inside other types</div>
+      <div class="quiz-option" data-key="B">Type assertions are not allowed on interface types in Go</div>
+      <div class="quiz-option" data-key="C">errors.As is faster at runtime than a type assertion</div>
+      <div class="quiz-option" data-key="D">PgError doesn't implement the error interface directly</div>
+    </div>
+
+    <div class="quiz"
+         data-question="After a scan run, 8% of servers returned ErrUnreachable. What does this signal?"
+         data-correct="B"
+         data-feedback-correct="Correct. 8% unreachable is above the expected noise floor (~1–2%) and indicates a systemic problem — stale inventory, a network segment issue, or a recent mass decommission — not individual server problems."
+         data-feedback-wrong="Not quite. Isolated unreachable errors are normal. 8% is a pattern — it signals something systemic like stale inventory, a network partition, or a batch of servers being decommissioned.">
+      <div class="quiz-option" data-key="A">Normal — 8% of servers are always down in a large fleet</div>
+      <div class="quiz-option" data-key="B">Systemic — stale inventory, network segment issue, or mass decommission</div>
+      <div class="quiz-option" data-key="C">The scanner's connect_timeout is too short; increase to 30s</div>
+      <div class="quiz-option" data-key="D">pg_monitor credentials expired on those 8% of servers</div>
+    </div>
+
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example:
+    <em>"What happens to in-flight queries when I cancel the parent context?"</em> or
+    <em>"How do I distinguish a TCP timeout from a statement_timeout in Go?"</em> or
+    <em>"Should my scanner log to stderr or a structured logger like slog?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <a href="0003-replication-and-vacuum.html">← Lesson 3: Replication &amp; Vacuum</a>
+    <a href="0005-concurrency.html">Lesson 5: Concurrency →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2: pg_stat_activity — PostgreSQL for Scanner Builders</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    .state-table td:first-child { font-family: 'Menlo', monospace; font-size: 0.83rem; }
+    .state-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .dot-green  { background: #1e7e34; }
+    .dot-yellow { background: #f59e0b; }
+    .dot-red    { background: #c0392b; }
+    .dot-grey   { background: #999; }
+    .threshold { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.82rem; }
+    .threshold td { padding: 0.4em 0.7em; }
+    .t-green  { color: #155724; font-weight: 600; }
+    .t-yellow { color: #856404; font-weight: 600; }
+    .t-red    { color: #721c24; font-weight: 600; }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 2</span>
+    <span>PostgreSQL for Scanner Builders</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="0001-what-is-a-postgres-connection.html">← Lesson 1</a></span>
+  </div>
+
+  <h1>pg_stat_activity: The View Your Scanner Reads Most</h1>
+
+  <p>
+    Your scanner connects to a server, runs 40–50 checks, and disconnects. The most important of those checks
+    query a single view: <code>pg_stat_activity</code>. It is PostgreSQL's live window into every
+    backend process on the server — what each connection is doing right now.
+  </p>
+
+  <div class="callout key">
+    <div class="label">The Core Insight</div>
+    <code>pg_stat_activity</code> has one row per backend process. The <code>state</code> column tells
+    you whether each connection is doing work, sitting idle, or — the dangerous case — sitting idle
+    <em>inside an open transaction</em>. From three queries against this view, your scanner can tell if
+    a server is healthy, saturated, or quietly accumulating problems.
+  </div>
+
+  <!-- ── 1. What the view is ── -->
+  <h2>1. What pg_stat_activity Contains</h2>
+
+  <p>
+    Each row is a backend process (see <a href="0001-what-is-a-postgres-connection.html">Lesson 1</a>).
+    The columns your scanner cares about:
+  </p>
+
+  <table>
+    <thead><tr><th>Column</th><th>Type</th><th>What it tells you</th></tr></thead>
+    <tbody>
+      <tr><td><code>pid</code></td><td>integer</td><td>OS process ID of this backend</td></tr>
+      <tr><td><code>usename</code></td><td>name</td><td>The database user for this connection</td></tr>
+      <tr><td><code>application_name</code></td><td>text</td><td>The client's self-reported name (from <code>RuntimeParams</code> — this is why we set it in Lesson 1)</td></tr>
+      <tr><td><code>state</code></td><td>text</td><td>What this backend is doing right now — the most important column</td></tr>
+      <tr><td><code>backend_type</code></td><td>text</td><td>Whether this is a client connection, autovacuum worker, WAL sender, etc.</td></tr>
+      <tr><td><code>query_start</code></td><td>timestamptz</td><td>When the current query started (NULL if idle)</td></tr>
+      <tr><td><code>xact_start</code></td><td>timestamptz</td><td>When the current transaction started (NULL if no active transaction)</td></tr>
+      <tr><td><code>wait_event_type</code></td><td>text</td><td>Why the backend is waiting (Lock, IO, Client, etc.) — NULL if not waiting</td></tr>
+      <tr><td><code>query</code></td><td>text</td><td>The most recent SQL statement (truncated at <code>track_activity_query_size</code> bytes, default 1024)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">Permission note</div>
+    Without the <code>pg_monitor</code> role, non-superusers see all rows but the <code>query</code>
+    column is blanked out for other users' sessions. With <code>pg_monitor</code>, your scanner sees
+    everything. This is one of the key reasons to request that role.
+    <a href="https://www.postgresql.org/docs/current/predefined-roles.html" target="_blank">[docs]</a>
+  </div>
+
+  <!-- ── 2. The state column ── -->
+  <h2>2. The state Column — What It Really Means</h2>
+
+  <p>
+    <code>state</code> is the health signal. Every scanner check against <code>pg_stat_activity</code>
+    filters on this column.
+  </p>
+
+  <table class="state-table">
+    <thead><tr><th>state value</th><th>Meaning</th><th>Danger level</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>active</code></td>
+        <td>Executing a query right now</td>
+        <td><span class="state-dot dot-green"></span>Normal — this is what healthy connections look like</td>
+      </tr>
+      <tr>
+        <td><code>idle</code></td>
+        <td>Connected, no query, no open transaction</td>
+        <td><span class="state-dot dot-grey"></span>Benign — but many idle connections waste process slots</td>
+      </tr>
+      <tr>
+        <td><code>idle in transaction</code></td>
+        <td>Inside a <code>BEGIN</code> block but not executing a query</td>
+        <td><span class="state-dot dot-red"></span><strong>Dangerous</strong> — holds locks, blocks autovacuum, can escalate to connection exhaustion</td>
+      </tr>
+      <tr>
+        <td><code>idle in transaction (aborted)</code></td>
+        <td>Transaction failed but was never rolled back</td>
+        <td><span class="state-dot dot-red"></span><strong>Dangerous</strong> — same risks as above; typically a bug in application code</td>
+      </tr>
+      <tr>
+        <td><code>fastpath function call</code></td>
+        <td>Executing a fast-path function</td>
+        <td><span class="state-dot dot-grey"></span>Rare, benign for your purposes</td>
+      </tr>
+      <tr>
+        <td>NULL</td>
+        <td>Background worker (autovacuum, WAL sender, etc.)</td>
+        <td><span class="state-dot dot-grey"></span>Filter these out with <code>backend_type = 'client backend'</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">Why "idle in transaction" is the silent killer</div>
+    A session in <code>idle in transaction</code> is sitting inside a <code>BEGIN</code> block doing nothing.
+    While it waits, it holds a <strong>transaction snapshot</strong> — PostgreSQL cannot clean up (vacuum) any
+    row that was visible when this transaction started. On a busy table, this causes dead-tuple accumulation
+    and bloat within minutes. It also holds any row locks it acquired, blocking other writers.
+    <br><br>
+    This is why <code>idle_in_transaction_session_timeout</code> (set in Lesson 1) is critical: it
+    automatically kills these sessions before they cause damage.
+    <a href="https://monpg.app/blog/postgresql-connection-pool-performance-pg-stat-activity" target="_blank">[source]</a>
+  </div>
+
+  <!-- ── 3. The three queries ── -->
+  <h2>3. Three Queries Your Scanner Runs</h2>
+
+  <p>
+    From <code>pg_stat_activity</code> alone, your scanner extracts three signals.
+    All three run on the same connection, one after another.
+  </p>
+
+  <h3>Query A — Connection Saturation</h3>
+  <p>
+    How full is this server? A server at 90%+ of <code>max_connections</code> is one spike away from
+    rejecting connections entirely.
+  </p>
+
+  <pre><code><span class="cm">-- How saturated is this server's connection limit?</span>
+<span class="kw">SELECT</span>
+  <span class="fn">count</span>(*) <span class="kw">AS</span> total,
+  <span class="fn">count</span>(*) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> state = <span class="st">'active'</span>)              <span class="kw">AS</span> active,
+  <span class="fn">count</span>(*) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> state = <span class="st">'idle'</span>)                <span class="kw">AS</span> idle,
+  <span class="fn">count</span>(*) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> state = <span class="st">'idle in transaction'</span>) <span class="kw">AS</span> idle_in_txn,
+  (<span class="kw">SELECT</span> setting::<span class="nm">int</span>
+   <span class="kw">FROM</span> pg_settings
+   <span class="kw">WHERE</span> name = <span class="st">'max_connections'</span>)                       <span class="kw">AS</span> max_connections
+<span class="kw">FROM</span> pg_stat_activity
+<span class="kw">WHERE</span> backend_type = <span class="st">'client backend'</span>;</code></pre>
+
+  <div class="callout info">
+    <div class="label">Why backend_type = 'client backend'?</div>
+    pg_stat_activity includes rows for PostgreSQL's own internal processes:
+    autovacuum workers, WAL senders, checkpointers, background workers. Filtering to
+    <code>'client backend'</code> gives you only actual client connections — the ones
+    that count against <code>max_connections</code>.
+  </div>
+
+  <p>Thresholds for <strong>connection saturation</strong> (<code>total / max_connections</code>):</p>
+
+  <table class="threshold">
+    <thead><tr><th>Used %</th><th>Signal</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td class="t-green">&lt; 70%</td><td>Healthy</td><td>No action needed</td></tr>
+      <tr><td class="t-yellow">70–90%</td><td>Warning</td><td>Alert the DBA team; investigate connection pooler config</td></tr>
+      <tr><td class="t-red">&gt; 90%</td><td>Critical</td><td>Imminent risk of connection storm; escalate immediately</td></tr>
+    </tbody>
+  </table>
+
+  <p>Any non-zero <code>idle_in_txn</code> count older than 60 seconds is independently alertable.</p>
+
+  <h3>Query B — Long-Running Queries</h3>
+  <p>
+    A query running for more than 5 minutes is almost certainly stuck, blocking, or a runaway.
+    Your scanner flags these as signals to investigate.
+  </p>
+
+  <pre><code><span class="cm">-- Queries running longer than 5 minutes right now</span>
+<span class="kw">SELECT</span>
+  pid,
+  usename,
+  application_name,
+  now() - query_start                <span class="kw">AS</span> query_age,
+  wait_event_type,
+  wait_event,
+  <span class="fn">left</span>(query, <span class="nm">120</span>)                   <span class="kw">AS</span> query_snippet
+<span class="kw">FROM</span> pg_stat_activity
+<span class="kw">WHERE</span> state = <span class="st">'active'</span>
+  <span class="kw">AND</span> query_start &lt; now() - <span class="kw">interval</span> <span class="st">'5 minutes'</span>
+  <span class="kw">AND</span> backend_type = <span class="st">'client backend'</span>
+<span class="kw">ORDER BY</span> query_start <span class="kw">ASC</span>;</code></pre>
+
+  <p>Thresholds for <strong>query age</strong>:</p>
+
+  <table class="threshold">
+    <thead><tr><th>Age</th><th>Signal</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="t-green">&lt; 1 min</td><td>Normal</td><td>Most OLTP queries should be milliseconds; some analytics are expected</td></tr>
+      <tr><td class="t-yellow">1–5 min</td><td>Watch</td><td>Could be a slow report; check <code>wait_event_type</code></td></tr>
+      <tr><td class="t-red">&gt; 5 min</td><td>Alert</td><td>Likely blocking or a runaway; note <code>wait_event = 'Lock'</code> specifically</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Query C — Idle-in-Transaction Age</h3>
+  <p>
+    Even a single idle-in-transaction session older than 60 seconds can hold locks and block
+    autovacuum on busy tables. This query surfaces the worst offenders.
+  </p>
+
+  <pre><code><span class="cm">-- Sessions stuck inside a transaction doing nothing</span>
+<span class="kw">SELECT</span>
+  pid,
+  usename,
+  application_name,
+  now() - xact_start   <span class="kw">AS</span> txn_age,
+  now() - state_change <span class="kw">AS</span> idle_for,
+  <span class="fn">left</span>(query, <span class="nm">80</span>)       <span class="kw">AS</span> last_query
+<span class="kw">FROM</span> pg_stat_activity
+<span class="kw">WHERE</span> state <span class="kw">IN</span> (<span class="st">'idle in transaction'</span>, <span class="st">'idle in transaction (aborted)'</span>)
+  <span class="kw">AND</span> xact_start &lt; now() - <span class="kw">interval</span> <span class="st">'30 seconds'</span>
+<span class="kw">ORDER BY</span> xact_start <span class="kw">ASC</span>;</code></pre>
+
+  <!-- ── 4. Go implementation ── -->
+  <h2>4. How Your TOML-Driven Scanner Runs These</h2>
+
+  <p>
+    Your scanner has a <strong>two-phase design</strong>. Understanding this unlocks why
+    <code>connections.toml</code> is special compared to every other file in <code>checks/</code>.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant CLI as Go CLI
+    participant CT as connections.toml
+    participant IDB as Inventory DB
+    participant S1 as server 1
+    participant S2 as server 2
+    participant SN as server 3000
+
+    Note over CLI,CT: Phase 1 — Inventory lookup
+    CLI->>CT: read inventory DSN + query
+    CLI->>IDB: connect
+    CLI->>IDB: SELECT host, port, dbname...
+    IDB-->>CLI: [server1 … server3000]
+    CLI->>IDB: close
+
+    Note over CLI,SN: Phase 2 — Concurrent health checks (semaphore-limited)
+    par
+        CLI->>S1: connect + run checks/*.toml
+        S1-->>CLI: results
+        CLI->>S1: close
+    and
+        CLI->>S2: connect + run checks/*.toml
+        S2-->>CLI: results
+        CLI->>S2: close
+    and
+        CLI->>SN: connect + run checks/*.toml
+        SN-->>CLI: results
+        CLI->>SN: close
+    end
+    </div>
+    <div class="diagram-caption">Phase 1 is sequential — one inventory query. Phase 2 is concurrent — up to N servers at once (semaphore).</div>
+  </div>
+
+  <p>
+    <code>connections.toml</code> is the bootstrap file — it holds the inventory database
+    connection and the query that produces the server list. Every other TOML under
+    <code>checks/</code> is a health-check category run against each server in that list.
+  </p>
+
+  <pre><code><span class="cm"># connections.toml — inventory DB config + server discovery</span>
+
+[<span class="fn">inventory</span>]
+dsn   = <span class="st">"postgres://scanner:secret@inventory-db:5432/infra"</span>
+query = <span class="st">"""
+  SELECT host, port, dbname, username, password
+  FROM servers
+  WHERE active = true
+  ORDER BY host
+"""</span>
+
+<span class="cm"># checks/activity.toml — health checks run against each scanned server</span>
+
+[[<span class="fn">checks</span>]]
+name        = <span class="st">"connection_saturation"</span>
+description = <span class="st">"Connection usage vs max_connections"</span>
+sql         = <span class="st">"""
+  SELECT
+    count(*)                                               AS total,
+    count(*) FILTER (WHERE state = 'active')              AS active,
+    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
+    (SELECT setting::int FROM pg_settings
+     WHERE name = 'max_connections')                      AS max_connections
+  FROM pg_stat_activity
+  WHERE backend_type = 'client backend'
+"""</span>
+
+[[<span class="fn">checks</span>]]
+name        = <span class="st">"long_running_queries"</span>
+description = <span class="st">"Queries active for more than 5 minutes"</span>
+sql         = <span class="st">"""
+  SELECT count(*) FROM pg_stat_activity
+  WHERE state = 'active'
+    AND query_start &lt; now() - interval '5 minutes'
+    AND backend_type = 'client backend'
+"""</span>
+
+[[<span class="fn">checks</span>]]
+name        = <span class="st">"stuck_transactions"</span>
+description = <span class="st">"Sessions idle in transaction for more than 30 seconds"</span>
+sql         = <span class="st">"""
+  SELECT count(*) FROM pg_stat_activity
+  WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')
+    AND xact_start &lt; now() - interval '30 seconds'
+"""</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Assumed TOML structure</div>
+    The structure above is a reasonable guess based on what you've shared. Share your actual
+    <code>connections.toml</code> when you can and the lesson will be updated to match exactly.
+  </div>
+
+  <p>
+    At runtime: Phase 1 reads the inventory, Phase 2 fans out. Because the result shape varies
+    per query, rows are scanned into <code>[]any</code> dynamically:
+  </p>
+
+  <pre><code><span class="cm">// ── Types ────────────────────────────────────────────────────</span>
+
+<span class="kw">type</span> <span class="fn">Server</span> <span class="kw">struct</span> {
+    Host, Port, DBName, User, Password <span class="nm">string</span>
+}
+
+<span class="kw">type</span> <span class="fn">InventoryConfig</span> <span class="kw">struct</span> {
+    DSN   <span class="nm">string</span> <span class="st">`toml:"dsn"`</span>
+    Query <span class="nm">string</span> <span class="st">`toml:"query"`</span>
+}
+
+<span class="kw">type</span> <span class="fn">ConnectionsFile</span> <span class="kw">struct</span> {
+    Inventory InventoryConfig <span class="st">`toml:"inventory"`</span>
+}
+
+<span class="kw">type</span> <span class="fn">Check</span> <span class="kw">struct</span> {
+    Name        <span class="nm">string</span> <span class="st">`toml:"name"`</span>
+    Description <span class="nm">string</span> <span class="st">`toml:"description"`</span>
+    SQL         <span class="nm">string</span> <span class="st">`toml:"sql"`</span>
+}
+
+<span class="kw">type</span> <span class="fn">CategoryFile</span> <span class="kw">struct</span> {
+    Checks []Check <span class="st">`toml:"checks"`</span>
+}
+
+<span class="kw">type</span> <span class="fn">CheckResult</span> <span class="kw">struct</span> {
+    Name    <span class="nm">string</span>
+    Columns []<span class="nm">string</span>
+    Rows    [][]<span class="kw">any</span>
+    Err     <span class="nm">error</span>
+}
+
+<span class="cm">// ── Phase 1: load server list from inventory DB ───────────────</span>
+
+<span class="kw">func</span> <span class="fn">loadServers</span>(ctx context.Context) ([]Server, <span class="nm">error</span>) {
+    <span class="kw">var</span> cfg ConnectionsFile
+    <span class="kw">if</span> _, err := toml.<span class="fn">DecodeFile</span>(<span class="st">"connections.toml"</span>, &amp;cfg); err != <span class="kw">nil</span> {
+        <span class="kw">return nil</span>, err
+    }
+
+    conn, err := pgx.<span class="fn">Connect</span>(ctx, cfg.Inventory.DSN)
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, fmt.<span class="fn">Errorf</span>(<span class="st">"inventory connect: %w"</span>, err) }
+    <span class="kw">defer</span> conn.<span class="fn">Close</span>(ctx)
+
+    rows, err := conn.<span class="fn">Query</span>(ctx, cfg.Inventory.Query)
+    <span class="kw">if</span> err != <span class="kw">nil</span> { <span class="kw">return nil</span>, err }
+    <span class="kw">defer</span> rows.<span class="fn">Close</span>()
+
+    <span class="kw">var</span> servers []Server
+    <span class="kw">for</span> rows.<span class="fn">Next</span>() {
+        <span class="kw">var</span> s Server
+        <span class="kw">if</span> err := rows.<span class="fn">Scan</span>(&amp;s.Host, &amp;s.Port, &amp;s.DBName, &amp;s.User, &amp;s.Password); err != <span class="kw">nil</span> {
+            <span class="kw">return nil</span>, err
+        }
+        servers = <span class="fn">append</span>(servers, s)
+    }
+    <span class="kw">return</span> servers, rows.<span class="fn">Err</span>()
+}
+
+<span class="cm">// ── Phase 2: run one category file against an open connection ──</span>
+
+<span class="kw">func</span> <span class="fn">runCategory</span>(ctx context.Context, conn *pgx.Conn, path <span class="nm">string</span>) ([]CheckResult, <span class="nm">error</span>) {
+    <span class="kw">var</span> cat CategoryFile
+    <span class="kw">if</span> _, err := toml.<span class="fn">DecodeFile</span>(path, &amp;cat); err != <span class="kw">nil</span> {
+        <span class="kw">return nil</span>, fmt.<span class="fn">Errorf</span>(<span class="st">"load %s: %w"</span>, path, err)
+    }
+
+    results := <span class="fn">make</span>([]CheckResult, <span class="nm">0</span>, <span class="fn">len</span>(cat.Checks))
+    <span class="kw">for</span> _, chk := <span class="kw">range</span> cat.Checks {
+        res := CheckResult{Name: chk.Name}
+
+        rows, err := conn.<span class="fn">Query</span>(ctx, chk.SQL)
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            res.Err = fmt.<span class="fn">Errorf</span>(<span class="st">"%s: %w"</span>, chk.Name, err)
+            results = <span class="fn">append</span>(results, res)
+            <span class="kw">continue</span>
+        }
+        <span class="kw">for</span> _, fd := <span class="kw">range</span> rows.<span class="fn">FieldDescriptions</span>() {
+            res.Columns = <span class="fn">append</span>(res.Columns, fd.Name)
+        }
+        <span class="kw">for</span> rows.<span class="fn">Next</span>() {
+            vals, _ := rows.<span class="fn">Values</span>() <span class="cm">// []any — pgx maps PG types to Go automatically</span>
+            res.Rows = <span class="fn">append</span>(res.Rows, vals)
+        }
+        rows.<span class="fn">Close</span>()
+        res.Err = rows.<span class="fn">Err</span>()
+        results = <span class="fn">append</span>(results, res)
+    }
+    <span class="kw">return</span> results, <span class="kw">nil</span>
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">Why rows.Values() instead of Scan()</div>
+    <code>Scan()</code> requires knowing the column types at compile time. Since your queries
+    live in TOML files and can change without recompiling, <code>rows.Values()</code> is the right
+    tool — it returns each row as <code>[]any</code>, letting you iterate columns dynamically.
+    pgx maps PostgreSQL types to sensible Go types automatically:
+    <code>int8</code> → <code>int64</code>, <code>text</code> → <code>string</code>, <code>interval</code> → <code>pgtype.Interval</code>.
+    The inventory query uses <code>Scan()</code> because you <em>do</em> know the shape — it always
+    returns the same server columns.
+  </div>
+
+  <!-- ── 5. Reading the output ── -->
+  <h2>5. How to Read the Output</h2>
+
+  <p>
+    Each <code>CheckResult</code> has a name, column list, and rows. Printing them for
+    the connections category looks like this — and the same loop works for every category:
+  </p>
+
+  <pre><code><span class="kw">for</span> _, r := <span class="kw">range</span> results {
+    <span class="kw">if</span> r.Err != <span class="kw">nil</span> {
+        fmt.<span class="fn">Printf</span>(<span class="st">"[ERROR] %s: %v\n"</span>, r.Name, r.Err)
+        <span class="kw">continue</span>
+    }
+    fmt.<span class="fn">Printf</span>(<span class="st">"\n── %s ──\n"</span>, r.Name)
+    fmt.<span class="fn">Println</span>(strings.<span class="fn">Join</span>(r.Columns, <span class="st">" | "</span>))
+    <span class="kw">for</span> _, row := <span class="kw">range</span> r.Rows {
+        parts := <span class="fn">make</span>([]<span class="nm">string</span>, <span class="fn">len</span>(row))
+        <span class="kw">for</span> i, v := <span class="kw">range</span> row {
+            parts[i] = fmt.<span class="fn">Sprintf</span>(<span class="st">"%v"</span>, v)
+        }
+        fmt.<span class="fn">Println</span>(strings.<span class="fn">Join</span>(parts, <span class="st">" | "</span>))
+    }
+}
+
+<span class="cm">// Example output for connection_saturation:
+// ── connection_saturation ──
+// total | active | idle_in_txn | max_connections
+// 47    | 12     | 0           | 200</span></code></pre>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source for This Lesson</div>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW" target="_blank">
+      <strong>pg_stat_activity — PostgreSQL Official Docs</strong>
+    </a> — The authoritative column reference. Every column in the view is documented with its exact type and meaning.
+    Also recommended: <a href="https://monpg.app/blog/postgresql-connection-pool-performance-pg-stat-activity" target="_blank">PostgreSQL Connection Saturation and pg_stat_activity (MonPG)</a> — practical patterns with real query examples.
+  </div>
+
+  <!-- ── Summary ── -->
+  <h2>Summary</h2>
+  <ul>
+    <li><code>pg_stat_activity</code> has one row per backend process; filter to <code>backend_type = 'client backend'</code> to count only real connections</li>
+    <li>The <code>state</code> column is the key signal: <code>active</code> is healthy, <code>idle in transaction</code> is dangerous</li>
+    <li>Three queries cover the main failure modes: connection saturation, long-running queries, and stuck transactions</li>
+    <li>Run all three on the same connection you already opened — no extra connections needed</li>
+    <li>Alert thresholds: &gt;90% saturation = critical; &gt;70% = warning; any stuck txn &gt;30s = warning</li>
+  </ul>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="pg_stat_activity has rows for autovacuum workers, WAL senders, and checkpointers. How do you filter these out to count only real client connections?"
+         data-correct="C"
+         data-feedback-correct="Correct. backend_type = 'client backend' selects only rows from actual client connections — the ones that count against max_connections."
+         data-feedback-wrong="Not quite. Filtering on state excludes rows by what the connection is doing, not what type it is. Background workers have a NULL state, but the clean filter is backend_type = 'client backend'.">
+      <div class="quiz-option" data-key="A">WHERE state IS NOT NULL</div>
+      <div class="quiz-option" data-key="B">WHERE usename IS NOT NULL</div>
+      <div class="quiz-option" data-key="C">WHERE backend_type = 'client backend'</div>
+      <div class="quiz-option" data-key="D">WHERE pid > 0</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A session has state = 'idle in transaction'. What is the most dangerous consequence of leaving it open for hours?"
+         data-correct="B"
+         data-feedback-correct="Correct. An idle-in-transaction session holds a transaction snapshot. PostgreSQL cannot vacuum any rows that were visible when the transaction started, causing dead-tuple accumulation and bloat."
+         data-feedback-wrong="Not quite. The key danger is not CPU or memory — it's that the open transaction snapshot prevents autovacuum from cleaning up dead tuples, causing table bloat and eventually performance degradation.">
+      <div class="quiz-option" data-key="A">It consumes extra CPU running a background query loop</div>
+      <div class="quiz-option" data-key="B">It holds a snapshot that blocks autovacuum and accumulates dead tuples</div>
+      <div class="quiz-option" data-key="C">It exhausts file descriptors on the OS faster than idle connections</div>
+      <div class="quiz-option" data-key="D">It prevents new connections from authenticating via pg_hba.conf</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your scanner finds: total=180, max_connections=200. What is the saturation level and correct signal?"
+         data-correct="D"
+         data-feedback-correct="Correct. 180/200 = 90% — exactly at the critical threshold. The server is one connection spike away from rejecting all new connections."
+         data-feedback-wrong="Not quite. 180/200 = 90%, which crosses the critical threshold (>90% is critical, but 90% itself is at the boundary — worth escalating immediately).">
+      <div class="quiz-option" data-key="A">45% — healthy, no action needed</div>
+      <div class="quiz-option" data-key="B">70% — warning, monitor closely</div>
+      <div class="quiz-option" data-key="C">80% — warning, alert the DBA team</div>
+      <div class="quiz-option" data-key="D">90% — critical, imminent connection storm risk</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why does checkConnectionHealth run three separate QueryRow calls instead of one big query?"
+         data-correct="A"
+         data-feedback-correct="Correct. Each query targets a different signal (saturation, long queries, stuck transactions). Keeping them separate makes the code readable, independently testable, and easy to add statement_timeout handling per check."
+         data-feedback-wrong="Not quite. PostgreSQL can run complex queries fine — the reason is code clarity and independent error handling, not database capability.">
+      <div class="quiz-option" data-key="A">Each check is an independent signal with its own error handling and thresholds</div>
+      <div class="quiz-option" data-key="B">PostgreSQL cannot run subqueries and aggregates in a single statement</div>
+      <div class="quiz-option" data-key="C">pgx v5 does not support scanning multiple result sets from one query</div>
+      <div class="quiz-option" data-key="D">Separate queries use less memory on the server than a single JOIN</div>
+    </div>
+
+    <div class="quiz"
+         data-question="The query column in pg_stat_activity is blank for other users' sessions. What role grants your scanner visibility into those queries?"
+         data-correct="B"
+         data-feedback-correct="Correct. The pg_monitor role grants read access to all pg_stat_* views including other users' query text, without needing superuser."
+         data-feedback-wrong="Not quite. pg_read_all_stats does exist but pg_monitor is the correct role — it's the broader monitoring role that includes pg_stat_activity query visibility.">
+      <div class="quiz-option" data-key="A">pg_read_server_files</div>
+      <div class="quiz-option" data-key="B">pg_monitor</div>
+      <div class="quiz-option" data-key="C">pg_execute_server_program</div>
+      <div class="quiz-option" data-key="D">pg_signal_backend</div>
+    </div>
+
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example:
+    <em>"What does wait_event_type = 'Lock' mean and how do I detect lock contention?"</em> or
+    <em>"How do I get the full query text, not just 120 characters?"</em> or
+    <em>"What's the difference between query_start and xact_start?"</em>
+  </div>
+
+  <!-- ── Nav ── -->
+  <div class="lesson-nav">
+    <a href="0001-what-is-a-postgres-connection.html">← Lesson 1: The PostgreSQL Connection</a>
+    <a href="0003-replication-and-vacuum.html">Lesson 3: Replication &amp; Vacuum →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>
