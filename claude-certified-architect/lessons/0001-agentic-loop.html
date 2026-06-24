@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: The Agentic Loop — Claude Certified Architect</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    .spectrum {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      margin: 1.5em 0;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.82rem;
+    }
+    .spectrum-cell {
+      flex: 1;
+      padding: 0.8em 0.7em;
+      text-align: center;
+      line-height: 1.4;
+    }
+    .spectrum-cell .pct { font-size: 0.72rem; color: var(--muted); margin-top: 0.3em; }
+    .spec-1 { background: #fff8e1; }
+    .spec-2 { background: #fff3cd; }
+    .spec-3 { background: #ffe8a0; }
+    .spec-4 { background: #ecfdf5; border-left: 3px solid var(--success); }
+    .spectrum-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 0.4em;
+    }
+    .cribsheet {
+      background: #fff0ee;
+      border: 1px solid #f5c6c0;
+      border-radius: 8px;
+      padding: 1.2em 1.4em;
+      margin: 1.5em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.88rem;
+    }
+    .cribsheet h4 { color: var(--danger); margin-bottom: 0.5em; font-size: 0.82rem; }
+    .cribsheet-good {
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      border-radius: 8px;
+      padding: 1.2em 1.4em;
+      margin: 1.5em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.88rem;
+    }
+    .cribsheet-good h4 { color: var(--success); margin-bottom: 0.5em; font-size: 0.82rem; }
+    .mnemonic-table td:first-child { font-family: 'Menlo', monospace; font-size: 0.82rem; color: var(--elephant); font-weight: 600; }
+    .official-q {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--elephant);
+      border-radius: 0 6px 6px 0;
+      padding: 1em 1.2em;
+      margin: 1.4em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.85rem;
+    }
+    .official-q .q-label {
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--elephant);
+      margin-bottom: 0.5em;
+    }
+    .not-tested {
+      background: #f8f8f8;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.9em 1.1em;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .not-tested strong { color: var(--text); }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="lesson-meta">
+    <span class="tag">Lesson 1 · D1</span>
+    <span>Claude Certified Architect · Foundations</span>
+    <span>~30 min</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>The Agentic Loop &amp; The One Frame That Unlocks This Exam</h1>
+
+  <p>
+    Domain 1 — Agentic Architecture &amp; Orchestration — carries <strong>27% of the exam</strong>,
+    the single heaviest domain. But more importantly: its concepts appear as distractors in D2–D5
+    questions too. If D1 is weak, every other domain suffers.
+  </p>
+
+  <p>
+    This lesson covers two things: the mechanics of the agentic loop (stop_reason), and
+    the one conceptual frame — from an actual exam passer — that resolves most questions across all five domains.
+  </p>
+
+  <div class="callout key">
+    <div class="label">The One Frame</div>
+    <strong>Prompts are probabilistic. Hooks are deterministic.</strong><br>
+    When a single failure causes financial loss, a security breach, or a compliance violation:
+    use hooks. Always. No matter how specific or well-worded the prompt is.
+    This distinction is tested relentlessly across all 5 domains.
+  </div>
+
+  <div class="not-tested">
+    <strong>Not on this exam — don't waste prep time on:</strong>
+    Constitutional AI · RLHF · fine-tuning · embedding models · computer use · vision API ·
+    streaming/SSE · OAuth/key rotation · rate limits · quotas · pricing · prompt caching
+    implementation details · cloud provider setup · token counting
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary sources for this lesson</div>
+    <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview" target="_blank">Anthropic Docs: Tool Use Overview</a> —
+    authoritative spec for stop_reason and the Messages API loop contract.<br>
+    <a href="https://ankitrahejagatech.github.io/claude-certified-architect-prep/practice-exam.html" target="_blank">Official sample questions (interactive)</a> —
+    built by an actual exam passer from the Anthropic PDF.
+  </div>
+
+  <!-- ── 1. The three global rules ── -->
+  <h2>1. Three Rules That Resolve Most Questions</h2>
+
+  <p>These rules, distilled from the official exam guide, cut through the noise on nearly every D1 scenario:</p>
+
+  <table>
+    <thead><tr><th>#</th><th>Rule</th><th>What it eliminates</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><strong>Deterministic beats probabilistic when stakes are real.</strong> Financial · security · compliance · safety → hooks or programmatic gates. Style · tone · formatting → prompts.</td>
+        <td>Any answer proposing "a stronger system prompt" for a financial-risk scenario</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><strong>Trace failures to their origin.</strong> Scope problems (missing topics, duplicate coverage) = upstream coordinator decomposition. Quality problems = subagent prompts or tools.</td>
+        <td>Blaming the subagent when the coordinator gave it a narrow brief</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><strong>Proportionate fixes first.</strong> Single agent beats multi-agent when sufficient. Prompts beat hooks when stakes are low. Don't over-engineer.</td>
+        <td>Any answer adding a routing classifier or specialised subagent when the root cause is a bad tool description</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── 2. The enforcement spectrum ── -->
+  <h2>2. The Enforcement Spectrum</h2>
+
+  <p>
+    The exam constantly asks you to choose between approaches that differ in reliability.
+    Know this spectrum cold:
+  </p>
+
+  <div class="spectrum-arrow">
+    <span>← PROBABILISTIC</span>
+    <span>DETERMINISTIC →</span>
+  </div>
+  <div class="spectrum">
+    <div class="spectrum-cell spec-1">
+      <strong>Prompt rules</strong>
+      <div class="pct">~95% compliance</div>
+    </div>
+    <div class="spectrum-cell spec-2">
+      <strong>Few-shot examples</strong>
+      <div class="pct">~97% compliance</div>
+    </div>
+    <div class="spectrum-cell spec-3">
+      <strong>Routing layer</strong>
+      <div class="pct">~98% compliance</div>
+    </div>
+    <div class="spectrum-cell spec-4">
+      <strong>Hooks / programmatic gates</strong>
+      <div class="pct">100% — the only correct answer when failure = harm</div>
+    </div>
+  </div>
+
+  <div class="callout warning">
+    <div class="label">The four-distractor pattern</div>
+    Almost every high-stakes D1 question follows this structure:<br>
+    <strong>A)</strong> PreToolUse/PostToolUse hook ← <em>correct</em><br>
+    <strong>B)</strong> Stronger system prompt instruction<br>
+    <strong>C)</strong> Add few-shot examples<br>
+    <strong>D)</strong> Route to a specialised subagent<br><br>
+    If the scenario involves financial loss, security, or compliance — A is the answer, every time.
+  </div>
+
+  <!-- ── 3. The agentic loop ── -->
+  <h2>3. The Agentic Loop — Know This Cold</h2>
+
+  <p>
+    Every agentic system wraps the Messages API in a loop. The loop terminates on one machine-readable
+    signal, not on text content. Here is the canonical structure:
+  </p>
+
+  <pre><code>messages = [{"role": <span class="st">"user"</span>, "content": user_input}]
+
+<span class="kw">while</span> True:
+    response = client.messages.create(model=MODEL, tools=tools, messages=messages)
+
+    <span class="kw">if</span> response.stop_reason == <span class="st">"end_turn"</span>:
+        <span class="kw">break</span>                         <span class="cm"># ← only legitimate exit</span>
+
+    <span class="kw">if</span> response.stop_reason == <span class="st">"tool_use"</span>:
+        tool_results = execute_tools(response.content)
+        messages.append({"role": <span class="st">"assistant"</span>, "content": response.content})
+        messages.append({"role": <span class="st">"user"</span>,      "content": tool_results})
+        <span class="cm"># loop continues ↑</span></code></pre>
+
+  <table>
+    <thead><tr><th>stop_reason</th><th>Meaning</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><code>"tool_use"</code></td><td>Model wants to call tools — loop continues</td><td>Execute all tool_use blocks, append results, call API again</td></tr>
+      <tr><td><code>"end_turn"</code></td><td>Model finished</td><td><strong>Stop the loop.</strong> Return result to user.</td></tr>
+      <tr><td><code>"max_tokens"</code></td><td>Response truncated</td><td>Handle as error — response is incomplete</td></tr>
+      <tr><td><code>"stop_sequence"</code></td><td>Custom stop sequence hit</td><td>Deliberate termination — inspect context</td></tr>
+    </tbody>
+  </table>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart TD
+    A([User request]) --> B[Call Messages API]
+    B --> C{stop_reason?}
+    C -->|tool_use| D[Extract ALL tool_use blocks]
+    D --> E[Execute tools]
+    E --> F[Append tool_results as user turn]
+    F --> B
+    C -->|end_turn| G([Return final text ✓])
+    C -->|max_tokens| H([Error: truncated ✗])
+
+    style A fill:#e8f0fe,stroke:#1a56db
+    style G fill:#ecfdf5,stroke:#059669
+    style H fill:#fff0ee,stroke:#c0392b
+    style C fill:#f3f2ee,stroke:#555
+    </div>
+    <div class="diagram-caption">The only legitimate loop exit is <code>stop_reason: "end_turn"</code>. Never text matching.</div>
+  </div>
+
+  <h3>Three anti-patterns — always wrong answers in the exam</h3>
+  <ol>
+    <li>Parsing natural language (<code>if "I'm done" in response.text</code>) to terminate the loop</li>
+    <li>Using an iteration cap as the <em>primary</em> stopping mechanism (caps are safety backstops only)</li>
+    <li>Checking <code>content[0].type == "text"</code> — tool_use responses can begin with a text block</li>
+  </ol>
+
+  <!-- ── 4. Hooks: PreToolUse vs PostToolUse ── -->
+  <h2>4. Hooks: PreToolUse vs PostToolUse</h2>
+
+  <p>
+    Hooks are the deterministic enforcement layer. Two hooks dominate the exam.
+    The keyword in the scenario tells you which one:
+  </p>
+
+  <table>
+    <thead><tr><th>Hook</th><th>Fires</th><th>Use cases</th><th>Exam keyword triggers</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>PreToolUse</strong></td>
+        <td>Before tool executes</td>
+        <td>Gates, authorisation, prerequisite checks, financial limits, capturing prior state hash for audit</td>
+        <td>"prior state" · "before X happens" · "block if" · "prerequisite" · "audit"</td>
+      </tr>
+      <tr>
+        <td><strong>PostToolUse</strong></td>
+        <td>After tool, before model sees result</td>
+        <td>Normalise formats, redact PII, truncate oversized results, enrich with metadata</td>
+        <td>"heterogeneous formats" · "normalise" · "redact" · "model confused by varying outputs"</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">Important distinction</div>
+    <strong>Hooks don't rank tools.</strong> Hooks gate, block, or transform.
+    To make Claude prefer one tool over another, use prompts and tool descriptions.
+    To make Claude <em>unable</em> to bypass a rule, use a hook.
+  </div>
+
+  <!-- ── 5. The official sample question ── -->
+  <h2>5. Apply It: Official Sample Question</h2>
+
+  <div class="official-q">
+    <div class="q-label">Official Sample Question — Scenario: Customer Support Agent</div>
+    <p>
+      Production data shows that in 12% of cases, your agent skips <code>get_customer</code> entirely
+      and calls <code>lookup_order</code> using only the customer's stated name, occasionally leading
+      to misidentified accounts and incorrect refunds. What change would most effectively address
+      this reliability issue?
+    </p>
+    <p>
+      <strong>A)</strong> Add a programmatic prerequisite that blocks <code>lookup_order</code> and
+      <code>process_refund</code> calls until <code>get_customer</code> has returned a verified customer ID.<br>
+      <strong>B)</strong> Enhance the system prompt to state that customer verification via
+      <code>get_customer</code> is mandatory before any order operations.<br>
+      <strong>C)</strong> Add few-shot examples showing the agent always calling
+      <code>get_customer</code> first, even when customers volunteer order details.<br>
+      <strong>D)</strong> Implement a routing classifier that analyses each request and enables only
+      the subset of tools appropriate for that request type.
+    </p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Why A is correct — the reasoning pattern</div>
+    <strong>A is a programmatic gate → 100% deterministic.</strong>
+    The scenario says "incorrect refunds" — financial harm. Rule 1 applies immediately.
+    <br><br>
+    <strong>Why B and C are wrong:</strong> prompts and few-shot examples are ~95–97% reliable.
+    That 3–5% failure rate means <em>some customers still get incorrect refunds</em>.
+    When single failures cause financial harm, probabilistic compliance is not acceptable.
+    <br><br>
+    <strong>Why D is wrong:</strong> it addresses tool <em>availability</em>, not tool <em>ordering</em>.
+    The agent can still skip <code>get_customer</code> within the enabled set.
+  </div>
+
+  <!-- ── 6. Distractor cribsheet ── -->
+  <h2>6. Distractor-Recognition Cribsheet</h2>
+
+  <p>
+    Most exam questions have one correct answer and three distractors that <em>sound plausible</em>.
+    Learning why the wrong answers are wrong matters more than just reading the right answer.
+  </p>
+
+  <div class="cribsheet">
+    <h4>Reject these phrases when stakes are financial / security / compliance:</h4>
+    <ul>
+      <li>"Add a stronger system prompt instruction…"</li>
+      <li>"Include few-shot examples demonstrating the correct sequence…"</li>
+      <li>"Route to a specialised subagent whose prompt emphasises…"</li>
+      <li>"Forward the full conversation transcript to the human reviewer"</li>
+      <li>"Catch errors and return an empty string silently"</li>
+      <li>"Retry on every error type with the same delay"</li>
+      <li>"Have subagent A pass results directly to subagent B"</li>
+    </ul>
+  </div>
+
+  <div class="cribsheet-good">
+    <h4>Lean toward these in the correct answer:</h4>
+    <ul>
+      <li>"PreToolUse hook that blocks…" / "PostToolUse hook that normalises…"</li>
+      <li>"Idempotency key generated on first attempt, passed on every retry"</li>
+      <li>"Pass structured data with claim → source mappings"</li>
+      <li>"Classify errors and handle each category appropriately"</li>
+      <li>"Coordinator's decomposition is too narrow" (for missing-topic scenarios)</li>
+      <li>"Add <code>Task</code> to coordinator's <code>allowedTools</code>" (for "won't delegate" bugs)</li>
+      <li>"Bounded timeout with fallback message" (for latency hangs)</li>
+    </ul>
+  </div>
+
+  <!-- ── 7. Production design mindset ── -->
+  <h2>7. Think Like a Production Design Reviewer</h2>
+
+  <p>
+    The exam is not about definitions — it tests architectural judgment under production constraints.
+    For every scenario, run through these five questions:
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    A[Production design review] --> B{What is brittle?}
+    A --> C{What is deterministic?}
+    A --> D{What fails silently?}
+    A --> E{What needs isolation?}
+    A --> F{What needs human escalation?}
+
+    B --> B1[Prompt-based guardrails\non financial flows]
+    C --> C1[Hooks · programmatic gates\nidempotency keys]
+    D --> D1[Silent empty results\non access failures]
+    E --> E1[Subagent context\ncredentials · PII]
+    F --> F1[Policy gaps · can't make\nprogress · explicit request]
+
+    style A fill:#e8f0fe,stroke:#1a56db
+    </div>
+    <div class="diagram-caption">Run this checklist mentally on every exam scenario.</div>
+  </div>
+
+  <!-- ── 8. One-line mnemonics ── -->
+  <h2>8. One-Line Mnemonics</h2>
+
+  <table class="mnemonic-table">
+    <tbody>
+      <tr><td>Loop termination</td><td><code>stop_reason</code> — or it's wrong</td></tr>
+      <tr><td>Subagent state</td><td>Nothing carries over. The prompt is the universe.</td></tr>
+      <tr><td>High stakes</td><td>Hooks, every time, no matter how strong the prompt wording</td></tr>
+      <tr><td>Missing topics</td><td>Blame the coordinator's decomposition</td></tr>
+      <tr><td>Duplicate work</td><td>Blame the coordinator's partitioning</td></tr>
+      <tr><td>Missing citations</td><td>Blame the context-passing format</td></tr>
+      <tr><td>Won't delegate</td><td>Check <code>allowedTools</code> for <code>"Task"</code></td></tr>
+      <tr><td>Prior state in audit</td><td>PreToolUse only</td></tr>
+      <tr><td>Heterogeneous outputs</td><td>PostToolUse normaliser</td></tr>
+      <tr><td>Double-charged customer</td><td>Idempotency key</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Practice — Wrong Answer Elimination</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">
+      These questions follow the official exam format. For each one, think about <em>why</em> the wrong answers are wrong — that's the skill the exam tests.
+    </p>
+
+    <div class="quiz"
+         data-question="An agent loop terminates when a variable `done` is set to True after checking if Claude's response contains the phrase 'Task complete.' Over several hundred runs, 4% of executions never terminate. What is the root cause?"
+         data-correct="B"
+         data-feedback-correct="Correct. Natural language termination is inherently unreliable — Claude's phrasing varies across models, temperatures, and context lengths. The loop must gate on stop_reason: 'end_turn', which is a machine-readable contract, not inferred text."
+         data-feedback-wrong="Think about what the 4% failure rate tells you about the reliability of text-matching vs a machine-readable signal.">
+      <div class="quiz-option" data-key="A">The iteration cap is not set, causing runaway loops when Claude produces verbose output.</div>
+      <div class="quiz-option" data-key="B">The loop uses natural language matching instead of stop_reason, so any phrasing variation causes it to miss the termination signal.</div>
+      <div class="quiz-option" data-key="C">The agent is not appending tool results correctly, causing the model to repeat tool calls indefinitely.</div>
+      <div class="quiz-option" data-key="D">The Messages API does not guarantee consistent stop_reason values across model versions.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your customer refund agent occasionally processes refunds without first verifying the customer's identity via get_customer. Engineers have added clear instructions to the system prompt and six few-shot examples. The problem occurs in 2% of cases. What is the correct fix?"
+         data-correct="A"
+         data-feedback-correct="Correct. 2% failure rate on a financial transaction means real customers get incorrect refunds. Prompts and few-shot examples are probabilistic — this 2% will never reach 0% with prompt tuning. A programmatic PreToolUse hook that blocks process_refund until get_customer has returned a verified ID is the only deterministic solution."
+         data-feedback-wrong="The question says you've already tried system prompt + few-shot. The issue is the approach, not the quality of the prompt. Think about the enforcement spectrum.">
+      <div class="quiz-option" data-key="A">Add a PreToolUse hook that blocks process_refund unless get_customer has previously returned a verified customer ID in this session.</div>
+      <div class="quiz-option" data-key="B">Rewrite the system prompt to make the verification requirement more prominent, and add two more targeted few-shot examples.</div>
+      <div class="quiz-option" data-key="C">Deploy a routing classifier trained on historical tickets to determine which requests need identity verification before reaching the agent.</div>
+      <div class="quiz-option" data-key="D">Add a specialised verification subagent whose entire system prompt focuses on enforcing identity checks.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A multi-agent research system produces reports on 'future of remote work' that cover only productivity tools and software, missing health, culture, and urban planning dimensions. All three subagents complete successfully and produce coherent summaries. Where is the fault?"
+         data-correct="C"
+         data-feedback-correct="Correct. All subagents executed faithfully — the symptom is missing coverage, not poor quality. Per Rule 2: scope problems = coordinator's decomposition. The coordinator split the topic into three narrow software-adjacent subtasks and never assigned the other dimensions. The subagents did exactly what they were told."
+         data-feedback-wrong="The subagents all completed successfully and produced coherent output. The problem is what they were asked to do, not how well they did it.">
+      <div class="quiz-option" data-key="A">The synthesis agent lacks instructions for detecting coverage gaps across the findings it receives.</div>
+      <div class="quiz-option" data-key="B">The web search agent's queries need to be broadened to surface non-technology sources automatically.</div>
+      <div class="quiz-option" data-key="C">The coordinator's task decomposition is too narrow — it assigned only technology-related subtasks and omitted other relevant dimensions of the topic.</div>
+      <div class="quiz-option" data-key="D">The document analysis agent is filtering out non-technical sources before passing results to synthesis.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Tool results from three different inventory APIs return timestamps in different formats (ISO 8601, Unix epoch, and US locale). The model makes frequent errors reconciling dates across sources. Which hook and placement is correct?"
+         data-correct="D"
+         data-feedback-correct="Correct. PostToolUse fires after tool execution but before the model sees the result — the ideal point to normalise heterogeneous formats into a single consistent schema. The model then sees only clean, consistent data. PreToolUse fires before execution and cannot transform results."
+         data-feedback-wrong="Think about which hook fires at the right moment to intercept and normalise results before the model tries to reconcile them.">
+      <div class="quiz-option" data-key="A">PreToolUse hook that rewrites the tool call parameters to request a specific timestamp format from each API.</div>
+      <div class="quiz-option" data-key="B">PreToolUse hook that validates timestamp format in the model's tool call before execution.</div>
+      <div class="quiz-option" data-key="C">Add explicit timestamp format requirements to each tool's description and a few-shot example showing correct reconciliation.</div>
+      <div class="quiz-option" data-key="D">PostToolUse hook that normalises all timestamps to ISO 8601 before the model receives the tool result.</div>
+    </div>
+
+  </div>
+
+  <!-- ── What's next ── -->
+  <h2>What's next</h2>
+
+  <p>
+    You now have the foundational frame — stop_reason, hooks vs prompts, the enforcement spectrum,
+    and how to eliminate wrong answers. Lesson 2 builds directly on this: how does a coordinator
+    delegate to subagents, what context do subagents receive, and what patterns break?
+  </p>
+
+  <ul>
+    <li>Next: <a href="0002-multi-agent-patterns.html">Lesson 2 — Orchestrator &amp; Subagent Patterns</a></li>
+    <li>Practice the official 12 sample questions: <a href="https://ankitrahejagatech.github.io/claude-certified-architect-prep/practice-exam.html" target="_blank">Interactive practice exam</a></li>
+    <li>Reference: <a href="../reference/domain-1-cheatsheet.html">Domain 1 Cheatsheet</a></li>
+  </ul>
+
+  <div class="teacher-note">
+    <strong>Questions?</strong> Ask your teacher anything that's unclear —
+    why a specific distractor is wrong, how a hook interacts with tool_choice,
+    or how this maps to a production system you're designing.
+    Each question you ask improves the next lesson.
+  </div>
+
+  <div class="lesson-nav">
+    <span></span>
+    <a href="0002-multi-agent-patterns.html">Lesson 2: Orchestrator &amp; Subagent Patterns →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

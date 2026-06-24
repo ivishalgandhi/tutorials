@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Certified Architect · Foundations</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .domain-section { margin: 2rem 0; }
+    .lesson-list { list-style: none; padding: 0; }
+    .lesson-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 0.8em;
+      padding: 0.55em 0;
+      border-bottom: 1px solid var(--border);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.9rem;
+    }
+    .lesson-list li:last-child { border-bottom: none; }
+    .lesson-num {
+      min-width: 1.8em;
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: var(--muted);
+      font-family: 'Menlo', monospace;
+    }
+    .lesson-status {
+      margin-left: auto;
+      font-size: 0.72rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .status-done  { color: var(--success); font-weight: 600; }
+    .status-ready { color: var(--accent);  font-weight: 600; }
+    .exam-bar-wrap { margin: 2rem 0; }
+    .progress-header {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 0.8em;
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Course Home</span>
+    <span><a href="../../index.html">← All Tutorials</a></span>
+  </div>
+
+  <h1>Claude Certified Architect</h1>
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: var(--muted); font-size: 0.95rem; margin-top: 0.2em;">
+    Foundations — Anthropic's official production AI architecture certification
+  </p>
+
+  <div class="callout info">
+    <div class="label">Exam snapshot</div>
+    <strong>60 questions · 120 min · pass at 720/1000 · no guessing penalty</strong> · Free via
+    <a href="https://anthropic.skilljar.com/" target="_blank">Anthropic Academy</a>
+    (Claude Partner Network membership required, also free) · 4 of 6 official scenarios randomly selected
+  </div>
+
+  <!-- Domain weights -->
+  <h2>Exam Domains</h2>
+
+  <div class="exam-domains">
+    <div class="exam-domain-row">
+      <span class="domain-name"><strong>D1</strong> Agentic Architecture &amp; Orchestration</span>
+      <div class="domain-bar-bg"><div class="domain-bar-fill" style="width:27%; background:#d97706;"></div></div>
+      <span class="domain-pct">27%</span>
+    </div>
+    <div class="exam-domain-row">
+      <span class="domain-name"><strong>D3</strong> Claude Code Configuration &amp; Workflows</span>
+      <div class="domain-bar-bg"><div class="domain-bar-fill" style="width:20%; background:#0891b2;"></div></div>
+      <span class="domain-pct">20%</span>
+    </div>
+    <div class="exam-domain-row">
+      <span class="domain-name"><strong>D4</strong> Prompt Engineering &amp; Structured Output</span>
+      <div class="domain-bar-bg"><div class="domain-bar-fill" style="width:20%; background:#059669;"></div></div>
+      <span class="domain-pct">20%</span>
+    </div>
+    <div class="exam-domain-row">
+      <span class="domain-name"><strong>D2</strong> Tool Design &amp; MCP Integration</span>
+      <div class="domain-bar-bg"><div class="domain-bar-fill" style="width:18%; background:#6366f1;"></div></div>
+      <span class="domain-pct">18%</span>
+    </div>
+    <div class="exam-domain-row">
+      <span class="domain-name"><strong>D5</strong> Context Management &amp; Reliability</span>
+      <div class="domain-bar-bg"><div class="domain-bar-fill" style="width:15%; background:#7c3aed;"></div></div>
+      <span class="domain-pct">15%</span>
+    </div>
+  </div>
+
+  <!-- Lessons -->
+  <h2>Lessons</h2>
+
+  <div class="domain-section">
+    <h3><span class="tag">D1 · 27%</span> Agentic Architecture &amp; Orchestration</h3>
+    <ul class="lesson-list">
+      <li>
+        <span class="lesson-num">01</span>
+        <a href="lessons/0001-agentic-loop.html">The Agentic Loop — <code>stop_reason</code> is Everything</a>
+        <span class="lesson-status status-ready">Ready</span>
+      </li>
+      <li>
+        <span class="lesson-num">02</span>
+        <span style="color: var(--muted);">Orchestrator &amp; Subagent Patterns</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">03</span>
+        <span style="color: var(--muted);">Lifecycle Hooks &amp; Agent SDK</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+    </ul>
+  </div>
+
+  <div class="domain-section">
+    <h3><span class="tag domain-3">D3 · 20%</span> Claude Code Configuration &amp; Workflows</h3>
+    <ul class="lesson-list">
+      <li>
+        <span class="lesson-num">04</span>
+        <span style="color: var(--muted);">CLAUDE.md — The Project Constitution</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">05</span>
+        <span style="color: var(--muted);">Hooks: Deterministic Guarantees</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">06</span>
+        <span style="color: var(--muted);">Plan Mode vs Direct Execution</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+    </ul>
+  </div>
+
+  <div class="domain-section">
+    <h3><span class="tag domain-4">D4 · 20%</span> Prompt Engineering &amp; Structured Output</h3>
+    <ul class="lesson-list">
+      <li>
+        <span class="lesson-num">07</span>
+        <span style="color: var(--muted);">Structured Output — JSON Schema &amp; tool_use</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">08</span>
+        <span style="color: var(--muted);">Extended Thinking — Budget Tokens &amp; Display</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+    </ul>
+  </div>
+
+  <div class="domain-section">
+    <h3><span class="tag domain-2">D2 · 18%</span> Tool Design &amp; MCP Integration</h3>
+    <ul class="lesson-list">
+      <li>
+        <span class="lesson-num">09</span>
+        <span style="color: var(--muted);">MCP Architecture — Host, Client, Server</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">10</span>
+        <span style="color: var(--muted);">MCP Primitives — Tools vs Resources vs Prompts</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">11</span>
+        <span style="color: var(--muted);">Tool Error Handling — Structured Errors</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+    </ul>
+  </div>
+
+  <div class="domain-section">
+    <h3><span class="tag domain-5">D5 · 15%</span> Context Management &amp; Reliability</h3>
+    <ul class="lesson-list">
+      <li>
+        <span class="lesson-num">12</span>
+        <span style="color: var(--muted);">Prompt Caching — Cost, Latency, Prefix Rules</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+      <li>
+        <span class="lesson-num">13</span>
+        <span style="color: var(--muted);">Context Window Management &amp; Compaction</span>
+        <span class="lesson-status">Coming soon</span>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Reference -->
+  <h2>Reference</h2>
+  <ul>
+    <li><a href="reference/domain-1-cheatsheet.html">Domain 1 Cheatsheet</a> <em style="font-size:0.8rem; color:var(--muted);">(coming soon)</em></li>
+    <li><a href="RESOURCES.md">Resources &amp; Study Links</a></li>
+    <li><a href="MISSION.md">Mission</a></li>
+  </ul>
+
+  <div class="teacher-note">
+    <strong>How to use this course:</strong> Work through lessons in order — they build on each
+    other. After each lesson, ask your teacher agent follow-up questions. The reference cheatsheets
+    are for quick review before the exam. Start with
+    <a href="lessons/0001-agentic-loop.html">Lesson 1</a>.
+  </div>
+
+</div>
+</body>
+</html>
