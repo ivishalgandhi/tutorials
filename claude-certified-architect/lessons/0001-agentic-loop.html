@@ -464,18 +464,101 @@ flowchart LR
 
   </div>
 
+  <!-- ── Watch ── -->
+  <h2>Watch First</h2>
+
+  <div class="callout info" style="padding: 0; overflow: hidden; border-radius: 8px;">
+    <div style="padding: 0.9em 1.1em 0.6em;">
+      <div class="label">Best video on this topic</div>
+      <strong>Tips for Building AI Agents</strong> — Anthropic (official channel)<br>
+      <span style="font-size:0.82rem; color: var(--muted);">574K views · 12K likes · 18 min · Barry Zhang, Erik Schluntz, Alex Albert</span><br>
+      <span style="font-size:0.82rem; color: var(--muted);">
+        Covers: tool description quality, agent architecture, when prompting is not enough,
+        multi-agent design, what makes agents fail in production.
+        Highest-viewed agent tutorial on the official Anthropic channel and directly maps to exam scenarios.
+      </span>
+    </div>
+    <div style="position:relative; padding-bottom: 56.25%; height: 0; overflow: hidden;">
+      <iframe
+        src="https://www.youtube.com/embed/LP5OCa20Zpg"
+        title="Tips for building AI agents — Anthropic"
+        style="position:absolute; top:0; left:0; width:100%; height:100%; border:0;"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <!-- ── Python exercises ── -->
+  <h2>Python Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">
+    Three exercises, each with a broken <code>problem.py</code> and a working <code>solution.py</code>.
+    Run the problem version first — observe it fail — then read the solution to understand why.
+  </p>
+
+  <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.85rem;">
+    <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1em 1.2em; margin-bottom: 0.8em;">
+      <strong>Setup</strong><br>
+      <code>pip install anthropic</code><br>
+      <code>export ANTHROPIC_API_KEY="your-key"</code><br>
+      <code style="color: var(--muted); font-size: 0.8rem;">cd exercises/lesson-01-agentic-loop/</code>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>Exercise</th><th>Anti-pattern it fixes</th><th>Exam concept</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>01</td>
+        <td>
+          <strong>Fix the broken loop</strong><br>
+          <code style="font-size:0.78rem;">01-fix-the-loop/problem.py</code>
+        </td>
+        <td>Text-matching termination (<code>if "Task complete" in response</code>)</td>
+        <td>stop_reason is the only reliable exit signal</td>
+      </tr>
+      <tr>
+        <td>02</td>
+        <td>
+          <strong>PreToolUse hook</strong><br>
+          <code style="font-size:0.78rem;">02-pretooluse-hook/problem.py</code>
+        </td>
+        <td>Relying on system prompt to enforce tool ordering</td>
+        <td>Official Sample Q1 — programmatic gate = 100% deterministic</td>
+      </tr>
+      <tr>
+        <td>03</td>
+        <td>
+          <strong>Handle all four stop_reasons</strong><br>
+          <code style="font-size:0.78rem;">03-stop-reason-handler/problem.py</code>
+        </td>
+        <td>Silently returning truncated text on max_tokens</td>
+        <td>max_tokens ≠ end_turn — different required action</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning" style="margin-top: 1em;">
+    <div class="label">Git location</div>
+    Exercises are version-controlled at:<br>
+    <code>tutorials/claude-certified-architect/exercises/lesson-01-agentic-loop/</code><br>
+    Each exercise has its own <code>README.md</code> explaining the bug and the exam connection.
+  </div>
+
   <!-- ── What's next ── -->
   <h2>What's next</h2>
 
   <p>
     You now have the foundational frame — stop_reason, hooks vs prompts, the enforcement spectrum,
-    and how to eliminate wrong answers. Lesson 2 builds directly on this: how does a coordinator
-    delegate to subagents, what context do subagents receive, and what patterns break?
+    and runnable Python exercises for each anti-pattern. Lesson 2 builds directly on this:
+    how does a coordinator delegate to subagents, what context do they receive, and what patterns break?
   </p>
 
   <ul>
     <li>Next: <a href="0002-multi-agent-patterns.html">Lesson 2 — Orchestrator &amp; Subagent Patterns</a></li>
-    <li>Practice the official 12 sample questions: <a href="https://ankitrahejagatech.github.io/claude-certified-architect-prep/practice-exam.html" target="_blank">Interactive practice exam</a></li>
+    <li>Practice all 12 official sample questions: <a href="https://ankitrahejagatech.github.io/claude-certified-architect-prep/practice-exam.html" target="_blank">Interactive practice exam</a></li>
     <li>Reference: <a href="../reference/domain-1-cheatsheet.html">Domain 1 Cheatsheet</a></li>
   </ul>
 
