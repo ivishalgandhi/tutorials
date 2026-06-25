@@ -617,6 +617,149 @@ sequenceDiagram
     </div>
   </div>
 
+  <!-- ── Python exercises ── -->
+  <h2>Python Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Three exercises, each with a broken <code>problem.py</code> and a working <code>solution.py</code>.
+    Click an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>pip install anthropic</code> &nbsp;·&nbsp;
+    <code>export ANTHROPIC_API_KEY="sk-…"</code>
+  </div>
+
+  <!-- Exercise viewer -->
+  <div id="ex-viewer" style="border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+
+    <!-- Exercise tabs -->
+    <div style="display:flex; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="ex-tab ex-tab-active" data-ex="01-wont-delegate"
+        title="Coordinator must include Task in allowed_tools">
+        01 — Won't delegate
+      </button>
+      <button class="ex-tab" data-ex="02-isolated-context"
+        title="Subagent prompt must include document and context">
+        02 — Isolated context
+      </button>
+      <button class="ex-tab" data-ex="03-failure-propagation"
+        title="Return structured error context instead of empty success">
+        03 — Failure propagation
+      </button>
+    </div>
+
+    <!-- Exercise description bar -->
+    <div id="ex-desc" style="padding: 0.6em 1em; background: #fffdf5; border-bottom: 1px solid var(--border); font-size: 0.82rem; color: var(--muted);"></div>
+
+    <!-- Problem / Solution toggle -->
+    <div style="display:flex; align-items:center; gap:0.5em; padding: 0.5em 1em; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="file-toggle file-toggle-active" data-file="problem" style="font-size:0.8rem;">problem.py</button>
+      <button class="file-toggle" data-file="solution" style="font-size:0.8rem;">solution.py</button>
+      <span id="ex-copy-btn"
+        style="margin-left:auto; cursor:pointer; font-size:0.78rem; color: var(--elephant); user-select:none;"
+        title="Copy to clipboard">⎘ copy</span>
+    </div>
+
+    <!-- Code display -->
+    <div style="position:relative; max-height: 520px; overflow-y: auto;">
+      <pre id="ex-code" style="margin:0; padding: 1em 1.2em; font-size: 0.8rem; line-height: 1.6; background: #1e1e2e; color: #cdd6f4; overflow-x: auto; white-space: pre;"><code id="ex-code-inner">Loading…</code></pre>
+    </div>
+
+    <!-- Status bar -->
+    <div id="ex-status" style="padding: 0.4em 1em; background: var(--code-bg); border-top: 1px solid var(--border); font-size: 0.76rem; color: var(--muted);"></div>
+  </div>
+
+  <style>
+    .ex-tab {
+      flex: 1; padding: 0.65em 0.5em; font-size: 0.8rem; font-weight: 600;
+      border: none; border-right: 1px solid var(--border); background: transparent;
+      cursor: pointer; color: var(--muted); transition: background 0.1s;
+    }
+    .ex-tab:last-child { border-right: none; }
+    .ex-tab:hover { background: #eee; color: var(--text); }
+    .ex-tab-active { background: #fff; color: var(--elephant); border-bottom: 2px solid var(--elephant); }
+    .file-toggle {
+      padding: 0.3em 0.8em; font-size: 0.8rem; font-weight: 600;
+      border: 1px solid var(--border); border-radius: 4px; background: transparent;
+      cursor: pointer; color: var(--muted);
+    }
+    .file-toggle:hover { background: #e8f0fe; color: var(--elephant); }
+    .file-toggle-active { background: var(--elephant); color: #fff; border-color: var(--elephant); }
+  </style>
+
+  <script>
+  (function () {
+    const BASE = '../exercises/lesson-02-multi-agent/';
+    const descriptions = {
+      '01-wont-delegate':
+        'BUG: coordinator has subagents defined but allowed_tools omits "Task", so it answers inline. FIX: add "Task" to the coordinator whitelist.',
+      '02-isolated-context':
+        'BUG: subagent prompt is "Analyze the document" with no document, context, or schema. FIX: pass the full universe in the prompt.',
+      '03-failure-propagation':
+        'BUG: subagent catches API timeout and returns empty results marked as success. FIX: return structured error context so the coordinator can retry.',
+    };
+
+    let currentEx   = '01-wont-delegate';
+    let currentFile = 'problem';
+
+    function setStatus(msg) {
+      document.getElementById('ex-status').textContent = msg;
+    }
+
+    async function loadFile() {
+      const path = `${BASE}${currentEx}/${currentFile}.py`;
+      setStatus(`Loading ${path}…`);
+      try {
+        const r = await fetch(path);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        document.getElementById('ex-code-inner').textContent = text;
+        setStatus(`${path}  ·  ${text.split('\n').length} lines  ·  ${(text.length / 1024).toFixed(1)} KB`);
+      } catch (e) {
+        document.getElementById('ex-code-inner').textContent = `Could not load file: ${e.message}`;
+        setStatus('Error loading file');
+      }
+    }
+
+    // Exercise tab clicks
+    document.querySelectorAll('.ex-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.ex-tab').forEach(b => b.classList.remove('ex-tab-active'));
+        btn.classList.add('ex-tab-active');
+        currentEx = btn.dataset.ex;
+        document.getElementById('ex-desc').textContent = descriptions[currentEx] || '';
+        loadFile();
+      });
+    });
+
+    // Problem / Solution toggle
+    document.querySelectorAll('.file-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        btn.classList.add('file-toggle-active');
+        currentFile = btn.dataset.file;
+        loadFile();
+      });
+    });
+
+    // Copy button
+    document.getElementById('ex-copy-btn').addEventListener('click', () => {
+      const text = document.getElementById('ex-code-inner').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('ex-copy-btn');
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = '⎘ copy'; }, 1500);
+      });
+    });
+
+    // Initial description + load
+    document.getElementById('ex-desc').textContent = descriptions[currentEx];
+    loadFile();
+  })();
+  </script>
+
   <!-- ── Watch ── -->
   <h2>Watch First</h2>
 
