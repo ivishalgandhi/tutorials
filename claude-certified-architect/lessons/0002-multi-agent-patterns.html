@@ -6,19 +6,108 @@
   <title>Lesson 2 — Orchestrator & Subagent Patterns</title>
   <link rel="stylesheet" href="../assets/style.css">
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    .spectrum {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      margin: 1.5em 0;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.82rem;
+    }
+    .spectrum-cell {
+      flex: 1;
+      padding: 0.8em 0.7em;
+      text-align: center;
+      line-height: 1.4;
+    }
+    .spectrum-cell .pct { font-size: 0.72rem; color: var(--muted); margin-top: 0.3em; }
+    .spec-1 { background: #fff8e1; }
+    .spec-2 { background: #fff3cd; }
+    .spec-3 { background: #ffe8a0; }
+    .spec-4 { background: #ecfdf5; border-left: 3px solid var(--success); }
+    .spectrum-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 0.4em;
+    }
+    .cribsheet {
+      background: #fff0ee;
+      border: 1px solid #f5c6c0;
+      border-radius: 8px;
+      padding: 1.2em 1.4em;
+      margin: 1.5em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.88rem;
+    }
+    .cribsheet h4 { color: var(--danger); margin-bottom: 0.5em; font-size: 0.82rem; }
+    .cribsheet-good {
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      border-radius: 8px;
+      padding: 1.2em 1.4em;
+      margin: 1.5em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.88rem;
+    }
+    .cribsheet-good h4 { color: var(--success); margin-bottom: 0.5em; font-size: 0.82rem; }
+    .mnemonic-table td:first-child { font-family: 'Menlo', monospace; font-size: 0.82rem; color: var(--elephant); font-weight: 600; }
+    .official-q {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--elephant);
+      border-radius: 0 6px 6px 0;
+      padding: 1em 1.2em;
+      margin: 1.4em 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.85rem;
+    }
+    .official-q .q-label {
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--elephant);
+      margin-bottom: 0.5em;
+    }
+    .not-tested {
+      background: #f8f8f8;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.9em 1.1em;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .not-tested strong { color: var(--text); }
+  </style>
 </head>
 <body>
 <div class="page">
   <div class="lesson-meta">
-    <span class="tag">Domain 1</span>
-    <span class="tag domain-1">Agentic Architecture</span>
-    <span>Lesson 2 of 13</span>
+    <span class="tag">Lesson 2 · D1</span>
+    <span>Claude Certified Architect · Foundations</span>
+    <span>~30 min</span>
+    <span><a href="../index.html">Course home</a></span>
   </div>
 
-  <h1>Lesson 2 — Orchestrator & Subagent Patterns</h1>
+  <h1>Orchestrator &amp; Subagent Patterns — Why the Coordinator Is Always the Suspect</h1>
 
-  <p class="primary-source">
-    <span class="ps-label">Primary sources</span>
+  <div class="not-tested">
+    <strong>Not on this exam — don't waste prep time on:</strong>
+    AutoGen, CrewAI, or LangGraph API specifics · recursive subagent trees (SDK forbids them) ·
+    general workflow orchestration frameworks (Airflow, Prefect) · multi-agent negotiation protocols
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary sources for this lesson</div>
     <strong>Best video on this topic:</strong>
     <a href="https://www.youtube.com/watch?v=P60LqQg1RH8" target="_blank">Stop Using Claude Code Like This (Use Sub-Agents Instead)</a>
     — Leon van Zyl · 101.8K views · 3.0K likes · 31 min<br>
@@ -27,7 +116,7 @@
     — Anthropic Engineering (June 2025)<br>
     <strong>SDK reference:</strong>
     <a href="https://platform.claude.com/docs/en/agent-sdk/subagents" target="_blank">Claude Agent SDK: Subagents</a>
-  </p>
+  </div>
 
   <!-- ── 1. The One Frame ── -->
   <h2>1. The One Frame</h2>
@@ -390,22 +479,8 @@ sequenceDiagram
     Single agent beats multi-agent when a single agent suffices. Don't over-engineer.
   </div>
 
-  <!-- ── 10. Not on this exam ── -->
-  <h2>10. Not on This Exam</h2>
-
-  <div class="callout warning">
-    <div class="label">Don't waste time here</div>
-    <ul>
-      <li>Specific async orchestration frameworks (Celery, Airflow, Prefect) — the exam is about
-        Claude Agent SDK primitives, not general workflow engines.</li>
-      <li>Reinforcement learning or multi-agent negotiation protocols.</li>
-      <li>Recursive subagent trees — subagents cannot spawn their own subagents in the SDK.</li>
-      <li>AutoGen, CrewAI, LangGraph specifics — only the architectural patterns matter.</li>
-    </ul>
-  </div>
-
-  <!-- ── 11. Official sample questions ── -->
-  <h2>11. Apply It — Official Sample Questions</h2>
+  <!-- ── 10. Official sample questions ── -->
+  <h2>10. Apply It — Official Sample Questions</h2>
 
   <div class="official-q">
     <div class="q-label">Official Sample Question 7 — Multi-Agent Research Coverage</div>
