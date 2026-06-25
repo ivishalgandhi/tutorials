@@ -207,9 +207,55 @@
   <h2>3. The Agentic Loop — Know This Cold</h2>
 
   <p>
-    Every agentic system wraps the Messages API in a loop. The loop terminates on one machine-readable
-    signal, not on text content. Here is the canonical structure:
+    Every time you call the Claude API, the response contains a field called <code>stop_reason</code>.
+    It's Claude's way of telling your code <strong>why it stopped writing</strong> — and your code's
+    job is to look at that field and decide what to do next.
   </p>
+
+  <p>Think of it as a traffic light with four colours:</p>
+
+  <table>
+    <thead><tr><th>stop_reason</th><th>What Claude is saying</th><th>What your code does</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>"end_turn"</code></td>
+        <td>"I'm done. Here's your answer."</td>
+        <td>Read the text. <strong>Stop the loop.</strong></td>
+      </tr>
+      <tr>
+        <td><code>"tool_use"</code></td>
+        <td>"I need to call a function. Run it and tell me the result."</td>
+        <td>Execute the tool. Send the result back. <strong>Keep looping.</strong></td>
+      </tr>
+      <tr>
+        <td><code>"max_tokens"</code></td>
+        <td>"I ran out of space. My answer got cut off."</td>
+        <td>Treat as an error. <strong>Don't return partial text silently.</strong></td>
+      </tr>
+      <tr>
+        <td><code>"stop_sequence"</code></td>
+        <td>"I hit a custom stop marker you configured."</td>
+        <td>Handle based on your app logic. Stop the loop.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">The one-liner</div>
+    <code>"end_turn"</code> = done, break the loop. &nbsp;
+    <code>"tool_use"</code> = not done, run the tool, keep going. &nbsp;
+    Everything else = something went wrong — handle it explicitly, never silently.
+  </div>
+
+  <p>
+    The trap most people fall into: checking if the response <em>text</em> says something like
+    <code>"Task complete"</code> instead of checking <code>stop_reason</code>. That works 98% of
+    the time — but Claude occasionally phrases its ending differently, and the loop hangs forever.
+    <code>stop_reason</code> is a <strong>machine contract</strong>. The text is just words.
+    Exercise 01 is exactly this bug.
+  </p>
+
+  <p>Now the canonical loop structure — every line follows directly from the table above:</p>
 
   <pre><code>messages = [{"role": <span class="st">"user"</span>, "content": user_input}]
 
