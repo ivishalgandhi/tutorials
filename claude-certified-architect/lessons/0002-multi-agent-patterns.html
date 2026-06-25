@@ -100,6 +100,12 @@
 
   <h1>Orchestrator &amp; Subagent Patterns — Why the Coordinator Is Always the Suspect</h1>
 
+  <div class="callout key">
+    <div class="label">The One Frame</div>
+    <strong>Prompts are probabilistic. Hooks are deterministic.</strong><br>
+    In multi-agent systems, add this: <strong>Subagents are isolated. The coordinator owns decomposition, partitioning, and context passing.</strong>
+  </div>
+
   <div class="not-tested">
     <strong>Not on this exam — don't waste prep time on:</strong>
     AutoGen, CrewAI, or LangGraph API specifics · recursive subagent trees (SDK forbids them) ·
@@ -120,12 +126,6 @@
 
   <!-- ── 1. The One Frame ── -->
   <h2>1. The One Frame</h2>
-
-  <div class="callout key">
-    <div class="label">The One Frame</div>
-    <strong>Prompts are probabilistic. Hooks are deterministic.</strong><br>
-    In multi-agent systems, add this: <strong>Subagents are isolated. The coordinator owns decomposition, partitioning, and context passing.</strong>
-  </div>
 
   <p>
     This lesson is about the second half of Domain 1: when one agent is not enough, you split the work
@@ -158,9 +158,10 @@ flowchart LR
     C <-->|Task| S1
     C <-->|Task| S2
     C <-->|Task| S3
-    S1 -.X.->|never| S2
-    S2 -.X.->|never| S3
-    S1 -.X.->|never| S3
+    NOTE["No direct subagent-to-subagent links"]
+    NOTE -.-> S1
+    NOTE -.-> S2
+    NOTE -.-> S3
     </div>
     <div class="diagram-caption">
       All inter-subagent communication goes through the coordinator. Direct agent-to-agent links break observability and error control.
