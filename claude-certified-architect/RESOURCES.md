@@ -54,9 +54,19 @@
   Raw content saved locally: `/Users/vishal/claude-certified-architect-book/daronyondem-exam-prep-guide.md`
   Use for: understanding the model-vs-code design principle, anti-pattern checklist.
 
+- [avidevelops/claude-architect-exam-prep ★474](https://github.com/avidevelops/claude-architect-exam-prep)
+  Q&A-style breakdown of multi-agent architectures, context management, tool/schema design,
+  and batch processing. Best for: Lesson 2 (orchestrator/subagent patterns) and architectural
+  tradeoff questions. Raw content saved locally:
+  `/Users/vishal/claude-certified-architect-book/avidevelops-exam-prep.md`
+
 - [dnacenta/claude-certified-architect ★24](https://github.com/dnacenta/claude-certified-architect)
   Per-domain deep dives (5 files). Good for: targeted domain review.
   Raw content saved locally: `/Users/vishal/claude-certified-architect-book/dnacenta-d*.md`
+
+- [OlivierAlter/Claude-Certified-Architect-Foundations-Certification-Exam ★125](https://github.com/OlivierAlter/Claude-Certified-Architect-Foundations-Certification-Exam)
+  77 scenario-based questions reverse-engineered from the official exam guide. Includes a
+  Claude Code skill for interactive exam sessions. Use for: high-volume question drill.
 
 - [NaveenBabuBommisetty/claude-architect-notes](https://github.com/naveenbabubommisetty/claude-architect-notes)
   Domain tutorials, anti-patterns guide, 60 practice questions.

@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2 — Orchestrator & Subagent Patterns</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+  <div class="lesson-meta">
+    <span class="tag">Domain 1</span>
+    <span class="tag domain-1">Agentic Architecture</span>
+    <span>Lesson 2 of 13</span>
+  </div>
+
+  <h1>Lesson 2 — Orchestrator & Subagent Patterns</h1>
+
+  <p class="primary-source">
+    <span class="ps-label">Primary sources</span>
+    <strong>Best video on this topic:</strong>
+    <a href="https://www.youtube.com/watch?v=P60LqQg1RH8" target="_blank">Stop Using Claude Code Like This (Use Sub-Agents Instead)</a>
+    — Leon van Zyl · 101.8K views · 3.0K likes · 31 min<br>
+    <strong>Authoritative article:</strong>
+    <a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank">How we built our multi-agent research system</a>
+    — Anthropic Engineering (June 2025)<br>
+    <strong>SDK reference:</strong>
+    <a href="https://platform.claude.com/docs/en/agent-sdk/subagents" target="_blank">Claude Agent SDK: Subagents</a>
+  </p>
+
+  <!-- ── 1. The One Frame ── -->
+  <h2>1. The One Frame</h2>
+
+  <div class="callout key">
+    <div class="label">The One Frame</div>
+    <strong>Prompts are probabilistic. Hooks are deterministic.</strong><br>
+    In multi-agent systems, add this: <strong>Subagents are isolated. The coordinator owns decomposition, partitioning, and context passing.</strong>
+  </div>
+
+  <p>
+    This lesson is about the second half of Domain 1: when one agent is not enough, you split the work
+    across a coordinator and subagents. The exam tests whether you can tell the difference between a
+    <strong>coordinator problem</strong> (bad decomposition) and a <strong>subagent problem</strong>
+    (bad execution).
+  </p>
+
+  <p>
+    The user-facing symptom almost always looks like the subagent: a missing topic, a shallow answer,
+    a duplicate section. But if the subagent executed successfully and produced coherent output, the
+    fault is upstream — in the coordinator's brief.
+  </p>
+
+  <!-- ── 2. Hub-and-Spoke ── -->
+  <h2>2. Hub-and-Spoke: The Only Topology</h2>
+
+  <p>
+    The canonical multi-agent architecture is a hub-and-spoke: the coordinator sits in the center,
+    subagents radiate outward, and every message between subagents routes through the hub.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    C["Coordinator"]
+    S1["Subagent 1<br/>(search)"]
+    S2["Subagent 2<br/>(analysis)"]
+    S3["Subagent 3<br/>(synthesis)"]
+    C <-->|Task| S1
+    C <-->|Task| S2
+    C <-->|Task| S3
+    S1 -.X.->|never| S2
+    S2 -.X.->|never| S3
+    S1 -.X.->|never| S3
+    </div>
+    <div class="diagram-caption">
+      All inter-subagent communication goes through the coordinator. Direct agent-to-agent links break observability and error control.
+    </div>
+  </div>
+
+  <p>
+    <strong>Why no direct agent-to-agent links?</strong>
+    Because the coordinator must aggregate, validate, and recover. If subagent A talks directly to
+    subagent B, the coordinator loses observability, can't handle failures, and can't decide whether
+    the intermediate result is good enough.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">Distractor</div>
+    Any exam answer that says "have subagent A pass results directly to subagent B" is wrong.
+    The hub-and-spoke topology is the exam's default correct architecture.
+  </div>
+
+  <!-- ── 3. Subagent context isolation ── -->
+  <h2>3. Subagent Context Isolation</h2>
+
+  <p>
+    A subagent is a fresh agent instance. It has its own conversation history, its own system prompt,
+    its own tool whitelist, and no memory of the coordinator's conversation.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Coordinator
+    participant S as Subagent
+
+    C->>S: Task prompt: "Analyze this document.<br/>Document: [...]<br/>Output format: [...]"
+    Note over S: Own context window<br/>Own system prompt<br/>Own tools
+    S-->>C: Final result only
+    Note over C: Parent never sees intermediate tool calls
+    </div>
+    <div class="diagram-caption">
+      Only the subagent's final result returns to the coordinator. Intermediate tool calls stay inside the subagent.
+    </div>
+  </div>
+
+  <p><strong>What a subagent receives:</strong></p>
+  <ul>
+    <li>Its own system prompt (defined in the coordinator's agent roster)</li>
+    <li>The invocation prompt from the coordinator (the <code>Task</code> tool input)</li>
+    <li>Tool definitions for tools explicitly listed for that subagent</li>
+  </ul>
+
+  <p><strong>What a subagent does NOT receive:</strong></p>
+  <ul>
+    <li>Coordinator's conversation history</li>
+    <li>Coordinator's system prompt</li>
+    <li>Coordinator's tool results</li>
+    <li>Skills (unless explicitly listed in the subagent definition)</li>
+  </ul>
+
+  <div class="callout key">
+    <div class="label">Mnemonic</div>
+    <strong>Subagent state: nothing carries over. The prompt is the universe.</strong>
+  </div>
+
+  <p>
+    This is why "forward the full conversation transcript to the human reviewer" is a wrong answer.
+    The full transcript is noise; the subagent needs only the structured inputs and output contract
+    defined by the coordinator.
+  </p>
+
+  <!-- ── 4. The Task tool ── -->
+  <h2>4. The Task Tool — Without It, Nothing Delegates</h2>
+
+  <p>
+    In the Claude Agent SDK, the coordinator spawns subagents via the built-in <code>Task</code> tool.
+    If the coordinator's <code>allowedTools</code> list does not include <code>"Task"</code>, the
+    coordinator will never delegate — it will try to do everything inline.
+  </p>
+
+  <pre><code><span class="kw">from</span> claude_agent_sdk <span class="kw">import</span> AgentDefinition
+
+coordinator = AgentDefinition(
+    name=<span class="st">"research-coordinator"</span>,
+    description=<span class="st">"Plans research and delegates to specialized subagents."</span>,
+    system_prompt=<span class="st">"You are a research coordinator..."</span>,
+    allowed_tools=[<span class="st">"Task"</span>, <span class="st">"verify_fact"</span>],  <span class="cm"># ← Task must be present</span>
+    agents={
+        <span class="st">"web-searcher"</span>: AgentDefinition(
+            description=<span class="st">"Searches the web for current sources on a topic."</span>,
+            prompt=<span class="st">"You are a web research specialist..."</span>,
+            tools=[<span class="st">"WebSearch"</span>, <span class="st">"WebFetch"</span>],
+            model=<span class="st">"sonnet"</span>,
+        ),
+        <span class="st">"analyst"</span>: AgentDefinition(
+            description=<span class="st">"Analyzes and summarizes documents."</span>,
+            prompt=<span class="st">"You are a document analysis specialist..."</span>,
+            tools=[<span class="st">"ReadFile"</span>],
+            model=<span class="st">"sonnet"</span>,
+        ),
+    }
+)</code></pre>
+
+  <div class="callout warning">
+    <div class="label">Common exam bug</div>
+    <strong>"Won't delegate"</strong> almost always means the coordinator's <code>allowedTools</code>
+    is missing <code>"Task"</code>. The model wants to delegate, but the harness doesn't let it.
+  </div>
+
+  <h3>Parallel spawning</h3>
+
+  <p>
+    A coordinator can call multiple <code>Task</code> tools in a single response. The SDK executes
+    them concurrently.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Coordinator
+    participant S1 as Subagent A
+    participant S2 as Subagent B
+    participant S3 as Subagent C
+
+    C->>S1: Task: "Research X"
+    C->>S2: Task: "Research Y"
+    C->>S3: Task: "Research Z"
+    Note over S1,S3: All three run in parallel
+    S1-->>C: Result A
+    S2-->>C: Result B
+    S3-->>C: Result C
+    </div>
+    <div class="diagram-caption">
+      One coordinator response can spawn multiple subagents. The SDK runs them in parallel automatically.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <div class="label">Constraint</div>
+    Subagents cannot spawn their own subagents. The orchestration tree is <strong>one level deep</strong>.
+  </div>
+
+  <!-- ── 5. Task decomposition patterns ── -->
+  <h2>5. Task Decomposition Patterns</h2>
+
+  <p>
+    The coordinator's first job is to decide how to split the work. The exam tests four patterns:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Pattern</th><th>When</th><th>Exam signal</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Fixed sequential pipeline</strong></td>
+        <td>Stable structure; each step consumes the prior step's output</td>
+        <td>"Every X follows the same flow"</td>
+      </tr>
+      <tr>
+        <td><strong>Dynamic decomposition</strong></td>
+        <td>Varying requests; typed subagents (search / doc / synth)</td>
+        <td>"Same roles, scope varies per query"</td>
+      </tr>
+      <tr>
+        <td><strong>Orchestrator–worker</strong></td>
+        <td>Uniform workers differentiated only by prompt-supplied scope</td>
+        <td>"N workers, each a different sub-topic"</td>
+      </tr>
+      <tr>
+        <td><strong>Evaluator–optimiser</strong></td>
+        <td>Explicit checkable quality criteria; first pass often inadequate</td>
+        <td>"Iterate until coverage/format passes"</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Evaluator–optimiser trap</h3>
+
+  <p>
+    The evaluator–optimiser pattern only works when the evaluator can check quality objectively.
+    If the criteria are subjective — "make the report more compelling" — the loop spins indefinitely
+    because the evaluator can always argue the output isn't good enough yet.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">Wrong answer pattern</div>
+    "Iterate until the synthesis agent is satisfied with quality" — wrong when "satisfied" is not
+    objectively defined.
+  </div>
+
+  <!-- ── 6. Failure tracing table ── -->
+  <h2>6. Failure Tracing — Blame the Right Layer</h2>
+
+  <p>
+    This table is the most important exam tool in this lesson. When a multi-agent system produces
+    bad output, the symptom tells you where to look:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Symptom</th><th>Root cause</th><th>Fix</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Missing topics</strong> in output</td>
+        <td>Coordinator's <strong>decomposition</strong> too narrow</td>
+        <td>Assign subagents to cover all required dimensions</td>
+      </tr>
+      <tr>
+        <td><strong>Duplicated work</strong> / redundant sources</td>
+        <td>Coordinator's <strong>scope partitioning</strong> sloppy</td>
+        <td>Define non-overlapping scopes per subagent</td>
+      </tr>
+      <tr>
+        <td><strong>Shallow</strong> on every topic</td>
+        <td>Subagent <strong>prompts</strong> or tool budgets</td>
+        <td>Improve subagent instructions or give more tool budget</td>
+      </tr>
+      <tr>
+        <td><strong>Missing source attribution</strong></td>
+        <td><strong>Context-passing</strong> format (prose instead of claim→source)</td>
+        <td>Pass structured data with claim → source mappings</td>
+      </tr>
+      <tr>
+        <td>Coordinator <strong>"won't delegate"</strong></td>
+        <td><code>allowedTools</code> missing <code>"Task"</code></td>
+        <td>Add <code>"Task"</code> to coordinator's tool list</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">Rule</div>
+    If subagents complete successfully and the output is <strong>missing dimensions</strong>,
+    blame the coordinator's <strong>decomposition</strong>.<br>
+    If subagents complete successfully and produce <strong>overlapping work</strong>,
+    blame the coordinator's <strong>partitioning</strong>.<br>
+    If subagents fail or produce poor quality, blame the subagent <strong>prompts or tools</strong>.
+  </div>
+
+  <!-- ── 7. Error propagation ── -->
+  <h2>7. Error Propagation — Structured Context</h2>
+
+  <p>
+    When a subagent fails, the coordinator needs enough information to decide what to do next:
+    retry, route around, or escalate. A generic "search unavailable" message is useless.
+  </p>
+
+  <p><strong>Good structured error context:</strong></p>
+  <ul>
+    <li>Failure type (timeout, 429, 404, malformed input)</li>
+    <li>The attempted query / task</li>
+    <li>Partial results, if any</li>
+    <li>Alternative approaches the coordinator could try</li>
+  </ul>
+
+  <p><strong>Bad answers:</strong></p>
+  <ul>
+    <li>"Catch the error and return an empty result set marked as successful" — masks failure as success</li>
+    <li>"Return a generic 'search unavailable' status" — strips the coordinator of context</li>
+    <li>"Forward the full conversation transcript to a human reviewer" — unstructured noise</li>
+  </ul>
+
+  <!-- ── 8. Principle of least privilege ── -->
+  <h2>8. Principle of Least Privilege</h2>
+
+  <p>
+    Give each subagent only the tools it needs. The synthesis agent from the official sample
+    questions needs to verify simple facts — dates, names, statistics — but not run full web searches.
+  </p>
+
+  <p>
+    <strong>Correct design:</strong> Give the synthesis agent a scoped <code>verify_fact</code> tool
+    for the simple 85% case, and keep complex verifications routed through the coordinator.
+  </p>
+
+  <p><strong>Wrong design:</strong> Give the synthesis agent access to all web search tools. This
+    violates separation of concerns and lets the synthesis agent drift into research territory.
+  </p>
+
+  <div class="callout info">
+    <div class="label">Exam signal</div>
+    "85% of verifications are simple, 15% require deeper investigation" → scoped tool for the 85%,
+    coordinator handles the 15%.
+  </div>
+
+  <!-- ── 9. Multi-agent tradeoffs ── -->
+  <h2>9. Multi-Agent Tradeoffs</h2>
+
+  <p>
+    Anthropic's own multi-agent research system beat single-agent Claude Opus 4 by <strong>90.2%</strong>
+    on internal research evals — but at roughly <strong>15× the token cost</strong>.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Use multi-agent when</th><th>Don't use multi-agent when</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Heavy parallelization is possible</td>
+        <td>Agents must tightly share the same context</td>
+      </tr>
+      <tr>
+        <td>Information exceeds a single context window</td>
+        <td>Many dependencies between subagents</td>
+      </tr>
+      <tr>
+        <td>Task value justifies the token cost</td>
+        <td>Few truly parallelizable subtasks (most coding tasks)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">Proportionate design</div>
+    Single agent beats multi-agent when a single agent suffices. Don't over-engineer.
+  </div>
+
+  <!-- ── 10. Not on this exam ── -->
+  <h2>10. Not on This Exam</h2>
+
+  <div class="callout warning">
+    <div class="label">Don't waste time here</div>
+    <ul>
+      <li>Specific async orchestration frameworks (Celery, Airflow, Prefect) — the exam is about
+        Claude Agent SDK primitives, not general workflow engines.</li>
+      <li>Reinforcement learning or multi-agent negotiation protocols.</li>
+      <li>Recursive subagent trees — subagents cannot spawn their own subagents in the SDK.</li>
+      <li>AutoGen, CrewAI, LangGraph specifics — only the architectural patterns matter.</li>
+    </ul>
+  </div>
+
+  <!-- ── 11. Official sample questions ── -->
+  <h2>11. Apply It — Official Sample Questions</h2>
+
+  <div class="official-q">
+    <div class="q-label">Official Sample Question 7 — Multi-Agent Research Coverage</div>
+    <p>
+      After running the system on the topic "impact of AI on creative industries," you observe that
+      each subagent completes successfully: the web search agent finds relevant articles, the document
+      analysis agent summarizes papers correctly, and the synthesis agent produces coherent output.
+      However, the final reports cover only visual arts, completely missing music, writing, and film
+      production. When you examine the coordinator's logs, you see it decomposed the topic into
+      three subtasks: "AI in digital art creation," "AI in graphic design," and "AI in photography."
+      What is the most likely root cause?
+    </p>
+    <p>
+      <strong>A)</strong> The synthesis agent lacks instructions for identifying coverage gaps in the findings it receives from other agents.<br>
+      <strong>B)</strong> The coordinator agent's task decomposition is too narrow, resulting in subagent assignments that don't cover all relevant domains of the topic.<br>
+      <strong>C)</strong> The web search agent's queries are not comprehensive enough and need to be expanded to cover more creative industry sectors.<br>
+      <strong>D)</strong> The document analysis agent is filtering out sources related to non-visual creative industries due to overly restrictive relevance criteria.
+    </p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Why B is correct</div>
+    The prompt says all three subagents <strong>complete successfully</strong> and produce coherent
+    output. The coordinator's logs show the decomposition was visual-arts-only. The subagents did
+    exactly what they were told. Missing dimensions = coordinator's decomposition.
+  </div>
+
+  <div class="official-q">
+    <div class="q-label">Official Sample Question 8 — Subagent Failure Propagation</div>
+    <p>
+      The web search subagent times out while researching a complex topic. You need to design how
+      this failure information flows back to the coordinator agent. Which error propagation approach
+      best enables intelligent recovery?
+    </p>
+    <p>
+      <strong>A)</strong> Return structured error context to the coordinator including the failure type, the attempted query, any partial results, and potential alternative approaches.<br>
+      <strong>B)</strong> Implement automatic retry logic with exponential backoff within the subagent, returning a generic "search unavailable" status only after all retries are exhausted.<br>
+      <strong>C)</strong> Catch the timeout within the subagent and return an empty result set marked as successful.<br>
+      <strong>D)</strong> Propagate the timeout exception directly to a top-level handler that terminates the entire research workflow.
+    </p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Why A is correct</div>
+    The coordinator needs <strong>structured context</strong> to decide: retry with a different query,
+    proceed with partial results, or escalate. B hides context. C masks failure as success. D gives up
+    on the entire workflow when one subagent hiccups.
+  </div>
+
+  <div class="official-q">
+    <div class="q-label">Official Sample Question 9 — Least Privilege for Verification</div>
+    <p>
+      During testing, you observe that the synthesis agent frequently needs to verify specific claims
+      while combining findings. Currently, when verification is needed, the synthesis agent returns
+      control to the coordinator, which invokes the web search agent, then re-invokes synthesis with
+      results. This adds 2-3 round trips per task and increases latency by 40%. Your evaluation shows
+      that 85% of these verifications are simple fact-checks (dates, names, statistics) while 15%
+      require deeper investigation. What's the most effective approach to reduce overhead while
+      maintaining system reliability?
+    </p>
+    <p>
+      <strong>A)</strong> Give the synthesis agent a scoped <code>verify_fact</code> tool for simple lookups, while complex verifications continue delegating to the web search agent through the coordinator.<br>
+      <strong>B)</strong> Have the synthesis agent accumulate all verification needs and return them as a batch to the coordinator at the end of its pass, which then sends them all to the web search agent at once.<br>
+      <strong>C)</strong> Give the synthesis agent access to all web search tools so it can handle any verification need directly without round-trips through the coordinator.<br>
+      <strong>D)</strong> Have the web search agent proactively cache extra context around each source during initial research, anticipating what the synthesis agent might need to verify.
+    </p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Why A is correct</div>
+    Option A is the <strong>principle of least privilege</strong> applied to a latency problem: give
+    the synthesis agent only the small tool it needs for the common case, keep the coordinator in the
+    loop for complex cases. B creates blocking dependencies. C over-provisions and breaks separation
+    of concerns. D is speculative caching.
+  </div>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Practice — Wrong Answer Elimination</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">
+      These questions follow the official exam format. For each one, think about <em>why</em> the wrong answers are wrong.
+    </p>
+
+    <div class="quiz"
+         data-question="A coordinator agent is configured with three subagents: search, analysis, and synthesis. The user asks for a report on 'renewable energy in Europe.' Each subagent completes successfully, but the final report covers only solar and wind, completely missing hydro, geothermal, and biomass. The subagent outputs are coherent. Where is the fault?"
+         data-correct="B"
+         data-feedback-correct="Correct. The subagents completed successfully. Missing topics = coordinator's decomposition too narrow. The coordinator only assigned solar and wind subtasks."
+         data-feedback-wrong="Ask: did the subagents fail, or were they not asked to cover the missing topics?">
+      <div class="quiz-option" data-key="A">The synthesis agent needs a tool to detect coverage gaps across subagent outputs.</div>
+      <div class="quiz-option" data-key="B">The coordinator's task decomposition is too narrow and omitted key energy sectors.</div>
+      <div class="quiz-option" data-key="C">The search agent should use broader queries to surface non-renewable alternatives.</div>
+      <div class="quiz-option" data-key="D">The analysis agent is filtering out non-solar/wind sources before synthesis.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A research coordinator with allowedTools=['WebSearch', 'WebFetch', 'ReadFile'] never invokes its subagents, even when the user asks for a broad topic that clearly needs parallel exploration. What is the most likely cause?"
+         data-correct="C"
+         data-feedback-correct="Correct. The coordinator's allowedTools list is missing 'Task'. Without the Task tool, the coordinator cannot spawn subagents."
+         data-feedback-wrong="The subagents are defined. The question is why the coordinator won't use them. Look at the tool list.">
+      <div class="quiz-option" data-key="A">The subagent descriptions are too vague for the coordinator to choose one.</div>
+      <div class="quiz-option" data-key="B">The coordinator's system prompt does not explicitly instruct it to delegate.</div>
+      <div class="quiz-option" data-key="C">The coordinator's allowedTools list is missing 'Task', so it cannot invoke subagents.</div>
+      <div class="quiz-option" data-key="D">The subagents are defined with model='inherit' and inherit a model that is too expensive.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A subagent that searches an internal API returns an empty result set when the API times out. The subagent marks the result as successful. The final research report is published with missing data. What is the best fix?"
+         data-correct="A"
+         data-feedback-correct="Correct. Returning empty results marked as success masks failure. The subagent should return structured error context so the coordinator can retry, route around, or escalate."
+         data-feedback-wrong="Silently returning empty results is failure masking. What should the coordinator receive instead?">
+      <div class="quiz-option" data-key="A">Return structured error context (failure type, query, partial results, alternatives) to the coordinator.</div>
+      <div class="quiz-option" data-key="B">Add automatic retry with exponential backoff inside the subagent and return empty if it still fails.</div>
+      <div class="quiz-option" data-key="C">Forward the full subagent conversation transcript to the human reviewer for manual intervention.</div>
+      <div class="quiz-option" data-key="D">Pre-cache the entire internal API in the coordinator so the subagent never needs to call it.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A report-generation system uses an evaluator-optimiser loop: a writer subagent produces a draft, an evaluator subagent checks it, and the loop repeats until the evaluator is 'satisfied.' The loop often runs 20+ iterations without converging. What is the root cause?"
+         data-correct="B"
+         data-feedback-correct="Correct. Evaluator-optimiser loops require objectively checkable criteria. 'Satisfied' is subjective, so the loop can always demand one more pass."
+         data-feedback-wrong="What does the evaluator check? If the criteria are not measurable, the loop has no termination condition.">
+      <div class="quiz-option" data-key="A">The writer subagent needs more few-shot examples of high-quality reports.</div>
+      <div class="quiz-option" data-key="B">The evaluator's criteria are not objectively checkable, so the loop has no stable termination condition.</div>
+      <div class="quiz-option" data-key="C">The coordinator should directly assign the writer subagent instead of using an evaluator loop.</div>
+      <div class="quiz-option" data-key="D">The loop should use a higher-tier model for the evaluator to reach convergence faster.</div>
+    </div>
+  </div>
+
+  <!-- ── Watch ── -->
+  <h2>Watch First</h2>
+
+  <div class="callout info" style="padding: 0; overflow: hidden; border-radius: 8px;">
+    <div style="padding: 0.9em 1.1em 0.6em;">
+      <div class="label">Best video on this topic</div>
+      <strong>Stop Using Claude Code Like This (Use Sub-Agents Instead)</strong> — Leon van Zyl<br>
+      <span style="font-size:0.82rem; color: var(--muted);">101.8K views · 3.0K likes · 31 min</span><br>
+      <span style="font-size:0.82rem; color: var(--muted);">
+        Covers: built-in subagents (Explore, Planning, Bash), custom specialized agents,
+        parallel subagent workflows, wave-based implementation, context-window isolation.
+        Highest-viewed practical tutorial on Claude subagents and orchestration.
+      </span>
+    </div>
+    <div style="position:relative; padding-bottom: 56.25%; height: 0; overflow: hidden;">
+      <iframe
+        src="https://www.youtube.com/embed/P60LqQg1RH8"
+        title="Stop Using Claude Code Like This (Use Sub-Agents Instead) — Leon van Zyl"
+        style="position:absolute; top:0; left:0; width:100%; height:100%; border:0;"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <!-- ── What's next ── -->
+  <h2>What's next</h2>
+
+  <p>
+    You now have the multi-agent frame: hub-and-spoke, context isolation, the Task tool, decomposition
+    patterns, and failure tracing. Lesson 3 builds directly on this: lifecycle hooks (PreToolUse / PostToolUse),
+    idempotency keys, and error classification in the Agent SDK.
+  </p>
+
+  <ul>
+    <li>Next: <a href="0003-lifecycle-hooks.html">Lesson 3 — Lifecycle Hooks & Agent SDK</a></li>
+    <li>Reference: <a href="../reference/multi-agent-orchestration.html">Multi-Agent Orchestration Reference</a></li>
+    <li>Practice all 12 official sample questions: <a href="https://ankitrahejagatech.github.io/claude-certified-architect-prep/practice-exam.html" target="_blank">Interactive practice exam</a></li>
+  </ul>
+
+  <div class="teacher-note">
+    <strong>Questions?</strong> Ask your teacher anything that's unclear — why direct subagent-to-subagent
+    communication breaks the pattern, when to use an evaluator-optimiser loop, or how the failure-tracing
+    table maps to a system you're designing.
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0001-agentic-loop.html">← Lesson 1: The Agentic Loop</a>
+    <a href="0003-lifecycle-hooks.html">Lesson 3: Lifecycle Hooks →</a>
+  </div>
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

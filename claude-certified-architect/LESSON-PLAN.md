@@ -23,7 +23,7 @@
 | # | Title | Domain | Status | File |
 |---|-------|--------|--------|------|
 | 01 | The Agentic Loop & The One Frame | D1 | ✅ Done | `lessons/0001-agentic-loop.html` |
-| 02 | Orchestrator & Subagent Patterns | D1 | ⬜ Next | `lessons/0002-multi-agent-patterns.html` |
+| 02 | Orchestrator & Subagent Patterns | D1 | ✅ Done | `lessons/0002-multi-agent-patterns.html` |
 | 03 | Lifecycle Hooks & Agent SDK | D1 | ⬜ | `lessons/0003-lifecycle-hooks.html` |
 | 04 | CLAUDE.md — The Project Constitution | D3 | ⬜ | `lessons/0004-claude-md.html` |
 | 05 | Hooks: Deterministic Guarantees | D3 | ⬜ | `lessons/0005-hooks-deterministic.html` |

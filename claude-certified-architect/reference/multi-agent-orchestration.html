@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-Agent Orchestration Reference</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+  <h1>Multi-Agent Orchestration Reference</h1>
+  <div class="lesson-meta">
+    <span class="tag">Domain 1</span>
+    <span>Claude Certified Architect</span>
+  </div>
+
+  <p class="primary-source">
+    <span class="ps-label">Primary sources</span>
+    <a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank">Anthropic: How we built our multi-agent research system</a><br>
+    <a href="https://platform.claude.com/docs/en/agent-sdk/subagents" target="_blank">Claude Agent SDK: Subagents</a>
+  </p>
+
+  <h2>The One Frame</h2>
+  <div class="callout key">
+    <div class="label">One Frame</div>
+    <strong>Prompts are probabilistic. Hooks are deterministic.</strong><br>
+    Subagents are isolated. The coordinator is responsible for decomposition, partitioning, and context passing.
+  </div>
+
+  <h2>Hub-and-Spoke Topology</h2>
+  <ul>
+    <li>Coordinator sits in the center; all subagents radiate out.</li>
+    <li>All inter-subagent communication routes through the coordinator — never agent-to-agent.</li>
+    <li>The coordinator decomposes, delegates, aggregates, validates, and handles errors.</li>
+  </ul>
+
+  <h2>Subagent Context Isolation</h2>
+  <ul>
+    <li>Subagents do <strong>not</strong> inherit the coordinator's conversation history.</li>
+    <li>Subagents do <strong>not</strong> inherit the coordinator's system prompt.</li>
+    <li>Subagents do <strong>not</strong> inherit parent tool results or skills (unless explicitly listed).</li>
+    <li>Every byte the subagent needs must be in its invocation prompt.</li>
+  </ul>
+  <div class="callout info">
+    <div class="label">Memory aid</div>
+    <strong>Subagent state: nothing carries over. The prompt is the universe.</strong>
+  </div>
+
+  <h2>The <code>Task</code> Tool</h2>
+  <ul>
+    <li>Coordinator spawns subagents via the <code>Task</code> tool.</li>
+    <li>Coordinator's <code>allowedTools</code> must include <code>"Task"</code> — otherwise it will never delegate.</li>
+    <li>Multiple <code>Task</code> calls in one coordinator response run concurrently.</li>
+    <li>Subagents cannot spawn their own subagents — keep orchestration one level deep.</li>
+  </ul>
+
+  <h2>Task Decomposition Patterns</h2>
+  <table>
+    <thead><tr><th>Pattern</th><th>When</th><th>Exam signal</th></tr></thead>
+    <tbody>
+      <tr><td>Fixed sequential pipeline</td><td>Stable structure; each step consumes the prior step's output</td><td>"Every X follows the same flow"</td></tr>
+      <tr><td>Dynamic decomposition</td><td>Varying requests; typed subagents (search / doc / synth)</td><td>"Same roles, scope varies per query"</td></tr>
+      <tr><td>Orchestrator–worker</td><td>Uniform workers differentiated only by prompt-supplied scope</td><td>"N workers, each a different sub-topic"</td></tr>
+      <tr><td>Evaluator–optimiser</td><td>Explicit checkable quality criteria; first pass often inadequate</td><td>"Iterate until coverage/format passes"</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">Evaluator–optimiser trap</div>
+    The evaluator–optimiser pattern fails when criteria aren't objectively checkable.
+    Subjective criteria → loop spins indefinitely.
+  </div>
+
+  <h2>Failure Tracing</h2>
+  <table>
+    <thead><tr><th>Symptom</th><th>Root cause</th></tr></thead>
+    <tbody>
+      <tr><td>Missing topics in output</td><td>Coordinator's <strong>decomposition</strong> too narrow</td></tr>
+      <tr><td>Duplicated work / redundant sources</td><td>Coordinator's <strong>scope partitioning</strong> sloppy</td></tr>
+      <tr><td>Shallow on every topic</td><td>Subagent <strong>prompts</strong> or tool budgets</td></tr>
+      <tr><td>Missing source attribution</td><td><strong>Context-passing</strong> format (prose instead of claim→source)</td></tr>
+      <tr><td>"Won't delegate"</td><td>Coordinator's <code>allowedTools</code> missing <code>"Task"</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Principle of Least Privilege</h2>
+  <ul>
+    <li>Give each subagent only the tools it needs for its scoped role.</li>
+    <li>Simple fact-checks can be delegated to a scoped <code>verify_fact</code> tool.</li>
+    <li>Complex multi-step research stays routed through the coordinator.</li>
+  </ul>
+
+  <h2>Multi-Agent Tradeoffs</h2>
+  <table>
+    <thead><tr><th>Benefit</th><th>Cost / Risk</th></tr></thead>
+    <tbody>
+      <tr><td>Parallel exploration; isolated context windows</td><td>~15× token cost vs. single-agent chat</td></tr>
+      <tr><td>Specialized prompts and tool restrictions per subagent</td><td>Coordination complexity; failure propagation must be designed</td></tr>
+      <tr><td>90% performance improvement on research-heavy tasks</td><td>Poor fit for tasks with many interdependencies or few parallel subtasks</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What NOT to do</h2>
+  <ul>
+    <li>Direct agent-to-agent communication.</li>
+    <li>Return empty results marked as success.</li>
+    <li>Forward the full conversation transcript to a human reviewer.</li>
+    <li>Retry every error type with the same delay.</li>
+    <li>Speculatively cache data "in case the synthesis agent needs it."</li>
+  </ul>
+
+  <div class="lesson-nav">
+    <a href="domain-1-cheatsheet.html">← Domain 1 Cheatsheet</a>
+    <a href="../lessons/0002-multi-agent-patterns.html">Lesson 2 →</a>
+  </div>
+</div>
+</body>
+</html>
