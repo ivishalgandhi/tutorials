@@ -312,27 +312,160 @@ flowchart TD
   <h2>4. Hooks: PreToolUse vs PostToolUse</h2>
 
   <p>
-    Hooks are the deterministic enforcement layer. Two hooks dominate the exam.
-    The keyword in the scenario tells you which one:
+    A <strong>hook</strong> is a piece of your application code that intercepts the agent loop at a
+    specific moment and runs regardless of what the model decided. The model cannot read a hook,
+    reason about it, or talk around it. It just fires — deterministically, every time.
   </p>
 
+  <p>
+    This is the key distinction from a system prompt instruction. A system prompt says
+    <em>"please verify the customer first."</em> A hook says <em>"this code will not execute
+    unless verification already happened"</em> — no matter what the model decides.
+  </p>
+
+  <h3>Where hooks sit in the loop</h3>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant M as Model
+    participant H1 as PreToolUse hook
+    participant T as Tool
+    participant H2 as PostToolUse hook
+
+    M->>H1: requests tool call
+    note over H1: Can BLOCK, ALLOW,<br/>MODIFY input, or<br/>INJECT context
+    alt blocked
+        H1-->>M: error result (gate failed)
+    else allowed
+        H1->>T: execute tool
+        T->>H2: raw result
+        note over H2: Can TRANSFORM,<br/>REDACT, TRUNCATE,<br/>or ENRICH
+        H2->>M: cleaned result
+    end
+    </div>
+    <div class="diagram-caption">
+      PreToolUse fires <em>before</em> the tool runs — it can stop the call entirely.<br>
+      PostToolUse fires <em>after</em> the tool runs but <em>before</em> the model sees the result — it shapes what the model receives.
+    </div>
+  </div>
+
+  <h3>What each hook can do</h3>
+
   <table>
-    <thead><tr><th>Hook</th><th>Fires</th><th>Use cases</th><th>Exam keyword triggers</th></tr></thead>
+    <thead>
+      <tr><th>Hook</th><th>Fires when</th><th>Actions available</th><th>Exam keyword triggers</th></tr>
+    </thead>
     <tbody>
       <tr>
         <td><strong>PreToolUse</strong></td>
-        <td>Before tool executes</td>
-        <td>Gates, authorisation, prerequisite checks, financial limits, capturing prior state hash for audit</td>
-        <td>"prior state" · "before X happens" · "block if" · "prerequisite" · "audit"</td>
+        <td>Model requests a tool call — before execution</td>
+        <td>
+          <strong>Block</strong> the call entirely<br>
+          <strong>Allow</strong> unconditionally<br>
+          <strong>Require approval</strong> (human-in-the-loop)<br>
+          <strong>Modify</strong> the tool's input parameters<br>
+          <strong>Inject context</strong> the model will see<br>
+          <strong>Capture prior state</strong> for audit trail
+        </td>
+        <td>
+          "prior state" · "before X happens" · "block if" ·
+          "prerequisite" · "audit trail" · "financial limit" ·
+          "identity verification" · "must not execute unless"
+        </td>
       </tr>
       <tr>
         <td><strong>PostToolUse</strong></td>
-        <td>After tool, before model sees result</td>
-        <td>Normalise formats, redact PII, truncate oversized results, enrich with metadata</td>
-        <td>"heterogeneous formats" · "normalise" · "redact" · "model confused by varying outputs"</td>
+        <td>Tool finishes — before model sees the result</td>
+        <td>
+          <strong>Normalise</strong> heterogeneous formats<br>
+          <strong>Redact</strong> PII or sensitive fields<br>
+          <strong>Truncate</strong> oversized results<br>
+          <strong>Enrich</strong> with metadata<br>
+          <strong>Log</strong> for audit
+        </td>
+        <td>
+          "heterogeneous formats" · "normalise" · "redact" ·
+          "model confused by varying outputs" · "PII" ·
+          "three different APIs return different shapes" ·
+          "truncate before model sees"
+        </td>
       </tr>
     </tbody>
   </table>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size:0.85rem; color:var(--muted); margin-top:0.5em;">
+    Two other hooks exist but rarely appear in exam scenarios:
+    <strong>UserPromptSubmit</strong> (fires when user submits a prompt — can block or modify it) and
+    <strong>SessionStart</strong> (fires once at session start — for loading context or running pre-flight checks).
+  </p>
+
+  <h3>The prior state hash gotcha</h3>
+
+  <p>
+    When a scenario mentions an <strong>audit trail</strong> or needing to record what something
+    looked like <em>before</em> a tool changed it — the answer is always <strong>PreToolUse</strong>.
+  </p>
+  <p>
+    PostToolUse fires after the change has already happened. If you need to capture the before
+    state (e.g. account balance before a withdrawal, record before an update), PostToolUse is
+    too late. PreToolUse captures it at the right moment.
+  </p>
+
+  <h3>Canonical scenarios — answer is always a hook</h3>
+
+  <table>
+    <thead><tr><th>Scenario keyword</th><th>Hook</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Refund without identity verification</td><td>PreToolUse</td><td>Block process_refund until get_customer has verified ID</td></tr>
+      <tr><td>Trade above financial limit</td><td>PreToolUse</td><td>Block execution if amount exceeds threshold</td></tr>
+      <tr><td>Compliance check before action</td><td>PreToolUse</td><td>Gate the tool — compliance cannot be probabilistic</td></tr>
+      <tr><td>Audit trail / prior state</td><td>PreToolUse</td><td>Capture state before the tool modifies it — PostToolUse is too late</td></tr>
+      <tr><td>Three APIs return different timestamp formats</td><td>PostToolUse</td><td>Normalise to ISO 8601 before model receives result</td></tr>
+      <tr><td>Tool result contains PII</td><td>PostToolUse</td><td>Redact before model sees it — model cannot unsee data it receives</td></tr>
+      <tr><td>Tool returns 400 fields, model only needs 5</td><td>PostToolUse</td><td>Truncate to relevant fields — reduces context waste and model confusion</td></tr>
+    </tbody>
+  </table>
+
+  <h3>What hooks cannot do</h3>
+
+  <div class="callout warning">
+    <div class="label">Common wrong answers</div>
+    <strong>Hooks don't rank tools.</strong> If the scenario asks how to make Claude
+    <em>prefer</em> one tool over another, the answer is prompts and tool descriptions —
+    not a hook. Hooks gate, block, or transform. They have no visibility into which tool
+    Claude is <em>about</em> to choose until it has already chosen.
+    <br><br>
+    <strong>Hooks aren't the answer for stylistic control.</strong> Tone, formatting,
+    response length → system prompt. Reserve hooks for rules where a single failure
+    causes financial loss, security breach, or compliance violation.
+  </div>
+
+  <h3>What a PreToolUse gate looks like in code</h3>
+
+  <p>This is the pattern from Exercise 02 — the same pattern Official Sample Q1 tests:</p>
+
+  <pre><code><span class="kw">def</span> dispatch_tool(tool_name, tool_input, session_state):
+    <span class="cm"># ── PreToolUse hook ─────────────────────────────────────────</span>
+    IDENTITY_REQUIRED = {<span class="st">"lookup_order"</span>, <span class="st">"process_refund"</span>}
+    <span class="kw">if</span> tool_name <span class="kw">in</span> IDENTITY_REQUIRED <span class="kw">and not</span> session_state.get(<span class="st">"verified_customer_id"</span>):
+        <span class="kw">return</span> <span class="st">"BLOCKED: call get_customer first to verify identity."</span>
+    <span class="cm"># ────────────────────────────────────────────────────────────</span>
+
+    <span class="kw">if</span> tool_name == <span class="st">"get_customer"</span>:
+        result = _get_customer(tool_input[<span class="st">"email"</span>])
+        <span class="kw">if</span> <span class="st">"customer_id"</span> <span class="kw">in</span> result:
+            session_state[<span class="st">"verified_customer_id"</span>] = result[<span class="st">"customer_id"</span>]
+        <span class="kw">return</span> str(result)
+
+    <span class="kw">if</span> tool_name == <span class="st">"process_refund"</span>:
+        <span class="kw">return</span> str(_process_refund(**tool_input))  <span class="cm"># only reaches here if hook passed</span></code></pre>
+
+  <p>
+    The gate lives in <em>your code</em>, not in the prompt. The model calls
+    <code>process_refund</code> and your code intercepts it — 100% of the time, regardless
+    of what Claude decided.
+  </p>
 
   <div class="callout info">
     <div class="label">Important distinction</div>
