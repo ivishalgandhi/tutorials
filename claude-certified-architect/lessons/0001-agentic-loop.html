@@ -590,6 +590,88 @@ flowchart LR
     </tbody>
   </table>
 
+  <!-- ── 9. Common wrong-answer autopsies ── -->
+  <h2>9. Wrong Answer Autopsies</h2>
+
+  <p>
+    These two questions are the most frequently missed in the official sample set because
+    the wrong answers look reasonable. Here is the exact reasoning that eliminates them.
+  </p>
+
+  <h3>Autopsy 1 — Heterogeneous tool outputs</h3>
+
+  <p>
+    <strong>Question:</strong> Three inventory APIs return timestamps in ISO 8601, Unix epoch, and US locale.
+    The model can't reconcile dates.
+  </p>
+
+  <p><strong>Why the distractors fail:</strong></p>
+
+  <ul>
+    <li>
+      <strong>A: PreToolUse hook that rewrites tool call parameters to request a specific format.</strong>
+      You cannot control what format an external API returns just by changing your tool call.
+      A PreToolUse hook runs before the API call, but the API ignores your tool parameter names.
+      <strong>The data already arrives messy.</strong>
+    </li>
+    <li>
+      <strong>B: PreToolUse hook that validates timestamp format before execution.</strong>
+      Validating doesn't fix the problem — the formats are still different after the tools run.
+      The model still receives heterogeneous data.
+    </li>
+    <li>
+      <strong>C: Add format requirements to tool descriptions and few-shot examples.</strong>
+      Tool descriptions only affect how Claude uses your tool. They don't change the payload
+      the external API sends back. Few-shot examples are probabilistic; they won't handle every
+      API variation.
+    </li>
+    <li>
+      <strong>D is correct:</strong> PostToolUse fires after the API returns but before the model sees the result.
+      That's the one moment when you can transform <em>all</em> returned timestamps into a single
+      canonical format — ISO 8601 — so the model sees consistent data.
+    </li>
+  </ul>
+
+  <div class="callout key">
+    <div class="label">Rule</div>
+    <strong>Can't control the upstream API?</strong> Use PostToolUse to normalise the output.
+    <strong>Can control what happens before execution?</strong> Use PreToolUse for gates.
+    <br>
+    The format of external API responses is something you cannot control — therefore the hook
+    that fires <em>after</em> the response is the only one that can fix it.
+  </div>
+
+  <h3>Autopsy 2 — Multi-agent output is missing topics</h3>
+
+  <p>
+    <strong>Question:</strong> Three subagents successfully produce a report on "future of remote work"
+    that only covers productivity tools and software, missing health, culture, and urban planning.
+  </p>
+
+  <p>
+    <strong>The wrong answers:</strong> "synthesis agent needs coverage-gap detection,"
+    "broaden the search queries," or "document agent is filtering sources."
+  </p>
+
+  <p>
+    <strong>Why those are wrong:</strong> The prompt says all three subagents
+    <em>complete successfully and produce coherent summaries</em>. The subagents executed correctly.
+    The problem is not execution quality — it's the scope they were given.
+  </p>
+
+  <p>
+    <strong>Correct answer:</strong> The coordinator's task decomposition is too narrow.
+    It assigned only technology-related subtasks and never asked anyone to cover health,
+    culture, or urban planning.
+  </p>
+
+  <div class="callout key">
+    <div class="label">Rule</div>
+    If subagents complete successfully but the output is <strong>missing dimensions</strong>,
+    blame the <strong>coordinator's decomposition</strong>. If subagents complete successfully but
+    produce <strong>overlapping or redundant work</strong>, blame the <strong>coordinator's partitioning</strong>.
+  </div>
+
   <!-- ── Quiz ── -->
   <div class="quiz-section">
     <h2>Practice — Wrong Answer Elimination</h2>
