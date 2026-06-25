@@ -161,6 +161,14 @@ flowchart LR
     S1 --x|never| S2
     S2 --x|never| S3
     S1 --x|never| S3
+
+    style C fill:#e8f0fe,stroke:#1a56db
+    style S1 fill:#fff7ed,stroke:#d97706
+    style S2 fill:#fff7ed,stroke:#d97706
+    style S3 fill:#fff7ed,stroke:#d97706
+    linkStyle 3 stroke:#c0392b,stroke-width:2px
+    linkStyle 4 stroke:#c0392b,stroke-width:2px
+    linkStyle 5 stroke:#c0392b,stroke-width:2px
     </div>
     <div class="diagram-caption">
       All inter-subagent communication goes through the coordinator. Direct agent-to-agent links break observability and error control.
