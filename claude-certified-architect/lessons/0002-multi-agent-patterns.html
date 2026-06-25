@@ -158,10 +158,9 @@ flowchart LR
     C <-->|Task| S1
     C <-->|Task| S2
     C <-->|Task| S3
-    NOTE["No direct subagent-to-subagent links"]
-    NOTE -.-> S1
-    NOTE -.-> S2
-    NOTE -.-> S3
+    S1 --x|never| S2
+    S2 --x|never| S3
+    S1 --x|never| S3
     </div>
     <div class="diagram-caption">
       All inter-subagent communication goes through the coordinator. Direct agent-to-agent links break observability and error control.
