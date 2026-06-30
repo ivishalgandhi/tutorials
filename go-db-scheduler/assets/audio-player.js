@@ -19,8 +19,8 @@
   // ── Configuration ──────────────────────────────────────────────
   // Local dev:
   // const AUDIO_BASE = '../audio/';
-  // Production: audio served via Dokploy HTTPS on /audio path
-  const AUDIO_BASE = 'https://dokploy.tail48fe8.ts.net/audio/tutorials/go-db-scheduler/audio/';
+  // Production: audio served from the same nginx container as the lessons
+  const AUDIO_BASE = '/go-db-scheduler/audio/';
   // ───────────────────────────────────────────────────────────────
 
   const STYLES = `

@@ -1,0 +1,9 @@
+services:
+  tutorials:
+    build: ../../
+    container_name: tutorials
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - /mnt/nas/code_artifacts/tutorials/go-db-scheduler/audio:/usr/share/nginx/html/go-db-scheduler/audio:ro
