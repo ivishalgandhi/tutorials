@@ -20,7 +20,7 @@
   // Local dev:
   // const AUDIO_BASE = '../audio/';
   // Production: audio served from the same nginx container as the lessons
-  const AUDIO_BASE = '/go-db-scheduler/audio/';
+  const AUDIO_BASE = '/tutorials/go-db-scheduler/audio/';
   // ───────────────────────────────────────────────────────────────
 
   const STYLES = `
