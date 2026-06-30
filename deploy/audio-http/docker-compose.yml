@@ -1,9 +1,0 @@
-services:
-  audio-http:
-    build: .
-    container_name: audio-http
-    restart: unless-stopped
-    ports:
-      - "8765:80"
-    volumes:
-      - /mnt/nas/code_artifacts:/usr/share/nginx/html:ro
