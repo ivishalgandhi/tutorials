@@ -1,0 +1,121 @@
+Welcome to Lesson 6: Executors, Observability, and Production Deployment.
+
+This is part of the Concurrent Database Job Scheduler in Go course. This is the final lesson.
+
+Let's start.
+
+
+The orchestrator from Lesson 5 knows when and whether to run a job, but it delegates the actual work to an Executor. This lesson implements both executors — SQL Server using T-SQL, and PostgreSQL using SQL plus shell commands — then wires up Prometheus metrics so you can observe what the scheduler is doing in production across five thousand servers.
+
+
+The Executor Interface
+
+The Executor interface has a single method: Execute, which takes a context and a ScheduledJob, and returns a Result and an error.
+
+The Result struct carries: the duration of the job, bytes written for backup operations, and a completion message.
+
+Why a single method? One operation per job — the interface matches the domain model exactly. One ScheduledJob maps to one Execute call. The context carries the dynamic timeout from Lesson 3 — the executor just honours it. A uniform return type means the orchestrator can record metrics and log results without engine-specific branching.
+
+This is a deliberately small interface. In Go, small interfaces are easier to mock in tests, easier to satisfy, and easier to understand. The engine-specific logic is completely isolated inside each executor struct.
+
+For the complete interface and Result struct code, see the lesson text.
+
+
+SQL Server Executor
+
+SQL Server operations run as T-SQL statements via a standard database/sql connection. The ExecContext method respects the context timeout, so a twelve-hour integrity check is cancelled automatically if the context deadline is reached.
+
+The Execute method dispatches to a specific handler based on the operation type: full backup, log backup, integrity check, index rebuild, or update statistics. Unsupported operations return an error.
+
+For the full backup, the T-SQL BACKUP DATABASE statement is executed as a string query with three parameters: the database name, the backup file path, and a descriptive name for the backup. The STATS equals ten option causes SQL Server to emit a row every ten percent of progress. Compression and checksum are always enabled for safety.
+
+For the complete T-SQL backup implementation, see the lesson text.
+
+For the integrity check, the executor runs DBCC CHECKDB. The mode is configurable from the policy: use PHYSICAL_ONLY for nightly runs on large databases, and the full check weekly. The ALL_ERRORMSGS option ensures all errors are reported.
+
+For the complete integrity check implementation, see the lesson text.
+
+
+PostgreSQL Executor
+
+PostgreSQL operations split into two categories: those that run as SQL statements — VACUUM, REINDEX, ANALYZE — and those that run as shell commands, specifically pg_dump. Both are handled by the same executor struct.
+
+The struct holds two things: a standard database/sql connection for SQL operations, and a credentials struct for shell commands.
+
+For VACUUM ANALYZE: the executor runs VACUUM with ANALYZE, SKIP_LOCKED, and VERBOSE options. SKIP_LOCKED makes it safe to schedule during production hours — it silently skips tables that are heavily in use rather than blocking. VACUUM cannot run inside a transaction, so ExecContext is sufficient.
+
+For pg_dump: PostgreSQL has no SQL-level backup command. pg_dump is a client binary that writes to a file. The Go executor runs it via exec.CommandContext — the context timeout also kills the shell process automatically.
+
+The command is constructed with the host, port, username, database name, format set to custom (compressed and parallel-restore ready), compression level six, and the output file path. The password is passed via the PGPASSWORD environment variable — never via the command line, because command-line arguments are visible in process listings.
+
+Go beginner note about exec.CommandContext: creating a command with exec.CommandContext binds it to the context. If the context is cancelled — whether by timeout or shutdown — Go sends SIGKILL to the shell process automatically. This is the same dynamic timeout mechanism used by SQL Server's ExecContext. The executor does not need separate timeout logic.
+
+For the complete VACUUM and pg_dump implementations, see the lesson text.
+
+
+Observability — Prometheus Metrics
+
+Prometheus works by scraping your application on a slash-metrics endpoint. Your Go binary exports numbers; Prometheus pulls them every fifteen seconds and stores them as time series. Grafana visualises those time series.
+
+Picture the flow: the worker pool increments counters. The scheduler exposes a slash-metrics HTTP endpoint. Prometheus polls that endpoint every fifteen seconds. Grafana queries Prometheus and renders dashboards and alerts.
+
+The three metric types you need are Counter, Gauge, and Histogram.
+
+A Counter only increases and resets on restart. Use it for total jobs completed and total errors. An example is scheduler_jobs_total with labels for operation and status.
+
+A Gauge goes up and down freely. Use it for jobs currently in-flight and queue depth. An example is scheduler_jobs_in_flight with a label for server hostname.
+
+A Histogram counts observations in configurable buckets. Use it for job duration distribution — for example, the fiftieth, ninety-fifth, and ninety-ninth percentile latencies. An example is scheduler_job_duration_seconds with a label for operation type.
+
+Important note — Counter versus Gauge: use a Counter for anything that only ever goes up — jobs completed, errors seen, bytes written. Use a Gauge for anything that goes both up and down — jobs currently running, queue length, memory used. Using a Counter for "jobs in flight" is a common mistake. It would never decrease, so you could never tell when the queue drains.
+
+Declaring metrics with promauto: promauto is the idiomatic way to declare Prometheus metrics in Go. It registers them automatically at startup so you cannot forget to call MustRegister. The four metrics to declare are: a CounterVec for jobs total, a GaugeVec for jobs in flight, a HistogramVec for job duration, and a Gauge for queue depth.
+
+The duration histogram buckets should cover the full range of your fleet's job durations: five seconds, thirty seconds, two minutes, ten minutes, thirty minutes, one hour, two hours, six hours, and twelve hours.
+
+For the complete promauto declarations and instrumentation code, see the lesson text.
+
+
+Grafana Panels and PromQL
+
+Three Grafana panels will tell you most of what you need to know about the scheduler's health.
+
+The first panel: job throughput by status. Use a PromQL rate query on the jobs_total counter, summed by status label. This shows how many jobs per second are completing as successes, failures, conflicts, and timeouts.
+
+The second panel: jobs in flight by server. Use an instant query on the jobs_in_flight gauge. This shows which servers are at or near their MaxConcurrentOps limit.
+
+The third panel: job duration heatmap. Use a histogram_quantile query on the job_duration_seconds histogram to plot the ninety-fifth percentile duration over time. A spike here indicates jobs are taking longer than expected — often the first sign of a storage or network problem.
+
+For the complete PromQL expressions for all three panels, see the lesson text.
+
+
+Production Deployment Checklist
+
+This is the final lesson, so here is a production readiness checklist.
+
+For coordination: set the coordination mode to Redis for bare-metal deployments, or Kubernetes Lease for Kubernetes deployments. Never use single-node mode in production.
+
+For concurrency: set MaxConcurrentOps conservatively — start at two or three for production SQL Server instances. Monitor the jobs_in_flight gauge and raise it only after observing real I/O headroom.
+
+For timeouts: review the per-GB timeout and maximum timeout for your largest databases. A five-terabyte integrity check should alert, not silently hit the maximum cap every week.
+
+For maintenance windows: verify timezone names are valid IANA timezone identifiers. A typo that defaults to UTC will cause maintenance windows to fire at the wrong local time after a DST transition.
+
+For stagger: ensure stagger minutes is less than or equal to window duration minus the maximum expected job runtime. A stagger that exceeds the window silently skips databases hashed into the overflow range.
+
+For Prometheus: verify the slash-metrics endpoint is accessible to your Prometheus scraper. Set alert rules on job failure rate greater than five percent and queue depth greater than your buffer size for more than two minutes.
+
+For graceful shutdown: verify your Kubernetes pod spec includes a preStop hook or a terminationGracePeriodSeconds that is longer than your drain timeout. If Kubernetes kills the pod before the drain timeout expires, in-flight jobs are interrupted.
+
+
+Course Complete
+
+Congratulations — you have completed the Concurrent Database Job Scheduler in Go course.
+
+You now understand the six layers of the architecture: inventory, policy generation, scheduling, execution, coordination, and observability. You can reason about policy-driven job generation, the stagger algorithm, the worker pool, per-server semaphores, exactly-once execution with distributed locks, and Prometheus instrumentation.
+
+The scheduler is production-grade. The same patterns apply at twenty thousand databases just as well as at fifty thousand.
+
+Return to the course home to review any lesson, or open the reference sheets for quick lookup of Go concurrency patterns and maintenance operation syntax.
+
+Thank you for learning with this course.

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zabbix Webhooks in Go</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .course-index { max-width: 760px; margin: 0 auto; }
+    .lesson-list { list-style: none; padding: 0; display: grid; gap: 0.8rem; margin-top: 1.5rem; }
+    .lesson-list li a { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 1.2rem; background: #fff; border: 1px solid #e0e0dc; border-radius: 6px; text-decoration: none; color: inherit; transition: box-shadow 0.15s, border-color 0.15s; }
+    .lesson-list li a:hover { box-shadow: 0 3px 12px rgba(0,0,0,0.07); border-color: #1a56db; }
+    .lesson-num { font-size: 0.78rem; font-weight: 700; color: #1a56db; background: #eef2f8; padding: 0.2rem 0.5rem; border-radius: 4px; white-space: nowrap; }
+    .lesson-title { font-weight: 600; font-size: 0.95rem; }
+    .lesson-topics { font-size: 0.82rem; color: #777; margin-top: 0.15rem; }
+    .back-link { display: inline-block; margin-bottom: 1.5rem; font-size: 0.85rem; color: #1a56db; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .ref-link { margin-top: 2rem; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+<div class="page course-index">
+
+  <a class="back-link" href="../index.html">← All Courses</a>
+
+  <div class="lesson-meta">
+    <span class="tag">Course</span>
+    <span>Zabbix Webhooks in Go</span>
+    <span>1 lesson · ~35 min</span>
+  </div>
+
+  <h1>Zabbix Webhooks in Go</h1>
+
+  <p style="margin: 1rem 0 0.5rem">
+    Push Zabbix alerts into a custom Go application and store them idempotently in a database.
+    Built for database reliability teams.
+  </p>
+
+  <ul class="lesson-list">
+    <li>
+      <a href="lessons/0001-webhook-vs-polling.html">
+        <div>
+          <span class="lesson-num">Lesson 1</span>
+          <span class="lesson-title">Receiving Zabbix Alerts with a Go Webhook</span>
+          <div class="lesson-topics">Webhooks vs. polling · Zabbix media type · Go receiver · PostgreSQL idempotency</div>
+        </div>
+      </a>
+    </li>
+  </ul>
+
+  <div class="ref-link">
+    <strong>Reference:</strong> <a href="reference/webhook-patterns.html">Webhook Patterns &amp; Glossary</a>
+    · <a href="reference/handoff-checklist.html">Handoff Checklist</a>
+  </div>
+
+</div>
+</body>
+</html>

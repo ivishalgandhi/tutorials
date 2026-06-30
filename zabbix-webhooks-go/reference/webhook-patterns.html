@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Webhook Patterns — Zabbix Webhooks in Go</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>Webhook Patterns Quick Reference</h1>
+
+  <p class="subtitle">
+    Compressed facts for designing, configuring, and operating a Zabbix → Go webhook receiver.
+  </p>
+
+  <h2>Glossary</h2>
+
+  <table>
+    <thead>
+      <tr><th>Term</th><th>Meaning in this context</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Webhook</td>
+        <td>An HTTP callback: Zabbix sends a POST request to your Go server when an alert fires or recovers.</td>
+      </tr>
+      <tr>
+        <td>Media type</td>
+        <td>Zabbix's delivery channel. Type <code>Webhook</code> runs a JavaScript snippet that builds and sends the HTTP request.</td>
+      </tr>
+      <tr>
+        <td>Action</td>
+        <td>Zabbix rule that links triggers/events to operations, including "send message via webhook media type."</td>
+      </tr>
+      <tr>
+        <td>Event</td>
+        <td>A problem, recovery, update, or other Zabbix occurrence. Webhooks fire <em>after</em> an alert is created.</td>
+      </tr>
+      <tr>
+        <td>Idempotency</td>
+        <td>Running the same event twice produces the same final state as running it once.</td>
+      </tr>
+      <tr>
+        <td>Idempotency key</td>
+        <td>A stable identifier for a logical event. Zabbix provides <code>{EVENT.ID}</code> for this purpose.</td>
+      </tr>
+      <tr>
+        <td>At-least-once delivery</td>
+        <td>Zabbix retries on non-2xx or timeout, so the same event may arrive more than once.</td>
+      </tr>
+      <tr>
+        <td>Retry storm</td>
+        <td>Returning 5xx or timing out while the event is already partially processed, causing repeated deliveries.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Webhooks vs. Polling</h2>
+
+  <table>
+    <thead>
+      <tr><th>When you need...</th><th>Use</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Near-real-time reaction to alerts</td>
+        <td>Webhook</td>
+        <td>Polling adds latency equal to the poll interval.</td>
+      </tr>
+      <tr>
+        <td>Audit trail of every event</td>
+        <td>Webhook</td>
+        <td>You receive the event once from Zabbix and store it yourself.</td>
+      </tr>
+      <tr>
+        <td>Historical analysis across many hosts</td>
+        <td>Polling / API</td>
+        <td>Zabbix history is the source of truth; pulling lets you query arbitrary time ranges.</td>
+      </tr>
+      <tr>
+        <td>Low operational surface area</td>
+        <td>Polling</td>
+        <td>No inbound listener, TLS, or firewall rules required.</td>
+      </tr>
+      <tr>
+        <td>Correlate alerts with external systems</td>
+        <td>Webhook</td>
+        <td>Push the event into your own database, then join it with other data.</td>
+      </tr>
+      <tr>
+        <td>Simple "is this alert still open?" checks</td>
+        <td>Polling</td>
+        <td>Zabbix already maintains problem state; don't rebuild it if you only need snapshots.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Zabbix macros → Go receiver fields</h2>
+
+  <p>These macros are commonly passed as webhook parameters and used to build the JSON payload.</p>
+
+  <table>
+    <thead>
+      <tr><th>Zabbix macro</th><th>Go field</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>{EVENT.ID}</code></td><td><code>EventID</code></td><td>Primary idempotency key.</td></tr>
+      <tr><td><code>{EVENT.SOURCE}</code></td><td><code>Source</code></td><td>0=trigger, 1=discovery, 2=autoregistration, 3=internal.</td></tr>
+      <tr><td><code>{EVENT.VALUE}</code></td><td><code>Value</code></td><td>0=ok/recovery, 1=problem for trigger/internal events.</td></tr>
+      <tr><td><code>{EVENT.CLOCK}</code></td><td><code>Clock</code></td><td>Unix epoch seconds when the event started.</td></tr>
+      <tr><td><code>{EVENT.SEVERITY}</code></td><td><code>Severity</code></td><td>0=not classified, 1=information, 2=warning, 3=average, 4=high, 5=disaster.</td></tr>
+      <tr><td><code>{HOST.NAME}</code></td><td><code>HostName</code></td><td>Human-readable host name.</td></tr>
+      <tr><td><code>{HOST.HOST}</code></td><td><code>HostTechnical</code></td><td>Technical host name.</td></tr>
+      <tr><td><code>{TRIGGER.NAME}</code></td><td><code>TriggerName</code></td><td>Description of the problem.</td></tr>
+      <tr><td><code>{TRIGGER.ID}</code></td><td><code>TriggerID</code></td><td>Useful for grouping recurring problems.</td></tr>
+      <tr><td><code>{EVENT.TAGSJSON}</code></td><td><code>Tags</code></td><td>Structured tag object; prefer over <code>{EVENT.TAGS}</code> in JSON payloads.</td></tr>
+      <tr><td><code>{ALERT.SUBJECT}</code></td><td><code>Subject</code></td><td>Rendered message subject.</td></tr>
+      <tr><td><code>{ALERT.MESSAGE}</code></td><td><code>Message</code></td><td>Rendered message body.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Idempotency primitives</h2>
+
+  <p>Claim an event before processing so retries are harmless.</p>
+
+  <h3>PostgreSQL</h3>
+  <pre><code>INSERT INTO events (event_id, received_at, status, payload)
+VALUES ($1, NOW(), 'pending', $2)
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id;</code></pre>
+
+  <h3>MySQL / MariaDB</h3>
+  <pre><code>INSERT INTO events (event_id, received_at, status, payload)
+VALUES (?, NOW(), 'pending', ?)
+ON DUPLICATE KEY UPDATE event_id = event_id;</code></pre>
+
+  <p>
+    In Go, check <code>RowsAffected()</code> or use the <code>xmax = 0</code> trick to know whether you
+    won the race and should process the event.
+  </p>
+
+  <h2>Operation checklist</h2>
+
+  <ul>
+    <li>Return <code>200 OK</code> only after the event has been durably recorded.</li>
+    <li>Return <code>200 OK</code> for duplicates too; otherwise Zabbix will retry.</li>
+    <li>Validate the payload shape and reject malformed requests with <code>400</code>.</li>
+    <li>Verify a shared secret or bearer token before parsing.</li>
+    <li>Do heavy work asynchronously; keep the HTTP handler fast.</li>
+    <li>Store raw payloads for at least a few days for debugging and replay.</li>
+    <li>Trim the idempotency table after a retention window (e.g., 30 days).</li>
+  </ul>
+
+</div>
+</body>
+</html>

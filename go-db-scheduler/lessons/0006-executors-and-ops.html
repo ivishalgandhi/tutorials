@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 6: Executors, Observability, and Production Deployment</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0006-executors-and-ops.mp3">
+    <span class="tag">Lesson 6</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~50 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0005-orchestrator.html">← Lesson 5</a></span>
+  </div>
+
+  <h1>Executors, Observability, and Production Deployment</h1>
+
+  <p>
+    The orchestrator from Lesson 5 knows <em>when</em> and <em>whether</em> to run a job, but it
+    delegates the actual work to an <code>Executor</code>. This lesson implements both executors —
+    SQL Server (T-SQL) and PostgreSQL (SQL + shell) — then wires up Prometheus metrics so you can
+    observe what the scheduler is doing in production across 5,000 servers.
+  </p>
+
+  <div class="callout info">
+    <div class="label">REFERENCE SHEET</div>
+    <p>The SQL and T-SQL commands in this lesson are catalogued in the
+    <a href="../reference/maintenance-operations.html">Maintenance Operations</a> reference sheet.
+    Bookmark it — you will return to it when writing executor code.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Executor Interface</h2>
+
+  <p>
+    You saw this interface in Lesson 5. Let's understand <em>why</em> it is designed this way
+    before implementing it.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">Executor</span> <span class="kw">interface</span> {
+    <span class="fn">Execute</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) (<span class="tp">Result</span>, <span class="tp">error</span>)
+}
+
+<span class="kw">type</span> <span class="tp">Result</span> <span class="kw">struct</span> {
+    Duration    time.<span class="tp">Duration</span>
+    BytesWritten <span class="tp">int64</span>          <span class="cm">// for backups</span>
+    Message     <span class="tp">string</span>          <span class="cm">// last STATS row or completion message</span>
+}</code></pre>
+
+  <p>
+    One method, one contract. This is a deliberately small interface. In Go, small interfaces are
+    easier to mock in tests, easier to satisfy, and easier to understand. The orchestrator never
+    knows whether it is talking to SQL Server or PostgreSQL — it only calls <code>Execute</code>.
+    The engine-specific logic is completely isolated inside each executor struct.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Why a single method?</th><th>What you gain</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One operation per job</td>
+        <td>The interface matches the domain model exactly — one <code>ScheduledJob</code> → one <code>Execute</code> call</td>
+      </tr>
+      <tr>
+        <td>Context for timeout/cancel</td>
+        <td>Dynamic timeouts (Lesson 3) arrive via the context — the executor just honours them with <code>ctx</code></td>
+      </tr>
+      <tr>
+        <td>Uniform return type</td>
+        <td>The orchestrator can record metrics and log results without engine-specific branching</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>SQL Server Executor</h2>
+
+  <p>
+    SQL Server operations run as T-SQL statements via a <code>database/sql</code> connection.
+    The <code>ExecContext</code> method respects the context timeout, so a 12-hour CHECKDB
+    is cancelled automatically if the context is cancelled.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">SQLServerExecutor</span> <span class="kw">struct</span> {
+    db *sql.<span class="tp">DB</span>   <span class="cm">// connection pool to this server</span>
+}
+
+<span class="kw">func</span> (e *<span class="tp">SQLServerExecutor</span>) <span class="fn">Execute</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    start := time.<span class="fn">Now</span>()
+
+    <span class="kw">switch</span> job.Operation {
+    <span class="kw">case</span> OpFullBackup:
+        <span class="kw">return</span> e.<span class="fn">fullBackup</span>(ctx, job, start)
+    <span class="kw">case</span> OpLogBackup:
+        <span class="kw">return</span> e.<span class="fn">logBackup</span>(ctx, job, start)
+    <span class="kw">case</span> OpIntegrityCheck:
+        <span class="kw">return</span> e.<span class="fn">checkDB</span>(ctx, job, start)
+    <span class="kw">case</span> OpIndexRebuild:
+        <span class="kw">return</span> e.<span class="fn">rebuildIndexes</span>(ctx, job, start)
+    <span class="kw">case</span> OpUpdateStats:
+        <span class="kw">return</span> e.<span class="fn">updateStats</span>(ctx, job, start)
+    <span class="kw">default</span>:
+        <span class="kw">return</span> <span class="tp">Result</span>{}, fmt.<span class="fn">Errorf</span>(<span class="st">"unsupported operation: %s"</span>, job.Operation)
+    }
+}</code></pre>
+
+  <h3>Full Backup (T-SQL)</h3>
+  <p>
+    The T-SQL <code>BACKUP DATABASE</code> statement is executed as a string query.
+    <code>STATS = 10</code> causes SQL Server to emit a row every 10% of progress,
+    which the executor can read to report intermediate progress.
+    Source: <a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql?view=sql-server-ver16" target="_blank">Microsoft Learn — BACKUP</a>.
+  </p>
+
+  <pre><code><span class="kw">func</span> (e *<span class="tp">SQLServerExecutor</span>) <span class="fn">fullBackup</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>, start time.<span class="tp">Time</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    backupPath := <span class="fn">backupFilePath</span>(job.DB, <span class="st">"full"</span>, start)
+
+    <span class="cm">// ExecContext runs the T-SQL and respects the context deadline.</span>
+    <span class="cm">// If ctx is cancelled (shutdown or timeout), the query is killed.</span>
+    _, err := e.db.<span class="fn">ExecContext</span>(ctx, <span class="st">`
+        BACKUP DATABASE [@db]
+        TO DISK = @path
+        WITH COMPRESSION, CHECKSUM, STATS = 10,
+             NAME = @name,
+             DESCRIPTION = 'Scheduled by db-scheduler'
+    `</span>,
+        sql.<span class="fn">Named</span>(<span class="st">"db"</span>,   job.DB.Name),
+        sql.<span class="fn">Named</span>(<span class="st">"path"</span>, backupPath),
+        sql.<span class="fn">Named</span>(<span class="st">"name"</span>, fmt.<span class="fn">Sprintf</span>(<span class="st">"%s Full %s"</span>, job.DB.Name, start.<span class="fn">Format</span>(<span class="st">"2006-01-02"</span>))),
+    )
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="kw">return</span> <span class="tp">Result</span>{}, <span class="fn">wrapError</span>(err, <span class="st">"full_backup"</span>)
+    }
+    <span class="kw">return</span> <span class="tp">Result</span>{Duration: time.<span class="fn">Since</span>(start), Message: <span class="st">"backup complete"</span>}, <span class="nm">nil</span>
+}</code></pre>
+
+  <h3>Integrity Check (T-SQL)</h3>
+  <p>
+    <code>DBCC CHECKDB</code> is SQL Server's integrity check command. For large databases use
+    <code>PHYSICAL_ONLY</code> for nightly runs; the full check weekly.
+    Source: <a href="https://learn.microsoft.com/en-us/sql/t-sql/database-console-commands/dbcc-checkdb-transact-sql?view=sql-server-ver16" target="_blank">Microsoft Learn — DBCC CHECKDB</a>.
+  </p>
+
+  <pre><code><span class="kw">func</span> (e *<span class="tp">SQLServerExecutor</span>) <span class="fn">checkDB</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>, start time.<span class="tp">Time</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    <span class="cm">// Choose mode from policy config.</span>
+    mode := <span class="st">"NO_INFOMSGS"</span>
+    <span class="kw">if</span> v, ok := job.Policy.Config[<span class="st">"physical_only"</span>]; ok &amp;&amp; v == <span class="nm">true</span> {
+        mode = <span class="st">"PHYSICAL_ONLY, NO_INFOMSGS"</span>
+    }
+    query := fmt.<span class="fn">Sprintf</span>(<span class="st">"DBCC CHECKDB ([%s]) WITH %s, ALL_ERRORMSGS"</span>, job.DB.Name, mode)
+
+    _, err := e.db.<span class="fn">ExecContext</span>(ctx, query)
+    <span class="kw">return</span> <span class="tp">Result</span>{Duration: time.<span class="fn">Since</span>(start)}, err
+}</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>PostgreSQL Executor</h2>
+
+  <p>
+    PostgreSQL operations split into two categories: those that run as SQL statements (VACUUM,
+    REINDEX, ANALYZE) and those that run as shell commands (pg_dump). Both are handled by
+    the same executor struct.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">PostgreSQLExecutor</span> <span class="kw">struct</span> {
+    db    *sql.<span class="tp">DB</span>         <span class="cm">// for SQL operations</span>
+    creds <span class="tp">DBCredentials</span>   <span class="cm">// for shell commands (pg_dump)</span>
+}
+
+<span class="kw">func</span> (e *<span class="tp">PostgreSQLExecutor</span>) <span class="fn">Execute</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    start := time.<span class="fn">Now</span>()
+    <span class="kw">switch</span> job.Operation {
+    <span class="kw">case</span> OpFullBackup:
+        <span class="kw">return</span> e.<span class="fn">pgDump</span>(ctx, job, start)
+    <span class="kw">case</span> OpVacuum:
+        <span class="kw">return</span> e.<span class="fn">vacuum</span>(ctx, job, start)
+    <span class="kw">case</span> OpIndexRebuild:
+        <span class="kw">return</span> e.<span class="fn">reindex</span>(ctx, job, start)
+    <span class="kw">case</span> OpUpdateStats:
+        <span class="kw">return</span> e.<span class="fn">analyze</span>(ctx, job, start)
+    <span class="kw">default</span>:
+        <span class="kw">return</span> <span class="tp">Result</span>{}, fmt.<span class="fn">Errorf</span>(<span class="st">"unsupported operation: %s"</span>, job.Operation)
+    }
+}</code></pre>
+
+  <h3>VACUUM ANALYZE (SQL)</h3>
+  <p>
+    <code>VACUUM ANALYZE</code> reclaims dead tuple space and updates query planner statistics.
+    Use <code>SKIP_LOCKED</code> during production hours — it silently skips tables that are
+    heavily in use rather than blocking.
+    Source: <a href="https://www.postgresql.org/docs/current/sql-vacuum.html" target="_blank">PostgreSQL Docs — VACUUM</a>.
+  </p>
+
+  <pre><code><span class="kw">func</span> (e *<span class="tp">PostgreSQLExecutor</span>) <span class="fn">vacuum</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>, start time.<span class="tp">Time</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    <span class="cm">// VACUUM cannot run inside a transaction, so ExecContext is sufficient.</span>
+    <span class="cm">// SKIP_LOCKED makes it safe to schedule during production hours.</span>
+    _, err := e.db.<span class="fn">ExecContext</span>(ctx,
+        fmt.<span class="fn">Sprintf</span>(<span class="st">"VACUUM (ANALYZE, SKIP_LOCKED, VERBOSE)"</span>),
+    )
+    <span class="kw">return</span> <span class="tp">Result</span>{Duration: time.<span class="fn">Since</span>(start)}, err
+}</code></pre>
+
+  <h3>pg_dump (Shell Command)</h3>
+  <p>
+    PostgreSQL has no SQL-level backup command. <code>pg_dump</code> is a client binary that
+    writes to a file. The Go executor runs it via <code>exec.CommandContext</code> — the context
+    timeout also kills the shell process.
+  </p>
+
+  <pre><code><span class="kw">func</span> (e *<span class="tp">PostgreSQLExecutor</span>) <span class="fn">pgDump</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>, start time.<span class="tp">Time</span>) (<span class="tp">Result</span>, <span class="tp">error</span>) {
+    backupPath := <span class="fn">backupFilePath</span>(job.DB, <span class="st">"pgdump"</span>, start)
+
+    <span class="cm">// exec.CommandContext: if ctx is cancelled, the OS kills the process.</span>
+    cmd := exec.<span class="fn">CommandContext</span>(ctx,
+        <span class="st">"pg_dump"</span>,
+        <span class="st">"--host"</span>,     job.Server.Hostname,
+        <span class="st">"--port"</span>,     strconv.<span class="fn">Itoa</span>(job.Server.Port),
+        <span class="st">"--username"</span>, e.creds.User,
+        <span class="st">"--dbname"</span>,   job.DB.Name,
+        <span class="st">"--format=custom"</span>,   <span class="cm">// compressed, parallel-restore ready</span>
+        <span class="st">"--compress=6"</span>,       <span class="cm">// gzip level 6</span>
+        <span class="st">"--file"</span>,     backupPath,
+    )
+    <span class="cm">// Pass password via environment variable — never via command line (visible in ps)</span>
+    cmd.Env = append(os.<span class="fn">Environ</span>(), <span class="st">"PGPASSWORD="</span>+e.creds.Password)
+
+    output, err := cmd.<span class="fn">CombinedOutput</span>()
+    <span class="kw">return</span> <span class="tp">Result</span>{Duration: time.<span class="fn">Since</span>(start), Message: <span class="tp">string</span>(output)}, err
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">GO BEGINNER — exec.CommandContext</div>
+    <p>
+      <code>exec.CommandContext(ctx, "pg_dump", ...)</code> creates a shell command that is bound
+      to the context. If the context is cancelled (timeout or shutdown), Go sends <code>SIGKILL</code>
+      to the shell process automatically. This is the same dynamic timeout mechanism used by
+      SQL Server's <code>ExecContext</code> — the executor does not need separate timeout logic.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Observability — Prometheus Metrics</h2>
+
+  <p>
+    Prometheus works by <em>scraping</em> your application on a <code>/metrics</code> endpoint.
+    Your Go binary exports numbers; Prometheus pulls them every 15 seconds and stores them
+    as time series. Grafana visualises those time series.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    subgraph Scheduler["Scheduler process"]
+        WP["Worker Pool\n(increments counters)"]
+        ME["/metrics endpoint\n(HTTP :9090)"]
+    end
+    PROM["Prometheus\n(scrapes every 15s)"]
+    GRAF["Grafana\n(dashboards + alerts)"]
+
+    WP -->|"writes"| ME
+    PROM -->|"GET /metrics"| ME
+    PROM --> GRAF
+    </div>
+    <div class="diagram-caption">
+      Figure 6.1 — Pull-based metrics. The scheduler never pushes; Prometheus polls on its own schedule.
+    </div>
+  </div>
+
+  <h3>The Three Metric Types You Need</h3>
+
+  <table>
+    <thead>
+      <tr><th>Type</th><th>Behaviour</th><th>Use for</th><th>Example</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Counter</strong></td>
+        <td>Only increases, resets on restart</td>
+        <td>Total jobs completed, total errors</td>
+        <td><code>scheduler_jobs_total{op,status}</code></td>
+      </tr>
+      <tr>
+        <td><strong>Gauge</strong></td>
+        <td>Goes up and down freely</td>
+        <td>Jobs currently in-flight, queue depth</td>
+        <td><code>scheduler_jobs_in_flight{server}</code></td>
+      </tr>
+      <tr>
+        <td><strong>Histogram</strong></td>
+        <td>Counts observations in configurable buckets</td>
+        <td>Job duration distribution (p50, p95, p99)</td>
+        <td><code>scheduler_job_duration_seconds{op}</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">COUNTER VS GAUGE — THE COMMON MISTAKE</div>
+    <p>
+      Use a Counter for anything that only ever goes up: jobs completed, errors seen, bytes written.
+      Use a Gauge for anything that goes both up and down: jobs currently running, queue length,
+      memory used. Using a Counter for "jobs in flight" is a common mistake — it would never
+      decrease, so you could never tell when the queue drains.
+    </p>
+  </div>
+
+  <h3>Declaring Metrics with promauto</h3>
+  <p>
+    <code>promauto</code> is the idiomatic way to declare Prometheus metrics in Go — it registers
+    them automatically at startup so you cannot forget to call <code>prometheus.MustRegister</code>.
+    Source: <a href="https://prometheus.io/docs/guides/go-application/" target="_blank">Prometheus — Instrumenting a Go Application</a>.
+  </p>
+
+  <pre><code><span class="kw">import</span> (
+    <span class="st">"github.com/prometheus/client_golang/prometheus"</span>
+    <span class="st">"github.com/prometheus/client_golang/prometheus/promauto"</span>
+)
+
+<span class="kw">type</span> <span class="tp">schedulerMetrics</span> <span class="kw">struct</span> {
+    <span class="cm">// Counter: jobs_total incremented on every job completion.</span>
+    <span class="cm">// Labels: op (e.g. "full_backup"), status ("success", "failed", "conflict", "timeout")</span>
+    jobsTotal *prometheus.<span class="tp">CounterVec</span>
+
+    <span class="cm">// Gauge: jobs currently running on a given server.</span>
+    jobsInFlight *prometheus.<span class="tp">GaugeVec</span>
+
+    <span class="cm">// Histogram: duration of completed jobs in seconds.</span>
+    <span class="cm">// Buckets cover the full range: 5s to 12h.</span>
+    jobDuration *prometheus.<span class="tp">HistogramVec</span>
+
+    <span class="cm">// Gauge: length of the job channel queue.</span>
+    queueDepth prometheus.<span class="tp">Gauge</span>
+}
+
+<span class="kw">func</span> <span class="fn">newMetrics</span>() *<span class="tp">schedulerMetrics</span> {
+    <span class="kw">return</span> &amp;<span class="tp">schedulerMetrics</span>{
+        jobsTotal: promauto.<span class="fn">NewCounterVec</span>(prometheus.<span class="tp">CounterOpts</span>{
+            Name: <span class="st">"scheduler_jobs_total"</span>,
+            Help: <span class="st">"Total jobs completed, by operation type and final status."</span>,
+        }, []<span class="tp">string</span>{<span class="st">"operation"</span>, <span class="st">"status"</span>}),
+
+        jobsInFlight: promauto.<span class="fn">NewGaugeVec</span>(prometheus.<span class="tp">GaugeOpts</span>{
+            Name: <span class="st">"scheduler_jobs_in_flight"</span>,
+            Help: <span class="st">"Jobs currently executing, by server hostname."</span>,
+        }, []<span class="tp">string</span>{<span class="st">"server"</span>}),
+
+        jobDuration: promauto.<span class="fn">NewHistogramVec</span>(prometheus.<span class="tp">HistogramOpts</span>{
+            Name:    <span class="st">"scheduler_job_duration_seconds"</span>,
+            Help:    <span class="st">"Duration of completed jobs in seconds."</span>,
+            Buckets: []<span class="tp">float64</span>{<span class="nm">5</span>, <span class="nm">30</span>, <span class="nm">120</span>, <span class="nm">600</span>, <span class="nm">1800</span>, <span class="nm">3600</span>, <span class="nm">7200</span>, <span class="nm">21600</span>, <span class="nm">43200</span>},
+            <span class="cm">// buckets: 5s, 30s, 2m, 10m, 30m, 1h, 2h, 6h, 12h</span>
+        }, []<span class="tp">string</span>{<span class="st">"operation"</span>}),
+
+        queueDepth: promauto.<span class="fn">NewGauge</span>(prometheus.<span class="tp">GaugeOpts</span>{
+            Name: <span class="st">"scheduler_queue_depth"</span>,
+            Help: <span class="st">"Current number of jobs waiting in the job channel."</span>,
+        }),
+    }
+}</code></pre>
+
+  <h3>Recording Metrics in the Dispatch Loop</h3>
+  <pre><code><span class="kw">func</span> (o *<span class="tp">Orchestrator</span>) <span class="fn">dispatch</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) {
+    <span class="cm">// ... (window check, conflict check, semaphore acquire) ...</span>
+
+    <span class="cm">// Gauge: increment when job starts</span>
+    o.metrics.jobsInFlight.<span class="fn">With</span>(prometheus.<span class="tp">Labels</span>{<span class="st">"server"</span>: job.Server.Hostname}).<span class="fn">Inc</span>()
+    <span class="kw">defer</span> o.metrics.jobsInFlight.<span class="fn">With</span>(prometheus.<span class="tp">Labels</span>{<span class="st">"server"</span>: job.Server.Hostname}).<span class="fn">Dec</span>()
+
+    start := time.<span class="fn">Now</span>()
+    result, err := o.<span class="fn">executor</span>(job.Server.Engine).<span class="fn">Execute</span>(jobCtx, job)
+
+    <span class="cm">// Counter: record final status</span>
+    status := <span class="st">"success"</span>
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        status = <span class="fn">classifyError</span>(err)   <span class="cm">// "failed", "timeout", "canceled"</span>
+    }
+    o.metrics.jobsTotal.<span class="fn">With</span>(prometheus.<span class="tp">Labels</span>{
+        <span class="st">"operation"</span>: <span class="tp">string</span>(job.Operation),
+        <span class="st">"status"</span>:    status,
+    }).<span class="fn">Inc</span>()
+
+    <span class="cm">// Histogram: observe actual duration</span>
+    o.metrics.jobDuration.<span class="fn">With</span>(prometheus.<span class="tp">Labels</span>{
+        <span class="st">"operation"</span>: <span class="tp">string</span>(job.Operation),
+    }).<span class="fn">Observe</span>(result.Duration.<span class="fn">Seconds</span>())
+
+    _ = result   <span class="cm">// store result via o.store.RecordResult(job, result, err)</span>
+}</code></pre>
+
+  <h3>Exposing the /metrics Endpoint</h3>
+  <pre><code><span class="cm">// Add to main() — exposes Prometheus metrics on :9090/metrics</span>
+<span class="kw">go func</span>() {
+    http.<span class="fn">Handle</span>(<span class="st">"/metrics"</span>, promhttp.<span class="fn">Handler</span>())
+    http.<span class="fn">ListenAndServe</span>(<span class="st">":9090"</span>, <span class="nm">nil</span>)
+}()</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Reading the Grafana Dashboard</h2>
+
+  <p>
+    Once Prometheus is scraping your <code>/metrics</code>, create a Grafana dashboard with
+    these four panels to see what your fleet is actually doing:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Panel</th><th>PromQL query</th><th>What you're looking for</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Jobs per minute</td>
+        <td><code>rate(scheduler_jobs_total[5m])*60</code></td>
+        <td>Flat line is healthy; sudden dips mean jobs aren't generating</td>
+      </tr>
+      <tr>
+        <td>Error rate</td>
+        <td><code>rate(scheduler_jobs_total{status!="success"}[5m])</code></td>
+        <td>Any sustained spike needs investigation</td>
+      </tr>
+      <tr>
+        <td>In-flight per server</td>
+        <td><code>topk(10, scheduler_jobs_in_flight)</code></td>
+        <td>A server stuck at <code>MaxConcurrentOps</code> for hours is stalled</td>
+      </tr>
+      <tr>
+        <td>Duration p95</td>
+        <td><code>histogram_quantile(0.95, rate(scheduler_job_duration_seconds_bucket[1h]))</code></td>
+        <td>p95 > 6h suggests integrity checks are running without PHYSICAL_ONLY</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Production Deployment Checklist</h2>
+
+  <p>
+    Before shipping to your 5,000-server fleet, verify each of these:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>Check</th><th>Why it matters</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>Leader election is active (Redis or etcd)</td><td>Multiple pods without leader election will double-execute every job</td></tr>
+      <tr><td>2</td><td>Distributed lock TTL &gt; 3× heartbeat interval</td><td>A TTL shorter than 3× heartbeat causes false leader transitions under load</td></tr>
+      <tr><td>3</td><td><code>MaxConcurrentOps</code> set per server tier</td><td>Development servers and production servers should have different caps</td></tr>
+      <tr><td>4</td><td>Maintenance windows use IANA timezone names</td><td>DST transitions silently shift window boundaries if you use offset-based zones</td></tr>
+      <tr><td>5</td><td>Drain timeout ≥ your longest job duration</td><td>A 5-minute drain timeout kills 6-hour CHECKDB jobs on every deployment</td></tr>
+      <tr><td>6</td><td>Prometheus endpoint unreachable from public internet</td><td><code>/metrics</code> can expose database hostnames, server counts, error patterns</td></tr>
+      <tr><td>7</td><td>All T-SQL and SQL operations tested on staging</td><td>Parameterised queries catch SQL injection; test all operation types before production</td></tr>
+      <tr><td>8</td><td>pg_dump binary version matches server version</td><td>A pg_dump mismatch causes silent backup format errors</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="callout info">
+    <div class="label">ASK YOUR TEACHER</div>
+    <p>
+      You've reached the end of the course — but the questions are just starting. Ask me anything:
+      <em>"How do I connect to SQL Server from Go — what driver do I use?"</em>
+      <em>"How do I test the executor without a real database?"</em>
+      <em>"What's the right Prometheus bucket spacing for a job that takes anywhere from 5 seconds to 12 hours?"</em>
+      <em>"How do I add a new operation type without changing the orchestrator?"</em>
+      Each of these has a specific answer tied to your fleet.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory. Each question has four options of equal length.</p>
+
+    <div class="quiz"
+         data-question="The Executor interface has a single method: Execute(ctx, job). What does making it an interface rather than a struct enable?"
+         data-correct="A"
+         data-feedback-correct="Correct. With an interface, the orchestrator calls Execute() and never knows whether it is talking to SQL Server or PostgreSQL. The engine-specific T-SQL and pg_dump logic is entirely isolated inside each executor struct. This also makes it easy to write a fake executor for unit tests."
+         data-feedback-wrong="Think about the two engines — SQL Server and PostgreSQL. The orchestrator has to dispatch jobs to both. How does an interface change what the orchestrator needs to know about each engine?">
+      <div class="quiz-option" data-key="A">It lets SQL Server and PostgreSQL share the same dispatch code path</div>
+      <div class="quiz-option" data-key="B">It lets the policy engine pick the correct executor at generation time</div>
+      <div class="quiz-option" data-key="C">It lets each database choose its own connection pool at runtime</div>
+      <div class="quiz-option" data-key="D">It lets multiple goroutines call Execute concurrently without any locks</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You want to track the total number of completed backup jobs across the fleet. Which Prometheus metric type is correct?"
+         data-correct="B"
+         data-feedback-correct="Correct. A Counter only ever increases and resets when the process restarts. It is the right choice for any 'total number of X that happened' measurement. A Gauge would be wrong here because the total number of completed jobs never decreases."
+         data-feedback-wrong="The key question is: can this number go down? The total number of completed jobs only ever goes up. Which metric type is designed for values that only increase?">
+      <div class="quiz-option" data-key="A">Gauge: it tracks values that go up and down like current queue depth</div>
+      <div class="quiz-option" data-key="B">Counter: it only ever increases and resets to zero on process restart</div>
+      <div class="quiz-option" data-key="C">Histogram: it buckets observations across configurable time-based ranges</div>
+      <div class="quiz-option" data-key="D">Summary: it computes quantile estimates without requiring bucket configuration</div>
+    </div>
+
+    <div class="quiz"
+         data-question="PostgreSQL's pg_dump runs as a shell command via exec.CommandContext. What happens to the shell process if the job context is cancelled?"
+         data-correct="D"
+         data-feedback-correct="Correct. exec.CommandContext tracks the process and sends SIGKILL when the context is cancelled — whether by a timeout or a shutdown signal. This is why exec.CommandContext is used instead of exec.Command: the dynamic timeout mechanism from the policy engine automatically cancels long-running pg_dump processes."
+         data-feedback-wrong="Think about what CommandContext adds compared to Command. The 'Context' in the name is there for a reason — what does Go do with the context when it is cancelled?">
+      <div class="quiz-option" data-key="A">The shell process keeps running; the Go executor just stops reading output</div>
+      <div class="quiz-option" data-key="B">The shell process is suspended and resumed on the next scheduling tick</div>
+      <div class="quiz-option" data-key="C">Go throws a runtime panic unless the executor handles the error explicitly</div>
+      <div class="quiz-option" data-key="D">Go sends SIGKILL to the process, terminating the pg_dump shell command</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Your scheduler Grafana dashboard shows scheduler_jobs_in_flight stuck at MaxConcurrentOps on sql-prod-07 for 4 hours. What is the most likely cause?"
+         data-correct="C"
+         data-feedback-correct="Correct. If jobs_in_flight is pegged at MaxConcurrentOps for hours, it means every slot is occupied and no job is completing. The most common cause is a DBCC CHECKDB or full backup on a large database that is taking longer than its dynamic timeout allows — either the timeout is too short, or the operation is genuinely blocked on I/O."
+         data-feedback-wrong="jobs_in_flight is a Gauge — it goes up when a job starts and down when it finishes. Being stuck at the maximum for hours means jobs are starting but never completing. What kind of operation on what kind of database could take 4+ hours?">
+      <div class="quiz-option" data-key="A">The per-server semaphore capacity was set too high in the DBServer config</div>
+      <div class="quiz-option" data-key="B">The Redis leader election key expired and no new jobs are being dispatched</div>
+      <div class="quiz-option" data-key="C">A long-running CHECKDB or backup is blocking all slots on that server</div>
+      <div class="quiz-option" data-key="D">The Prometheus scrape interval is too short and showing stale metric data</div>
+    </div>
+
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <a href="0005-orchestrator.html">← Lesson 5: The Orchestrator</a>
+    <a href="../index.html">Course home →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <ul>
+      <li><a href="https://prometheus.io/docs/guides/go-application/" target="_blank">Prometheus — Instrumenting a Go Application</a>
+        — Official guide: Counter, Gauge, Histogram, promauto, /metrics endpoint.</li>
+      <li><a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql?view=sql-server-ver16" target="_blank">Microsoft Learn — BACKUP (Transact-SQL)</a>
+        — Authoritative syntax for <code>BACKUP DATABASE</code>, COMPRESSION, CHECKSUM options.</li>
+      <li><a href="https://learn.microsoft.com/en-us/sql/t-sql/database-console-commands/dbcc-checkdb-transact-sql?view=sql-server-ver16" target="_blank">Microsoft Learn — DBCC CHECKDB</a>
+        — Official reference for integrity check modes (PHYSICAL_ONLY, ALL_ERRORMSGS).</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-vacuum.html" target="_blank">PostgreSQL — VACUUM</a>
+        — Authoritative reference for VACUUM, VACUUM FULL, SKIP_LOCKED, and ANALYZE.</li>
+      <li><a href="https://pkg.go.dev/github.com/prometheus/client_golang/prometheus" target="_blank">pkg.go.dev — prometheus package</a>
+        — Complete API reference for CounterVec, GaugeVec, HistogramVec.</li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: Receiving Zabbix Alerts with a Go Webhook</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 1</span>
+    <span>Zabbix Webhooks in Go</span>
+    <span>~35 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="../reference/webhook-patterns.html">Reference</a></span>
+    <span><a href="../reference/handoff-checklist.html">Handoff</a></span>
+  </div>
+
+  <h1>Receiving Zabbix Alerts with a Go Webhook</h1>
+
+  <p>
+    A webhook is a push notification over HTTP. Instead of your Go application repeatedly asking
+    Zabbix "are there any new alerts?", Zabbix tells your application "this alert just happened" as
+    soon as the event is created. In this lesson you will configure the Zabbix side, write a Go
+    receiver, and store alerts idempotently in a database.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant Z as Zabbix Server
+    participant W as Webhook media type
+    participant G as Go receiver
+    participant DB as PostgreSQL
+
+    Z->>W: Trigger fires (or recovers)
+    W->>G: POST /alerts (JSON payload)
+    G->>G: Verify bearer token
+    G->>DB: INSERT event ON CONFLICT skip
+    DB-->>G: new or duplicate?
+    G->>DB: UPDATE status = processed
+    G-->>W: 200 OK
+    W-->>Z: alert logged
+    Note over G,DB: Retry from Zabbix is harmless<br/>because event_id is unique
+    </div>
+    <p class="diagram-caption">Figure 1: Zabbix pushes alerts to a Go receiver that writes them to a database.</p>
+  </div>
+
+  <h2>1. Webhooks vs. polling</h2>
+
+  <p>
+    Polling is familiar to most DBAs: a cron job or scheduler queries the Zabbix API every minute
+    and compares results to the previous run. It works, but it adds latency and wastes work when
+    nothing has changed. Webhooks invert the flow: the monitoring system calls you.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Polling</th><th>Webhook</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Latency</td><td>At least the poll interval</td><td>Seconds after the event</td></tr>
+      <tr><td>Load on Zabbix</td><td>Grows with frequency and scope</td><td>Proportional to actual events</td></tr>
+      <tr><td>Missed events</td><td>Possible if interval is too long</td><td>Zabbix retries on failure</td></tr>
+      <tr><td>Duplicates</td><td>Usually none</td><td>Common because of retries</td></tr>
+      <tr><td>Operational complexity</td><td>Low</td><td>Needs an inbound HTTP listener</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">Rule of thumb</div>
+    <p>
+      Use webhooks when you need a durable, real-time event stream you can join with other data.
+      Use polling when you only need occasional snapshots or when you cannot expose an endpoint.
+    </p>
+  </div>
+
+  <h2>2. Zabbix webhook configuration</h2>
+
+  <p>
+    In Zabbix, a webhook is a media type. You write a small JavaScript function that receives
+    parameters and returns either success or an error. The script runs on the Zabbix server after an
+    action creates the alert.
+  </p>
+
+  <p>
+    Create a media type at <strong>Alerts → Media types → Create media type</strong>, choose
+    <strong>Type: Webhook</strong>, and set the parameters like this:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Parameter</th><th>Value</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>URL</code></td><td><code>https://alerts.example.com/alerts</code></td></tr>
+      <tr><td><code>Token</code></td><td><code>&lt;PUT BEARER TOKEN HERE&gt;</code></td></tr>
+      <tr><td><code>HTTPProxy</code></td><td><code>&lt;optional&gt;</code></td></tr>
+      <tr><td><code>EventID</code></td><td><code>{EVENT.ID}</code></td></tr>
+      <tr><td><code>EventSource</code></td><td><code>{EVENT.SOURCE}</code></td></tr>
+      <tr><td><code>EventValue</code></td><td><code>{EVENT.VALUE}</code></td></tr>
+      <tr><td><code>EventClock</code></td><td><code>{EVENT.CLOCK}</code></td></tr>
+      <tr><td><code>EventSeverity</code></td><td><code>{EVENT.SEVERITY}</code></td></tr>
+      <tr><td><code>HostName</code></td><td><code>{HOST.NAME}</code></td></tr>
+      <tr><td><code>TriggerName</code></td><td><code>{TRIGGER.NAME}</code></td></tr>
+      <tr><td><code>Tags</code></td><td><code>{EVENT.TAGSJSON}</code></td></tr>
+      <tr><td><code>Subject</code></td><td><code>{ALERT.SUBJECT}</code></td></tr>
+      <tr><td><code>Message</code></td><td><code>{ALERT.MESSAGE}</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The <strong>Timeout</strong> field controls how long the JavaScript engine waits for the HTTP
+    call to complete. Default is 30s, allowed range is 1–60s. The <strong>Attempts</strong> and
+    <strong>Attempt interval</strong> on the media type control retries: by default Zabbix retries 3
+    times with a 10s interval when the webhook returns non-2xx or times out.
+    <a href="https://www.zabbix.com/documentation/current/en/manual/config/notifications/media/webhook">Source: Zabbix webhook media type docs</a>.
+  </p>
+
+  <p>The <strong>Script</strong> parameter builds the JSON body and sends it:</p>
+
+  <pre><code>try {
+    Zabbix.log(4, '[custom-go-webhook] started');
+
+    var params = JSON.parse(value);
+    var req = new HttpRequest();
+
+    if (!params.URL) {
+        throw 'Missing "URL" parameter.';
+    }
+    if (!params.Token) {
+        throw 'Missing "Token" parameter.';
+    }
+
+    var payload = {
+        event_id: params.EventID,
+        source: parseInt(params.EventSource, 10),
+        value: parseInt(params.EventValue, 10),
+        clock: parseInt(params.EventClock, 10),
+        severity: parseInt(params.EventSeverity, 10),
+        host_name: params.HostName,
+        trigger_name: params.TriggerName,
+        tags: params.Tags ? JSON.parse(params.Tags) : {},
+        subject: params.Subject,
+        message: params.Message
+    };
+
+    req.addHeader('Content-Type: application/json');
+    req.addHeader('Authorization: Bearer ' + params.Token);
+
+    if (params.HTTPProxy) {
+        req.setProxy(params.HTTPProxy);
+    }
+
+    var resp = req.post(params.URL, JSON.stringify(payload));
+    var status = req.getStatus();
+
+    if (status < 200 || status >= 300) {
+        throw 'HTTP ' + status + ': ' + resp;
+    }
+
+    return JSON.stringify({status: 'ok'});
+}
+catch (error) {
+    Zabbix.log(4, '[custom-go-webhook] error: ' + error);
+    throw 'Sending failed: ' + error;
+}</code></pre>
+
+  <div class="callout warning">
+    <div class="label">Zabbix macro gotchas</div>
+    <p>
+      <code>{EVENT.TAGSJSON}</code> is only available for trigger-based events. Use
+      <code>{EVENT.SOURCE}</code> and <code>{EVENT.VALUE}</code> to branch your logic, and always
+      validate inputs because macros are not substituted during the media type test. See the
+      <a href="https://www.zabbix.com/documentation/guidelines/en/webhooks">Zabbix webhook guidelines</a>
+      for the full validation checklist.
+    </p>
+  </div>
+
+  <p>
+    Then create an action at <strong>Configuration → Actions</strong> that uses this media type.
+    The operation is <strong>Send to users</strong> (or user groups) via your new webhook media type.
+  </p>
+
+  <h2>3. Testing the webhook</h2>
+
+  <p>
+    After saving the media type, click <strong>Test</strong> in the media type list. Fill in the
+    parameter values manually (macros are not substituted in test mode) and run it against your Go
+    receiver or a local echo server.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">Test-button timeout trap</div>
+    <p>
+      The media type test button uses a hard-coded 3-second connection timeout, regardless of the
+      media type's <strong>Timeout</strong> setting. If your receiver is slow to respond or the
+      network is latent, the test may fail with "Connection timeout" even though the real webhook
+      would succeed. This is a known behavior documented in ZBX-16716. Test with a fast local echo
+      server first, then verify production behavior with a real trigger.
+    </p>
+  </div>
+
+  <p>A quick local echo server for testing:</p>
+
+  <pre><code>package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "io"
+    "log"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/alerts", func(w http.ResponseWriter, r *http.Request) {
+        body, _ := io.ReadAll(r.Body)
+        var pretty bytes.Buffer
+        json.Indent(&pretty, body, "", "  ")
+        log.Printf("%s %s\n%s", r.Method, r.URL, pretty.String())
+        w.WriteHeader(http.StatusOK)
+    })
+    log.Fatal(http.ListenAndServe(":8080", nil))
+}</code></pre>
+
+  <h2>4. Database schema</h2>
+
+  <p>
+    The database is the source of truth for what happened. Each row records one Zabbix event.
+    The unique constraint on <code>event_id</code> is what makes retries safe.
+  </p>
+
+  <pre><code>CREATE TABLE zabbix_events (
+    event_id      BIGINT PRIMARY KEY,
+    source        SMALLINT NOT NULL,
+    value         SMALLINT NOT NULL,
+    event_clock   BIGINT NOT NULL,
+    severity      SMALLINT NOT NULL,
+    host_name     TEXT NOT NULL,
+    trigger_name  TEXT NOT NULL,
+    tags          JSONB,
+    subject       TEXT,
+    message       TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    received_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at  TIMESTAMPTZ,
+    raw_payload   JSONB NOT NULL
+);
+
+CREATE INDEX idx_zabbix_events_status ON zabbix_events(status);
+CREATE INDEX idx_zabbix_events_clock ON zabbix_events(event_clock);</code></pre>
+
+  <h2>5. Go receiver</h2>
+
+  <p>
+    The handler does four things: authenticate, parse, claim the event idempotently, and process it.
+    The claim must be atomic with the database so two concurrent deliveries of the same event do not
+    both run the side effects.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "context"
+    "crypto/subtle"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "time"
+
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Alert is the JSON shape Zabbix sends.
+type Alert struct {
+    EventID     int64             `json:"event_id"`
+    Source      int16             `json:"source"`
+    Value       int16             `json:"value"`
+    Clock       int64             `json:"clock"`
+    Severity    int16             `json:"severity"`
+    HostName    string            `json:"host_name"`
+    TriggerName string            `json:"trigger_name"`
+    Tags        map[string]string `json:"tags"`
+    Subject     string            `json:"subject"`
+    Message     string            `json:"message"`
+}
+
+func main() {
+    db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal("open db: ", err)
+    }
+
+    token := os.Getenv("WEBHOOK_TOKEN")
+    if token == "" {
+        log.Fatal("WEBHOOK_TOKEN not set")
+    }
+
+    http.HandleFunc("/alerts", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        if !auth(r, token) {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+
+        var alert Alert
+        if err := json.NewDecoder(r.Body).Decode(&alert); err != nil {
+            http.Error(w, "bad request", http.StatusBadRequest)
+            return
+        }
+
+        if err := storeAlert(r.Context(), db, alert); err != nil {
+            log.Printf("store alert %d: %v", alert.EventID, err)
+            http.Error(w, "internal error", http.StatusInternalServerError)
+            return
+        }
+
+        w.WriteHeader(http.StatusOK)
+        fmt.Fprint(w, `{"ok":true}`)
+    })
+
+    addr := ":8080"
+    log.Printf("listening on %s", addr)
+    log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func auth(r *http.Request, token string) bool {
+    got := r.Header.Get("Authorization")
+    want := "Bearer " + token
+    if len(got) != len(want) {
+        return false
+    }
+    return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func storeAlert(ctx context.Context, db *pgxpool.Pool, a Alert) error {
+    raw, err := json.Marshal(a)
+    if err != nil {
+        return err
+    }
+
+    tx, err := db.Begin(ctx)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback(ctx)
+
+    // Claim the event. If it already exists, this is a retry: return success.
+    var inserted bool
+    err = tx.QueryRow(ctx, `
+        INSERT INTO zabbix_events (
+            event_id, source, value, event_clock, severity,
+            host_name, trigger_name, tags, subject, message,
+            status, received_at, raw_payload
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), $11)
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING (xmax = 0) AS inserted
+    `, a.EventID, a.Source, a.Value, a.Clock, a.Severity,
+        a.HostName, a.TriggerName, a.Tags, a.Subject, a.Message, raw,
+    ).Scan(&inserted)
+    if err != nil {
+        return err
+    }
+
+    if !inserted {
+        // Duplicate delivery. Return OK so Zabbix stops retrying.
+        return tx.Commit(ctx)
+    }
+
+    // Do real work here: send a page, update a dashboard, correlate with other events.
+    // Keep it inside the same transaction so the claim and the effect are atomic.
+
+    _, err = tx.Exec(ctx, `
+        UPDATE zabbix_events
+        SET status = 'processed', processed_at = NOW()
+        WHERE event_id = $1
+    `, a.EventID)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit(ctx)
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">Why <code>xmax = 0</code>?</div>
+    <p>
+      In PostgreSQL, <code>xmax</code> is non-zero when a row was updated by an existing row
+      (conflict) and zero when it was freshly inserted. The query returns <code>inserted = true</code>
+      only for brand-new events, so the handler can skip side effects for duplicates in a single
+      round trip. See <a href="https://gethook.to/blog/writing-a-webhook-consumer-in-go">gethook.to</a>
+      for the original pattern.
+    </p>
+  </div>
+
+  <h2>6. Making it production-ready</h2>
+
+  <p>A few things turn this prototype into something a DBA team can run:</p>
+
+  <ul>
+    <li><strong>Timeouts.</strong> Set read/write timeouts on the HTTP server so a slow client cannot hang the process.</li>
+    <li><strong>TLS.</strong> Put the receiver behind a reverse proxy or load balancer that terminates TLS.</li>
+    <li><strong>Async work.</strong> If processing an alert is slow, write it to the database as pending and process it in a background worker.</li>
+    <li><strong>Retention.</strong> Archive or delete old <code>raw_payload</code> rows after the idempotency window passes.</li>
+    <li><strong>Metrics.</strong> Count deliveries, duplicates, and processing failures so you can tune Zabbix and the receiver.</li>
+  </ul>
+
+  <h2>7. If another team manages Zabbix</h2>
+
+  <p>
+    You will not be able to click through the Zabbix frontend yourself. Schedule a handoff meeting
+    and ask for the endpoint, auth method, agreed JSON schema, macro list, timeout/attempt settings,
+    and on-call ownership. A printable checklist is in the
+    <a href="../reference/handoff-checklist.html">Handoff Checklist</a> reference.
+  </p>
+
+  <h2>8. Quiz — Check Your Understanding</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">
+    Answer from memory, then read the explanation. The goal is retrieval practice, not guessing.
+  </p>
+
+  <div class="quiz-section">
+    <div class="quiz"
+         data-question="Why does the Go handler return 200 OK even for duplicate events?"
+         data-correct="B"
+         data-feedback-correct="Correct. Zabbix retries on any non-2xx response or timeout. Returning 200 for a duplicate stops the retry loop without doing extra work."
+         data-feedback-wrong="Think about what Zabbix does when it does not receive a 2xx response from the webhook endpoint.">
+      <div class="quiz-option" data-key="A">Because the database unique constraint prevents storage, so no work is needed.</div>
+      <div class="quiz-option" data-key="B">Because Zabbix retries on non-2xx responses, and 200 stops the retry loop.</div>
+      <div class="quiz-option" data-key="C">Because returning 200 is the only way to update the event status to processed.</div>
+      <div class="quiz-option" data-key="D">Because Zabbix does not retry webhook deliveries.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the best idempotency key for a Zabbix trigger-based webhook?"
+         data-correct="C"
+         data-feedback-correct="Correct. {EVENT.ID} is the unique identifier for the trigger event. Mapping it to the database primary key lets you deduplicate retries and concurrent deliveries."
+         data-feedback-wrong="The key must be stable across retries and unique per logical event. Which macro fits that?">
+      <div class="quiz-option" data-key="A">A hash of the full JSON payload.</div>
+      <div class="quiz-option" data-key="B">The host name plus trigger name.</div>
+      <div class="quiz-option" data-key="C">{EVENT.ID} mapped to the event_id primary key.</div>
+      <div class="quiz-option" data-key="D">The timestamp {EVENT.CLOCK}.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="When is polling a better choice than a webhook for monitoring data?"
+         data-correct="A"
+         data-feedback-correct="Correct. Polling is simpler when you only need occasional snapshots, when you cannot expose an inbound endpoint, or when Zabbix history is the authoritative source."
+         data-feedback-wrong="Consider the operational cost of an inbound listener and the freshness requirements of the use case.">
+      <div class="quiz-option" data-key="A">When you only need occasional snapshots or cannot expose an endpoint.</div>
+      <div class="quiz-option" data-key="B">When you need sub-second reaction to every alert.</div>
+      <div class="quiz-option" data-key="C">When you want to build a durable audit trail of every event.</div>
+      <div class="quiz-option" data-key="D">When you want to correlate alerts with external systems.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="The Zabbix media type test button fails with a connection timeout, but the real webhook works fine. What is the most likely explanation?"
+         data-correct="D"
+         data-feedback-correct="Correct. The test button uses a hard-coded 3-second connection timeout regardless of the media type's Timeout setting. This is a known behavior (ZBX-16716)."
+         data-feedback-wrong="The test button has a special timeout that does not match the media type's configured Timeout field.">
+      <div class="quiz-option" data-key="A">The media type Timeout field is set below 3 seconds.</div>
+      <div class="quiz-option" data-key="B">Zabbix does not support HTTPS in the test button.</div>
+      <div class="quiz-option" data-key="C">The webhook script is not executed during testing.</div>
+      <div class="quiz-option" data-key="D">The test button uses a hard-coded 3-second timeout regardless of the configured Timeout.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why is the INSERT ... ON CONFLICT wrapped in a transaction?"
+         data-correct="B"
+         data-feedback-correct="Correct. The transaction makes the claim and the side effect atomic. If the side effect fails, the transaction rolls back and Zabbix can retry; the next retry will see the event as not yet processed."
+         data-feedback-wrong="Think about what happens if the side effect fails after the event is already marked as processed.">
+      <div class="quiz-option" data-key="A">Because PostgreSQL requires a transaction for ON CONFLICT.</div>
+      <div class="quiz-option" data-key="B">To make the idempotency claim and the side effect atomic.</div>
+      <div class="quiz-option" data-key="C">Because the pgx driver only supports queries inside transactions.</div>
+      <div class="quiz-option" data-key="D">To prevent Zabbix from sending recovery events.</div>
+    </div>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary source</div>
+    <p>
+      Read the official <a href="https://www.zabbix.com/documentation/current/en/manual/config/notifications/media/webhook">Zabbix webhook media type documentation</a>
+      and the <a href="https://www.zabbix.com/documentation/guidelines/en/webhooks">Zabbix webhook guidelines</a>
+      before you configure a production webhook. They are the authoritative references for the Zabbix side.
+    </p>
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher next.</strong> If anything is unclear — the Zabbix action setup, the Go
+    handler, the PostgreSQL idempotency pattern, or how to adapt this for MySQL — tell me and we
+    will dig in. I can also add a Lesson 2 on testing the receiver, handling Zabbix recovery events,
+    or building a small dashboard from the stored alerts.
+  </div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

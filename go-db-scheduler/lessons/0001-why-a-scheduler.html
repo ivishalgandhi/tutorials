@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: Why a Database Fleet Needs a Scheduler — Concurrent Database Job Scheduler in Go</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0001-why-a-scheduler.mp3">
+    <span class="tag">Lesson 1</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~40 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0002-data-models.html">Lesson 2: Data Models →</a></span>
+  </div>
+
+  <h1>Why a Database Fleet Needs a Scheduler</h1>
+
+  <p>
+    Running maintenance on a single database is trivial — a cron job and a shell script will do. But what happens when
+    that single database becomes a fleet of 10,000 databases spread across 500 servers, running a mix of SQL Server and
+    PostgreSQL, across multiple regions and tiers? The naive approach — one cron entry per job per database — collapses
+    under its own weight. This lesson explains exactly why, and introduces the policy-driven architecture that replaces it.
+  </p>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Scale Problem</h2>
+
+  <p>
+    Before we can understand why a scheduler is necessary, we need to appreciate the target scale. These are the
+    operational parameters the system is designed to handle:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Minimum</th>
+        <th>Target</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Servers in fleet</td>
+        <td>500</td>
+        <td>1,000</td>
+        <td>Mix of SQL Server and PostgreSQL instances</td>
+      </tr>
+      <tr>
+        <td>Databases</td>
+        <td>10,000</td>
+        <td>50,000</td>
+        <td>Across all servers, all tiers</td>
+      </tr>
+      <tr>
+        <td>Jobs dispatched per day</td>
+        <td>—</td>
+        <td>1,000,000+</td>
+        <td>Includes lightweight health checks and log backups</td>
+      </tr>
+      <tr>
+        <td>Concurrent running jobs</td>
+        <td>50</td>
+        <td>200</td>
+        <td>Throttled per server by <code>MaxConcurrentOps</code></td>
+      </tr>
+      <tr>
+        <td>Job duration range</td>
+        <td>5 seconds</td>
+        <td>12 hours</td>
+        <td>Health check vs. DBCC CHECKDB on a 10 TB database</td>
+      </tr>
+      <tr>
+        <td>Database size range</td>
+        <td>10 MB</td>
+        <td>10 TB</td>
+        <td>Drives dynamic timeout calculation</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The scale numbers alone reveal the problem. With 50,000 databases, a naive cron-based approach requires 50,000
+    cron entries — just for full backups. Add differential backups, log backups, integrity checks, index maintenance, and
+    statistics updates, and you are managing hundreds of thousands of static job definitions. And cron, a tool designed
+    for a single host in the 1970s, breaks in the following specific ways at this scale:
+  </p>
+
+  <ul>
+    <li><strong>Time drift and no coordination.</strong> When the same job is scheduled on multiple dispatcher nodes, each fires independently. You get duplicate executions and no way to ensure exactly-once semantics.</li>
+    <li><strong>No conflict detection.</strong> Cron does not know that a full backup and an integrity check on the same database should never run simultaneously. It will happily fire both at midnight.</li>
+    <li><strong>No window awareness.</strong> Cron expressions fire at a time; they have no concept of "only run this during the 1 AM–5 AM maintenance window on weekdays, accounting for DST, in America/Chicago."</li>
+    <li><strong>Thundering herd.</strong> If 5,000 databases all have <code>0 1 * * *</code> as their backup schedule, all 5,000 backup jobs start at 01:00:00. Disk I/O, network bandwidth, and backup storage are instantly saturated.</li>
+    <li><strong>Static definitions can't survive fleet churn.</strong> Databases are provisioned and deprovisioned daily. A static job list is perpetually stale.</li>
+  </ul>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Hermes Inspiration</h2>
+
+  <p>
+    Modern AI agent platforms — and production-grade scheduling systems like Hermes — solved an analogous problem:
+    how do you schedule work across a dynamically changing set of resources without hardcoding a job per resource? The
+    answer is <em>policies</em>.
+  </p>
+
+  <p>
+    In a policy-driven model, you do not define what should happen to each individual resource. Instead, you define
+    <strong>rules that apply to classes of resources</strong>, and the system generates work dynamically by evaluating
+    those rules against live inventory. Consider the difference:
+  </p>
+
+  <ul>
+    <li><strong>Job-driven (old way):</strong> "Back up database <em>Northwind</em> on server <em>sql-prod-01</em> every day at 1 AM."<br>
+    Repeated 50,000 times. For every database. Manually maintained.</li>
+    <li><strong>Policy-driven (new way):</strong> "Back up all ONLINE, non-read-only, production-tier SQL Server databases whose last full backup is older than 24 hours — every night between 1 AM and 5 AM, staggered across the window."<br>
+    Defined once. Applies automatically to every matching database, including ones added tomorrow.</li>
+  </ul>
+
+  <p>
+    Hermes takes this further: when a new agent (resource) registers, existing policies immediately apply to it. No
+    human intervention. No ticket. The scheduler discovers new work from inventory refresh, not from manual job creation.
+    This is the model our database scheduler adopts wholesale.
+  </p>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Policy-Driven vs. Job-Driven Design</h2>
+
+  <p>
+    The practical consequences of the design choice are large. Here is a head-to-head comparison across the concerns
+    that matter most at fleet scale:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>Static — 50,000 job rows</th>
+        <th>Policy-driven — 20 policies</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>New database added to fleet</td>
+        <td>Manual — an administrator must add a new row for each job type</td>
+        <td>Auto-discovered on next inventory refresh; all matching policies apply immediately</td>
+      </tr>
+      <tr>
+        <td>Schedule change for a job type</td>
+        <td>Update 1,000 rows (one per database)</td>
+        <td>Update 1 policy row</td>
+      </tr>
+      <tr>
+        <td>Conflict detection</td>
+        <td>Not possible — static jobs have no runtime awareness of each other</td>
+        <td>Derived from <code>OperationType</code> conflict matrix at dispatch time</td>
+      </tr>
+      <tr>
+        <td>Storage footprint</td>
+        <td>50,000 rows that must be kept in sync with fleet state forever</td>
+        <td>20 policy rows + live inventory (already maintained)</td>
+      </tr>
+      <tr>
+        <td>Thundering herd</td>
+        <td>Likely — all jobs with the same cron expression fire at the same second</td>
+        <td>Stagger algorithm distributes jobs across the maintenance window per server</td>
+      </tr>
+      <tr>
+        <td>Environment-specific overrides</td>
+        <td>Requires duplicating job rows per environment</td>
+        <td>Policy <code>TargetSelector</code> filters by tier, region, tags</td>
+      </tr>
+      <tr>
+        <td>Audit and observability</td>
+        <td>Hard — 50,000 rows have overlapping history</td>
+        <td>Clean — policy execution traces in a single structured log stream</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      A policy is a <strong>template</strong>. Jobs are computed dynamically from <code>policies × inventory</code>.
+      You store the recipe, not the meal. When inventory changes, the meal changes automatically — the recipe stays the
+      same.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>System Architecture Overview</h2>
+
+  <p>
+    Before diving into individual components, it helps to see the complete system on one canvas. The diagram below shows
+    how data flows from raw fleet inventory all the way to a completed job execution, and where each safety mechanism
+    sits.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart TD
+    subgraph Inventory["Inventory Layer"]
+        SS["SQL Server Fleet\n(servers + databases)"]
+        PG["PostgreSQL Fleet\n(servers + databases)"]
+    end
+
+    subgraph Generation["Policy Generation Layer"]
+        PG_GEN["Policy Generator\nGenerateAll()"]
+        POL["20 Policies\n(stored)"]
+    end
+
+    subgraph Scheduling["Scheduling Layer"]
+        CRON["Cron Scheduler\n(robfig/cron v3)"]
+        QUEUE["Job Queue\nchan *ScheduledJob"]
+        STAGGER["Stagger Algorithm\nspread across window"]
+    end
+
+    subgraph Execution["Execution Layer"]
+        WP["Worker Pool\n50–200 goroutines"]
+        SS_EX["SQL Server Executor\nbackup / checkdb / index"]
+        PG_EX["PostgreSQL Executor\npg_dump / vacuum / reindex"]
+    end
+
+    subgraph Coordination["Coordination Layer"]
+        LE["Leader Election\n(etcd or Redis)"]
+        DL["Distributed Lock\nper-job mutex"]
+    end
+
+    subgraph Observability["Observability Layer"]
+        PROM["Prometheus\nmetrics scrape"]
+        GRAF["Grafana\ndashboards + alerts"]
+    end
+
+    SS --> PG_GEN
+    PG --> PG_GEN
+    POL --> PG_GEN
+    PG_GEN --> STAGGER
+    STAGGER --> CRON
+    CRON --> QUEUE
+    QUEUE --> WP
+    WP --> SS_EX
+    WP --> PG_EX
+    LE --> CRON
+    DL --> WP
+    PROM -.->|scrapes| WP
+    PROM -.->|scrapes| QUEUE
+    PROM --> GRAF
+    </div>
+    <div class="diagram-caption">
+      Figure 1.1 — End-to-end architecture. Inventory and policies feed the generator; the stagger algorithm prevents
+      thundering herds; leader election and distributed locks provide exactly-once execution; Prometheus and Grafana
+      observe everything.
+    </div>
+  </div>
+
+  <p>Each layer has a distinct responsibility:</p>
+
+  <ul>
+    <li><strong>Inventory Layer.</strong> The live registry of servers and databases, refreshed on a configurable interval (default 15 minutes). Backed by a local store (SQLite or Postgres) that mirrors discovered fleet state.</li>
+    <li><strong>Policy Generation Layer.</strong> On each scheduling tick, <code>GenerateAll()</code> evaluates every policy's <code>TargetSelector</code> against live inventory and produces a set of <code>ScheduledJob</code> candidates. No candidates are persisted — they are computed fresh.</li>
+    <li><strong>Scheduling Layer.</strong> The cron scheduler fires on policy-defined intervals. The stagger algorithm offsets each database's job start time within the maintenance window to prevent simultaneous execution. Jobs are pushed into a bounded channel queue.</li>
+    <li><strong>Execution Layer.</strong> A worker pool of goroutines drains the queue. Each goroutine dispatches to the appropriate engine executor (SQL Server or PostgreSQL) based on the server's <code>Engine</code> field.</li>
+    <li><strong>Coordination Layer.</strong> Leader election ensures a single dispatcher node in multi-instance deployments. Distributed locks provide defense-in-depth for split-brain scenarios — even if two nodes briefly believe they are leader, only one can acquire the per-job lock.</li>
+    <li><strong>Observability Layer.</strong> Every job state transition emits a Prometheus counter or gauge. Grafana dashboards surface queue depth, job latency histograms, failure rates, and per-server concurrency in real time.</li>
+  </ul>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Ten Design Principles</h2>
+
+  <p>
+    Every architectural decision in this course flows from ten explicit principles. Learning them now will help you
+    understand <em>why</em> the code is structured the way it is — rather than memorising patterns without context.
+  </p>
+
+  <h3>1. Policy-driven, not job-driven</h3>
+  <p>
+    Maintenance rules are expressed as policies over classes of databases, not as individual job definitions. The policy
+    generator computes what needs to run by joining policies with live inventory. Adding a database to the fleet
+    automatically enrolls it in all applicable policies — zero manual steps.
+  </p>
+
+  <h3>2. Exactly-once execution</h3>
+  <p>
+    In a horizontally-scaled deployment, multiple scheduler instances may run simultaneously. Leader election (via etcd
+    or Redis) designates a single active dispatcher. A distributed lock per job is acquired before execution begins,
+    providing defense-in-depth: even in a brief split-brain scenario, only one instance can execute a given job at a
+    time.
+  </p>
+
+  <h3>3. Server-aware concurrency</h3>
+  <p>
+    Each <code>DBServer</code> carries a <code>MaxConcurrentOps</code> field. The worker pool tracks in-flight jobs per
+    server and refuses to dispatch a new job if the server is already at its limit. This prevents a burst of generated
+    jobs from overwhelming a server's I/O subsystem regardless of worker pool size.
+  </p>
+
+  <h3>4. Conflict detection</h3>
+  <p>
+    The conflict matrix defines which operation pairs cannot run simultaneously on the same database (or the same server
+    for I/O-heavy operations). Before dispatching a job, the orchestrator calls <code>HasConflict()</code>. If a
+    conflict is detected, the job is recorded with <code>StatusConflict</code> and retried on the next tick rather than
+    failing.
+  </p>
+
+  <h3>5. Maintenance window awareness</h3>
+  <p>
+    Heavy operations — full backups, integrity checks, index rebuilds — carry a <code>RequiresWindow: true</code> flag
+    on their policy. The scheduler will not dispatch these jobs outside a defined maintenance window. Windows are stored
+    with IANA timezone names so DST transitions are handled correctly automatically.
+  </p>
+
+  <h3>6. Staggered scheduling</h3>
+  <p>
+    The stagger algorithm distributes jobs across a maintenance window proportionally. Given a 4-hour window and 120
+    databases on a server, each database receives a unique offset between 0 and 239 minutes. No two databases on the
+    same server fire simultaneously for the same operation type. The thundering herd is eliminated structurally.
+  </p>
+
+  <h3>7. Dynamic timeouts</h3>
+  <p>
+    Job timeouts scale with database size. A 100 MB database gets a 30-second base timeout for a backup; a 5 TB
+    database might get a 6-hour timeout for an integrity check. The timeout formula is configurable per operation type:
+    <code>base + (sizeGB × perGBMultiplier)</code>, capped at <code>MaxTimeout</code>. A job that exceeds its dynamic
+    timeout is cancelled and marked <code>StatusTimeout</code> — not retried, but alertable.
+  </p>
+
+  <h3>8. Environment agnostic</h3>
+  <p>
+    The scheduler runs identically on a single developer laptop (SQLite, in-process, no etcd), a bare-metal data centre
+    (Postgres store, Redis for locks), and Kubernetes (etcd leader election, persistent volumes). Environment differences
+    are injected through a <code>Config</code> struct — the core logic never checks the deployment environment directly.
+  </p>
+
+  <h3>9. Auto-discovery</h3>
+  <p>
+    The inventory refresh loop runs on a configurable interval. When a new database appears, it is detected on the next
+    refresh and immediately becomes eligible for policy matching. When a database goes offline or is deprovisioned, the
+    scheduler stops generating jobs for it without any manual intervention.
+  </p>
+
+  <h3>10. Graceful shutdown</h3>
+  <p>
+    On receipt of <code>SIGTERM</code> or <code>SIGINT</code>, the scheduler stops accepting new jobs, waits for
+    in-flight jobs to complete (up to a configurable drain timeout, default 5 minutes), then exits cleanly. Long-running
+    jobs — like a 6-hour CHECKDB — are allowed to finish. The process will not exit mid-backup.
+  </p>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>What We Will Build</h2>
+
+  <p>
+    This course is structured as six lessons that build the scheduler from the ground up. By the end, you will have a
+    working, production-grade implementation. Here is what each lesson covers:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Lesson</th>
+        <th>Title</th>
+        <th>What you build</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Why a Database Fleet Needs a Scheduler</td>
+        <td>Architecture understanding, design principles (this lesson)</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>Data Models — Servers, Databases, and Operations</td>
+        <td><code>DBServer</code>, <code>Database</code>, <code>OperationType</code>, conflict matrix, maintenance windows</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>Policy Engine and Job Generation</td>
+        <td><code>Policy</code>, <code>TargetSelector</code>, <code>PolicyGenerator</code>, stagger algorithm</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>The Orchestrator — Concurrency and Conflict Control</td>
+        <td>Worker pool, <code>ServerConcurrencyController</code>, conflict checking, job state machine</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>Executors — SQL Server and PostgreSQL</td>
+        <td>Engine-specific execution, dynamic timeouts, result parsing, error classification</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>Leader Election, Distributed Locks, and Observability</td>
+        <td>etcd/Redis leader election, per-job locks, Prometheus metrics, graceful shutdown</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">COURSE APPROACH</div>
+    <p>
+      Each lesson is self-contained: it explains <em>why</em> before <em>how</em>, shows complete compilable Go code,
+      and ends with a quiz. The code across all lessons forms a single coherent codebase — lesson 3 imports from lesson
+      2, and so on. By lesson 6 you have a full scheduler ready to deploy.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="When 5,000 databases all have a daily full backup scheduled at 1:00 AM, what problem does this create?"
+         data-correct="C"
+         data-feedback-correct="Correct. All 5,000 databases firing backup jobs simultaneously saturates disk I/O, network bandwidth, and backup storage. The stagger algorithm spreads jobs across a 2-hour window to avoid this."
+         data-feedback-wrong="Think about what happens to disk I/O and network bandwidth when thousands of backup jobs start in the same second.">
+      <div class="quiz-option" data-key="A">Nothing — Go goroutines handle it easily</div>
+      <div class="quiz-option" data-key="B">The cron expression becomes invalid with too many databases</div>
+      <div class="quiz-option" data-key="C">A thundering herd that overwhelms server I/O and competes for backup storage bandwidth</div>
+      <div class="quiz-option" data-key="D">The databases fail because they can't run backups at the same time</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In a policy-driven scheduler, when a new database is added to the fleet, how does it get a maintenance job?"
+         data-correct="B"
+         data-feedback-correct="Correct. The policy generator runs against live inventory on every refresh cycle (default every 15 minutes). Any database that matches a policy's TargetSelector automatically gets a generated job — no manual steps required."
+         data-feedback-wrong="The whole point of policy-driven design is removing manual steps. Think about how templates and inventory combine.">
+      <div class="quiz-option" data-key="A">An administrator manually creates a job entry in the scheduler database</div>
+      <div class="quiz-option" data-key="B">The inventory refresh cycle automatically generates jobs for it from matching policies</div>
+      <div class="quiz-option" data-key="C">The database must be restarted to trigger scheduler discovery</div>
+      <div class="quiz-option" data-key="D">A POST request must be sent to the scheduler API</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why does the scheduler need both leader election AND a distributed lock?"
+         data-correct="D"
+         data-feedback-correct="Correct. Leader election reduces the normal case to a single dispatcher. The distributed lock is defense-in-depth for split-brain scenarios where two nodes briefly believe they are leader. Both together give exactly-once execution."
+         data-feedback-wrong="Think about network partitions. Can you guarantee a single leader node at all times in a distributed system?">
+      <div class="quiz-option" data-key="A">Leader election is for Kubernetes; distributed locks are for Redis</div>
+      <div class="quiz-option" data-key="B">Leader election handles backup jobs; locks handle integrity checks</div>
+      <div class="quiz-option" data-key="C">Leader election is required by Go's standard library for concurrent programs</div>
+      <div class="quiz-option" data-key="D">Leader election prevents duplicate scheduling; the lock is defense-in-depth — a second node that wins leadership during a network partition cannot also acquire the job lock</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A DBCC CHECKDB on a 2TB database takes 6 hours. What two scheduler features handle this correctly?"
+         data-correct="A"
+         data-feedback-correct="Correct. Dynamic timeout ensures the job isn't killed early (base 30m + per-GB scaling up to 12h max). Conflict detection prevents a full backup from starting on the same database while CHECKDB runs, since they conflict."
+         data-feedback-wrong="Think specifically about two problems: how long the operation takes, and what other operations can't run at the same time.">
+      <div class="quiz-option" data-key="A">Dynamic timeout (scales timeout with DB size) and conflict detection (blocks concurrent backups on same DB)</div>
+      <div class="quiz-option" data-key="B">Maintenance windows (limits it to off-hours) and stagger (spreads load)</div>
+      <div class="quiz-option" data-key="C">Leader election (ensures only one runs) and graceful shutdown (stops it cleanly)</div>
+      <div class="quiz-option" data-key="D">Worker pool (dedicates a goroutine) and the execution store (records start time)</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <span></span>
+    <a href="0002-data-models.html">Lesson 2: Data Models — Servers, Databases, and Operations →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://pkg.go.dev/github.com/robfig/cron/v3" target="_blank">robfig/cron v3 — Go cron expression scheduler</a></li>
+      <li><a href="https://pkg.go.dev/sync" target="_blank">Go standard library: sync — Mutex, WaitGroup, Once</a></li>
+      <li><a href="https://pkg.go.dev/context" target="_blank">Go standard library: context — cancellation and deadlines</a></li>
+      <li><a href="https://etcd.io/docs/v3.5/dev-guide/api_concurrency_reference_v3/" target="_blank">etcd v3 concurrency API — leader election and distributed locks</a></li>
+      <li><a href="https://redis.io/docs/manual/patterns/distributed-locks/" target="_blank">Redis — Distributed locks with Redlock</a></li>
+      <li><a href="https://docs.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql" target="_blank">Microsoft Docs — BACKUP (Transact-SQL)</a></li>
+      <li><a href="https://www.postgresql.org/docs/current/app-pgbasebackup.html" target="_blank">PostgreSQL Docs — pg_basebackup</a></li>
+      <li><a href="https://prometheus.io/docs/guides/go-application/" target="_blank">Prometheus — Instrumenting a Go application</a></li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

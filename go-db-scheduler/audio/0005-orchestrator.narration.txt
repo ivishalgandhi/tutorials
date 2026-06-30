@@ -1,0 +1,114 @@
+Welcome to Lesson 5: The Orchestrator — Concurrency Control and the Scheduling Loop.
+
+This is part of the Concurrent Database Job Scheduler in Go course.
+
+Let's start.
+
+
+Lessons 2 through 4 built the data models, policies, and coordination primitives. Now everything converges in the orchestrator: the component that takes a stream of generated ScheduledJob objects and dispatches them safely across five thousand servers without overwhelming any single server, running conflicting operations on the same database, or losing work during a shutdown.
+
+This lesson introduces three Go patterns you may not have seen before: the worker pool, the per-server semaphore, and graceful shutdown using signal.NotifyContext. Each is a standard Go idiom worth keeping in your toolbox permanently.
+
+
+Where the Orchestrator Sits
+
+Picture a flowchart with three columns. On the left is the Tick Loop. In the middle is the Orchestrator. On the right are the Executors.
+
+The Tick Loop contains: the cron library fires, the policy generator runs, and the jobs are pushed onto a channel.
+
+The Orchestrator contains: a buffered job channel with five hundred slots, a pool of worker goroutines, per-server semaphores, a conflict detector, and a window checker.
+
+The Executors are: the SQL Server executor and the PostgreSQL executor.
+
+The flow goes: cron fires, the policy generator produces jobs, jobs enter the buffered channel, worker goroutines drain the channel, each worker checks the semaphore, conflict detector, and window checker before calling the appropriate executor.
+
+
+Why a Worker Pool? Not a Goroutine Per Job
+
+The simplest way to process jobs concurrently in Go is to spawn a goroutine for every job. For ten jobs, this looks fine.
+
+With fifty thousand databases multiplied by six operation types at a fleet tick, you can generate three hundred thousand goroutines in milliseconds. Each goroutine starts with a two-kilobyte stack that grows as needed. At three hundred thousand goroutines times two kilobytes minimum, that is six hundred megabytes just to start — before any work happens. And the goroutines do not finish quickly: a full backup takes up to twelve hours.
+
+The solution is a worker pool: a fixed number of goroutines that all read from a single shared channel. You control concurrency by controlling the number of goroutines, not the number of jobs.
+
+In the worker pool pattern: you create a buffered channel — the queue. The buffer size determines how many jobs can wait before the generator is slowed down. Then you start a fixed number of goroutines. Each goroutine loops over the channel using Go's range-over-channel syntax. When the channel is closed, all goroutines exit cleanly. A WaitGroup tracks when all goroutines have finished.
+
+Go beginner note — range over a channel: range over a channel is like looping over a slice, except the loop blocks waiting for the next value instead of immediately finishing. When close is called on the channel, the loop exits cleanly. This is the standard Go pattern for "process work until told to stop."
+
+Go beginner note — sync.WaitGroup: a WaitGroup is a counter. Add increments it before launching a goroutine. Done decrements it when the goroutine finishes. Wait blocks until the counter reaches zero — meaning all goroutines are done. This is how graceful shutdown waits for in-flight jobs to finish.
+
+For the complete worker pool code, see the lesson text.
+
+
+Per-Server Semaphore — Protecting MaxConcurrentOps
+
+A global worker pool limits total parallelism, but it does not protect individual servers. If two hundred workers all pick jobs that happen to land on the same SQL Server instance, that server gets two hundred simultaneous backup processes — saturating its disk I/O completely regardless of the MaxConcurrentOps setting.
+
+The per-server semaphore is the fix. It ensures that at most MaxConcurrentOps jobs are running on any single server at any moment.
+
+In Go, the idiom for a semaphore is a buffered channel. A buffered channel with capacity N can hold N values. Sending to it — which means writing an empty struct — succeeds immediately if there is room. This is called acquiring a permit. If the channel is full, the send blocks until someone else receives from it. Receiving is called releasing a permit. The empty struct uses zero bytes — it is just a token, not real data.
+
+The system maintains a map of server IDs to semaphore channels. When a worker picks up a job, it looks up or lazily creates the semaphore for that server with the correct capacity equal to MaxConcurrentOps.
+
+The dispatch function then:
+Step one: checks the maintenance window. If the job requires a window and the server is not in one, the job is marked as skipped and the function returns.
+Step two: checks for conflicts. If a conflict is found, the job is deferred and the function returns.
+Step three: acquires the per-server semaphore. This uses a select statement so that a shutdown signal can unblock the goroutine even if the server is at capacity.
+Step four: applies the dynamic timeout to a new context.
+Step five: marks the job as running, executes it, and records the result.
+
+The semaphore is released using defer — meaning it is always released when the function returns, whether the job succeeded, failed, or panicked.
+
+Watch out: use select — not a bare send — when acquiring the semaphore. A bare send would block forever if the server is at capacity and shutdown arrives — the program could never exit.
+
+For the complete dispatch function code, see the lesson text.
+
+
+The Tick Loop
+
+The tick loop is the heartbeat of the scheduler. Every N seconds — the default is sixty — it evaluates all policies against live inventory, generates the current set of candidate jobs, and pushes them onto the job channel.
+
+The tick loop uses a standard Go ticker. It selects over two cases: context done, which means shutdown has arrived, causing the loop to return; or ticker fires, which means it is time to generate jobs.
+
+When the ticker fires, the generator produces all candidates for the current moment. Each candidate is pushed onto the job channel using another select, again watching for context done so a shutdown during generation does not block.
+
+Important note: the job channel has a fixed buffer of five hundred slots. If workers cannot drain the queue fast enough, the send will block — applying backpressure to the generator. This is intentional. It prevents the scheduler from accumulating millions of stale jobs during a slow period. The buffer size should be roughly worker count multiplied by some multiple for your fleet.
+
+For the complete tick loop code, see the lesson text.
+
+
+Graceful Shutdown — The Full Picture
+
+Kubernetes sends SIGTERM before it kills a pod. Your scheduler might be in the middle of a six-hour integrity check job when this happens. Graceful shutdown is the mechanism that says: "stop accepting new work, but let everything in-flight finish."
+
+Picture this sequence. The operating system sends SIGTERM. Main receives it and cancels the context. The tick loop sees context done and stops generating new jobs. The job channel is closed. Workers finish their current jobs and then exit their range loops. The WaitGroup counter reaches zero. The main function exits cleanly.
+
+Here is the five-step shutdown sequence in plain terms.
+
+Step one: use signal.NotifyContext to create a context that is automatically cancelled when SIGTERM or SIGINT arrives.
+
+Step two: start N worker goroutines that read from the job channel.
+
+Step three: run the tick loop — this blocks until the context is cancelled.
+
+Step four: close the job channel. This signals all workers to finish their current job and then exit.
+
+Step five: wait for all workers to finish using WaitGroup.Wait, with a five-minute drain timeout.
+
+Key insight about the drain context: when SIGTERM arrives, the main context is cancelled. You cannot use it to create the drain timeout — a timeout derived from a cancelled context is immediately expired. Always create the drain context from context.Background, a context that is never cancelled.
+
+For the complete main function with graceful shutdown code, see the lesson text.
+
+
+The Complete Orchestrator
+
+The Orchestrator struct holds: a configuration, the policy generator, the execution store, a map of engine type to executor, the per-server semaphores, and the job channel.
+
+The Executor interface has a single method: Execute, which takes a context and a scheduled job, and returns a result and an error. One method, one contract. The orchestrator never knows whether it is talking to SQL Server or PostgreSQL.
+
+For the complete Orchestrator struct and its method set, see the lesson text. Lesson 6 fills in the Execute method on each executor.
+
+
+That is the end of Lesson 5: The Orchestrator — Concurrency Control and the Scheduling Loop.
+
+Return to the lesson page for the complete code, the concurrency diagrams, and the interactive quiz.

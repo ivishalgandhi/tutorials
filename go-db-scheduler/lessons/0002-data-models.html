@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2: Data Models — Servers, Databases, and Operations — Concurrent Database Job Scheduler in Go</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0002-data-models.mp3">
+    <span class="tag">Lesson 2</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~35 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0001-why-a-scheduler.html">← Lesson 1: Why a Scheduler</a></span>
+    <span><a href="0003-policy-engine.html">Lesson 3: Policy Engine →</a></span>
+  </div>
+
+  <h1>Data Models — Servers, Databases, and Operations</h1>
+
+  <p>
+    The scheduler's power comes from rich metadata. Every decision — which jobs to generate, which servers are
+    overloaded, which operations conflict, how long a timeout should be — is derived from three core types:
+    <code>DBServer</code>, <code>Database</code>, and <code>OperationType</code>. This lesson walks through those
+    types and the conflict matrix that sits at the heart of the scheduler.
+  </p>
+
+  <!-- entity relationship diagram -->
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    subgraph Models["Core Domain Models"]
+        SRV["DBServer\n─────────────\nID, Hostname, Port\nEngine, Version, Tier\nMaxConcurrentOps\nMaintenanceWindows[]"]
+        DB["Database\n─────────────\nID, Name, ServerID\nSizeBytes, RecoveryModel\nLastFullBackup\nExcludedOps[]"]
+        OP["OperationType\n─────────────\nfull_backup\nintegrity_check\nindex_rebuild\nvacuum_full\n..."]
+    end
+
+    subgraph Runtime["Runtime Artifacts"]
+        POL["Policy\n─────────────\nTargetSelector\nOperationType\nSchedule (cron)"]
+        JOB["ScheduledJob\n─────────────\nDatabase ref\nOperation\nTimeout\nStatus"]
+        EX["Executor\n─────────────\nSQLServerExecutor\nPostgreSQLExecutor"]
+    end
+
+    SRV -->|"hosts 1..N"| DB
+    DB  -->|"matched by"| POL
+    OP  -->|"referenced by"| POL
+    POL -->|"generates"| JOB
+    DB  -->|"targeted by"| JOB
+    JOB -->|"dispatched to"| EX
+    SRV -->|"engine selects"| EX
+    </div>
+    <div class="diagram-caption">
+      Figure 2.1 — Relationship between domain models and runtime artifacts. A <code>DBServer</code> hosts many
+      <code>Database</code> records. Policies match databases and generate <code>ScheduledJob</code> instances that are
+      dispatched to the correct executor based on the server's engine.
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>DBServer — The Fleet Registry</h2>
+
+  <p>
+    Every physical or virtual database server in the fleet is represented by a <code>DBServer</code> struct. It carries
+    everything the scheduler needs to know about the host: what engine it runs, how many concurrent operations it can
+    tolerate, when its maintenance windows are, and which region and tier it belongs to.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">EngineType</span> <span class="tp">string</span>
+
+<span class="kw">const</span> (
+    <span class="nm">EngineSQLServer</span>  <span class="tp">EngineType</span> = <span class="st">"sqlserver"</span>
+    <span class="nm">EnginePostgreSQL</span> <span class="tp">EngineType</span> = <span class="st">"postgresql"</span>
+)
+
+<span class="kw">type</span> <span class="tp">ServerTier</span> <span class="tp">string</span>
+
+<span class="kw">const</span> (
+    <span class="nm">TierProduction</span>  <span class="tp">ServerTier</span> = <span class="st">"production"</span>
+    <span class="nm">TierStaging</span>     <span class="tp">ServerTier</span> = <span class="st">"staging"</span>
+    <span class="nm">TierDevelopment</span> <span class="tp">ServerTier</span> = <span class="st">"development"</span>
+    <span class="nm">TierDR</span>          <span class="tp">ServerTier</span> = <span class="st">"dr"</span>
+)
+
+<span class="kw">type</span> <span class="tp">DBServer</span> <span class="kw">struct</span> {
+    ID                 <span class="tp">string</span>              <span class="st">`json:"id"`</span>
+    Hostname           <span class="tp">string</span>              <span class="st">`json:"hostname"`</span>
+    Port               <span class="tp">int</span>                 <span class="st">`json:"port"`</span>
+    Engine             <span class="tp">EngineType</span>          <span class="st">`json:"engine"`</span>
+    Version            <span class="tp">string</span>              <span class="st">`json:"version"`</span>
+    Tier               <span class="tp">ServerTier</span>          <span class="st">`json:"tier"`</span>
+    Region             <span class="tp">string</span>              <span class="st">`json:"region"`</span>
+    MaxConcurrentOps   <span class="tp">int</span>                 <span class="st">`json:"max_concurrent_ops"`</span>
+    ConnectionString   <span class="tp">string</span>              <span class="st">`json:"-"`</span>
+    Tags               <span class="kw">map</span>[<span class="tp">string</span>]<span class="tp">string</span>    <span class="st">`json:"tags"`</span>
+    MaintenanceWindows []<span class="tp">MaintenanceWindow</span>  <span class="st">`json:"maintenance_windows"`</span>
+    Enabled            <span class="tp">bool</span>                <span class="st">`json:"enabled"`</span>
+}</code></pre>
+
+  <p>
+    <strong>MaxConcurrentOps</strong> is the single most important throttle in the system. It prevents the scheduler
+    from running 20 simultaneous backups on a server with 4 spindles. A busy SQL Server production instance might have
+    <code>MaxConcurrentOps=3</code>; a dedicated backup server might allow 8. The worker pool tracks in-flight jobs per
+    server ID and will not dispatch a new job when the count is at capacity.
+  </p>
+
+  <p>
+    Notice that <code>ConnectionString</code> is tagged <code>json:"-"</code>. It is intentionally excluded from all
+    JSON serialisation — credentials must never appear in API responses, logs, or Prometheus labels.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">GOTCHA</div>
+    <p>
+      <strong>MaxConcurrentOps must be set conservatively.</strong> For OLTP SQL Server boxes, start at 2–3. Index
+      rebuilds and integrity checks are I/O-intensive — running three simultaneously on the same spindles will saturate
+      them. If you are unsure, start at 1 for production servers and raise it after observing real I/O utilisation
+      during maintenance windows.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Database — The Maintenance Subject</h2>
+
+  <p>
+    The <code>Database</code> struct represents a single logical database on a server. It carries the metadata that the
+    policy generator, conflict checker, and executor all need to make decisions.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">Database</span> <span class="kw">struct</span> {
+    ID             <span class="tp">string</span>          <span class="st">`json:"id"`</span>
+    Name           <span class="tp">string</span>          <span class="st">`json:"name"`</span>
+    ServerID       <span class="tp">string</span>          <span class="st">`json:"server_id"`</span>
+    Server         *<span class="tp">DBServer</span>       <span class="st">`json:"server,omitempty"`</span>
+    SizeBytes      <span class="tp">int64</span>           <span class="st">`json:"size_bytes"`</span>
+    RecoveryModel  <span class="tp">string</span>          <span class="st">`json:"recovery_model"`</span> <span class="cm">// FULL, SIMPLE, BULK_LOGGED</span>
+    State          <span class="tp">string</span>          <span class="st">`json:"state"`</span>           <span class="cm">// ONLINE, OFFLINE, RESTORING</span>
+    IsReadOnly     <span class="tp">bool</span>            <span class="st">`json:"is_read_only"`</span>
+    LastFullBackup *<span class="tp">time.Time</span>      <span class="st">`json:"last_full_backup"`</span>
+    LastIntegrity  *<span class="tp">time.Time</span>      <span class="st">`json:"last_integrity_check"`</span>
+    LastVacuum     *<span class="tp">time.Time</span>      <span class="st">`json:"last_vacuum"`</span>
+    Priority       <span class="tp">int</span>             <span class="st">`json:"priority"`</span>        <span class="cm">// 1=critical, 5=low</span>
+    ExcludedOps    []<span class="tp">OperationType</span> <span class="st">`json:"excluded_ops"`</span>
+    Enabled        <span class="tp">bool</span>            <span class="st">`json:"enabled"`</span>
+}</code></pre>
+
+  <p>
+    <strong>RecoveryModel</strong> is crucial for log backup policies. Log backups only make sense for databases in
+    <code>FULL</code> recovery model. The policy generator checks this field — a <code>SIMPLE</code> recovery model
+    database is automatically excluded from log backup policies by the <code>TargetSelector</code>. No job is
+    generated, so there is no runtime failure to handle.
+  </p>
+
+  <p>
+    <strong>LastFullBackup, LastIntegrity, LastVacuum</strong> are pointer fields — they are <code>nil</code> when the
+    operation has never run on this database. The helper methods below use this to make scheduling decisions:
+  </p>
+
+  <pre><code><span class="cm">// NeedsBackup returns true if the database has never been backed up,</span>
+<span class="cm">// or if the last full backup is older than maxAge.</span>
+<span class="kw">func</span> (<span class="nm">d</span> *<span class="tp">Database</span>) <span class="fn">NeedsBackup</span>(maxAge <span class="tp">time.Duration</span>) <span class="tp">bool</span> {
+    <span class="kw">if</span> d.LastFullBackup == <span class="nm">nil</span> {
+        <span class="kw">return</span> <span class="nm">true</span> <span class="cm">// never backed up</span>
+    }
+    <span class="kw">return</span> time.<span class="fn">Since</span>(*d.LastFullBackup) &gt; maxAge
+}</code></pre>
+
+  <pre><code><span class="cm">// IsSystemDB returns true for built-in system databases on both</span>
+<span class="cm">// SQL Server and PostgreSQL. These are excluded from most policies.</span>
+<span class="kw">func</span> (<span class="nm">d</span> *<span class="tp">Database</span>) <span class="fn">IsSystemDB</span>() <span class="tp">bool</span> {
+    systemDBs := <span class="kw">map</span>[<span class="tp">string</span>]<span class="tp">bool</span>{
+        <span class="cm">// SQL Server system databases</span>
+        <span class="st">"master"</span>:    <span class="nm">true</span>,
+        <span class="st">"msdb"</span>:      <span class="nm">true</span>,
+        <span class="st">"model"</span>:     <span class="nm">true</span>,
+        <span class="st">"tempdb"</span>:    <span class="nm">true</span>,
+        <span class="cm">// PostgreSQL system databases</span>
+        <span class="st">"postgres"</span>:  <span class="nm">true</span>,
+        <span class="st">"template0"</span>: <span class="nm">true</span>,
+        <span class="st">"template1"</span>: <span class="nm">true</span>,
+    }
+    <span class="kw">return</span> systemDBs[strings.<span class="fn">ToLower</span>(d.Name)]
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">SYSTEM DATABASES</div>
+    <p>
+      System databases are excluded from most policies by default. <code>tempdb</code> cannot be backed up at all.
+      <code>master</code> and <code>msdb</code> need special handling — they are small but critical, and must be
+      backed up after any schema-level change. Set <code>IncludeSystemDBs: true</code> only on policies designed
+      specifically for them, not on general maintenance policies.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>OperationType — What Jobs Actually Do</h2>
+
+  <p>
+    <code>OperationType</code> is a typed string constant that identifies the kind of work a job performs. The full
+    catalogue of supported operations spans both engines and several maintenance categories:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Category</th>
+        <th>Operation</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SQL Server Backup</td>
+        <td><code>full_backup</code></td>
+        <td><code>BACKUP DATABASE ... TO DISK WITH COMPRESSION, CHECKSUM</code></td>
+      </tr>
+      <tr>
+        <td>SQL Server Backup</td>
+        <td><code>differential_backup</code></td>
+        <td>Incremental backup since last full; restores faster than repeated log replays</td>
+      </tr>
+      <tr>
+        <td>SQL Server Backup</td>
+        <td><code>log_backup</code></td>
+        <td>T-log backup (FULL recovery model only); enables point-in-time restore</td>
+      </tr>
+      <tr>
+        <td>SQL Server Maintenance</td>
+        <td><code>index_rebuild</code></td>
+        <td><code>ALTER INDEX REBUILD</code> — for fragmentation &gt; 30%; rewrites index pages entirely</td>
+      </tr>
+      <tr>
+        <td>SQL Server Maintenance</td>
+        <td><code>index_reorganize</code></td>
+        <td><code>ALTER INDEX REORGANIZE</code> — for 10–30% fragmentation; online, less locking</td>
+      </tr>
+      <tr>
+        <td>SQL Server Maintenance</td>
+        <td><code>update_statistics</code></td>
+        <td><code>UPDATE STATISTICS</code> with sample or full scan; keeps query plans optimal</td>
+      </tr>
+      <tr>
+        <td>SQL Server Maintenance</td>
+        <td><code>integrity_check</code></td>
+        <td><code>DBCC CHECKDB</code> — verifies every data and index page; detects corruption</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL Backup</td>
+        <td><code>pg_basebackup</code></td>
+        <td>Physical cluster backup via <code>pg_basebackup</code>; streams the entire data directory</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL Backup</td>
+        <td><code>pg_dump</code></td>
+        <td>Logical backup — schema plus data in SQL or custom format; database-level granularity</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL Maintenance</td>
+        <td><code>vacuum_analyze</code></td>
+        <td><code>VACUUM (VERBOSE, ANALYZE)</code> — reclaims dead tuple space; updates planner stats</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL Maintenance</td>
+        <td><code>vacuum_full</code></td>
+        <td><code>VACUUM FULL</code> — reclaims table bloat; takes exclusive lock on each table</td>
+      </tr>
+      <tr>
+        <td>PostgreSQL Maintenance</td>
+        <td><code>reindex_concurrently</code></td>
+        <td><code>REINDEX CONCURRENTLY</code> (PostgreSQL 14+) — rebuilds indexes without blocking reads</td>
+      </tr>
+      <tr>
+        <td>Cross-platform</td>
+        <td><code>health_check</code></td>
+        <td>Quick connectivity and state check; verifies the database is reachable and ONLINE</td>
+      </tr>
+      <tr>
+        <td>Cross-platform</td>
+        <td><code>cleanup_old_backups</code></td>
+        <td>Removes backup files older than <code>retention_days</code> from backup storage</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Operation Weights — Understanding Resource Impact</h2>
+
+  <p>
+    Every operation carries four weight scores on a scale of 1–10 for IO, CPU, Lock contention, and Network. The
+    scheduler uses these scores to reason about server load at a high level, though the primary throttle is always
+    <code>MaxConcurrentOps</code>. Weight scores help operators understand <em>why</em> a given combination of
+    operations is dangerous — and they drive future enhancements like weighted concurrency limits.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>IO</th>
+        <th>CPU</th>
+        <th>Lock</th>
+        <th>Network</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>integrity_check</code></td>
+        <td>10</td>
+        <td>8</td>
+        <td>5</td>
+        <td>1</td>
+        <td>Reads every data page — maximally I/O-intensive</td>
+      </tr>
+      <tr>
+        <td><code>full_backup</code></td>
+        <td>9</td>
+        <td>5</td>
+        <td>3</td>
+        <td>8</td>
+        <td>High I/O plus high network to backup target</td>
+      </tr>
+      <tr>
+        <td><code>index_rebuild</code></td>
+        <td>9</td>
+        <td>7</td>
+        <td>8</td>
+        <td>1</td>
+        <td>Rewrites all index pages; holds schema locks</td>
+      </tr>
+      <tr>
+        <td><code>vacuum_full</code></td>
+        <td>10</td>
+        <td>6</td>
+        <td>10</td>
+        <td>1</td>
+        <td>Exclusive table lock; rewrites the entire heap</td>
+      </tr>
+      <tr>
+        <td><code>pg_basebackup</code></td>
+        <td>9</td>
+        <td>4</td>
+        <td>2</td>
+        <td>8</td>
+        <td>Streams the entire PostgreSQL cluster directory</td>
+      </tr>
+      <tr>
+        <td><code>vacuum_analyze</code></td>
+        <td>4</td>
+        <td>3</td>
+        <td>2</td>
+        <td>1</td>
+        <td>Safe to run during business hours for most workloads</td>
+      </tr>
+      <tr>
+        <td><code>log_backup</code></td>
+        <td>3</td>
+        <td>2</td>
+        <td>1</td>
+        <td>4</td>
+        <td>Very lightweight; designed to run every 15–30 minutes</td>
+      </tr>
+      <tr>
+        <td><code>health_check</code></td>
+        <td>1</td>
+        <td>1</td>
+        <td>0</td>
+        <td>1</td>
+        <td>Near-zero impact; run as frequently as needed</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Conflict Matrix — Who Blocks Whom</h2>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      The conflict matrix is the heart of safe scheduling. It answers: <em>"Can I start operation X on database D
+      while operation Y is already running on D?"</em> If <code>HasConflict(X, Y)</code> returns <code>true</code>,
+      the new job is deferred with <code>StatusConflict</code> and retried on the next scheduling tick. No data is
+      put at risk, and no jobs are silently dropped.
+    </p>
+  </div>
+
+  <pre><code><span class="kw">var</span> <span class="nm">OperationConflicts</span> = <span class="kw">map</span>[<span class="tp">OperationType</span>][]<span class="tp">OperationType</span>{
+    <span class="cm">// Full backup conflicts: heavy I/O operations that can corrupt or</span>
+    <span class="cm">// interfere with the backup stream.</span>
+    <span class="nm">OpFullBackup</span>:     {<span class="nm">OpDiffBackup</span>, <span class="nm">OpIntegrityCheck</span>, <span class="nm">OpIndexRebuild</span>, <span class="nm">OpVacuumFull</span>},
+
+    <span class="cm">// DBCC CHECKDB reads every page — any concurrent write-heavy</span>
+    <span class="cm">// operation causes false positives or excessive I/O contention.</span>
+    <span class="nm">OpIntegrityCheck</span>: {<span class="nm">OpFullBackup</span>, <span class="nm">OpDiffBackup</span>, <span class="nm">OpIndexRebuild</span>, <span class="nm">OpVacuumFull</span>},
+
+    <span class="cm">// Index rebuild holds schema locks; backup and checkdb can't</span>
+    <span class="cm">// proceed cleanly while pages are being rewritten.</span>
+    <span class="nm">OpIndexRebuild</span>:   {<span class="nm">OpFullBackup</span>, <span class="nm">OpIntegrityCheck</span>, <span class="nm">OpVacuumFull</span>, <span class="nm">OpReindex</span>},
+
+    <span class="cm">// VACUUM FULL holds exclusive locks on every table it touches.</span>
+    <span class="nm">OpVacuumFull</span>:     {<span class="nm">OpFullBackup</span>, <span class="nm">OpIndexRebuild</span>, <span class="nm">OpReindex</span>, <span class="nm">OpPgBaseBackup</span>},
+
+    <span class="cm">// REINDEX conflicts with VACUUM FULL and index_rebuild (both</span>
+    <span class="cm">// compete for the same index structures).</span>
+    <span class="nm">OpReindex</span>:        {<span class="nm">OpVacuumFull</span>, <span class="nm">OpIndexRebuild</span>},
+
+    <span class="cm">// Log backup is designed to be lightweight and non-blocking.</span>
+    <span class="nm">OpLogBackup</span>:      {}, <span class="cm">// never conflicts</span>
+
+    <span class="cm">// VACUUM ANALYZE only conflicts with VACUUM FULL (both want</span>
+    <span class="cm">// to process the visibility map and free space map).</span>
+    <span class="nm">OpVacuumAnalyze</span>:  {<span class="nm">OpVacuumFull</span>},
+
+    <span class="cm">// REINDEX CONCURRENTLY never takes exclusive locks — it's safe</span>
+    <span class="cm">// to run alongside any other operation.</span>
+    <span class="nm">OpReindexConcur</span>:  {}, <span class="cm">// concurrent — never conflicts</span>
+}
+
+<span class="cm">// HasConflict returns true if op1 and op2 cannot run concurrently</span>
+<span class="cm">// on the same database. The check is directional (op1 → op2).</span>
+<span class="kw">func</span> <span class="fn">HasConflict</span>(op1, op2 <span class="tp">OperationType</span>) <span class="tp">bool</span> {
+    <span class="kw">for</span> _, conflict := <span class="kw">range</span> <span class="nm">OperationConflicts</span>[op1] {
+        <span class="kw">if</span> conflict == op2 {
+            <span class="kw">return</span> <span class="nm">true</span>
+        }
+    }
+    <span class="kw">return</span> <span class="nm">false</span>
+}</code></pre>
+
+  <p>
+    The matrix below makes the relationships visual. A <strong>✗ blocks</strong> cell means the row operation cannot
+    start while the column operation is running on the same database. A <strong>✓ safe</strong> cell means concurrent
+    execution is permitted.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Running →<br>New job ↓</th>
+        <th><code>full_backup</code></th>
+        <th><code>integrity_check</code></th>
+        <th><code>index_rebuild</code></th>
+        <th><code>vacuum_full</code></th>
+        <th><code>log_backup</code></th>
+        <th><code>vacuum_analyze</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>full_backup</code></td>
+        <td>—</td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+      </tr>
+      <tr>
+        <td><code>integrity_check</code></td>
+        <td>✗ blocks</td>
+        <td>—</td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+      </tr>
+      <tr>
+        <td><code>index_rebuild</code></td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>—</td>
+        <td>✗ blocks</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+      </tr>
+      <tr>
+        <td><code>vacuum_full</code></td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>✗ blocks</td>
+        <td>—</td>
+        <td>✓ safe</td>
+        <td>✗ blocks</td>
+      </tr>
+      <tr>
+        <td><code>log_backup</code></td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+        <td>—</td>
+        <td>✓ safe</td>
+      </tr>
+      <tr>
+        <td><code>vacuum_analyze</code></td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+        <td>✓ safe</td>
+        <td>✗ blocks</td>
+        <td>✓ safe</td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Server-Level Conflicts</h2>
+
+  <p>
+    Database-level conflict detection handles the case where two operations target the same database. But some
+    operations are so resource-intensive that they conflict at the <strong>server</strong> level — even when they
+    target different databases on the same host.
+  </p>
+
+  <p>
+    <code>DBCC CHECKDB</code> is the canonical example. It reads every data and index page in a database, saturating
+    the I/O subsystem. Running two <code>CHECKDB</code> operations simultaneously on the same SQL Server — even on
+    different databases — will overwhelm the server's spindles and cause both to run three to four times slower.
+    The same is true for <code>VACUUM FULL</code> on PostgreSQL.
+  </p>
+
+  <pre><code><span class="cm">// ServerLevelConflicts defines operations that cannot run concurrently</span>
+<span class="cm">// on the same SERVER, regardless of which database they target.</span>
+<span class="kw">var</span> <span class="nm">ServerLevelConflicts</span> = <span class="kw">map</span>[<span class="tp">OperationType</span>][]<span class="tp">OperationType</span>{
+    <span class="cm">// Only one DBCC CHECKDB may run per SQL Server at a time.</span>
+    <span class="nm">OpIntegrityCheck</span>: {<span class="nm">OpIntegrityCheck</span>},
+
+    <span class="cm">// Only one VACUUM FULL may run per PostgreSQL server at a time.</span>
+    <span class="nm">OpVacuumFull</span>: {<span class="nm">OpVacuumFull</span>},
+}</code></pre>
+
+  <p>
+    The <code>ServerConcurrencyController</code> (built in Lesson 4) checks <em>both</em> the database-level conflict
+    matrix and this server-level conflict map before dispatching any job. A new job is blocked if either check fails.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      Forgetting server-level conflicts is a frequent production mistake. If you have 30 databases on a SQL Server and
+      <code>CHECKDB</code> is scheduled for all of them, the scheduler will correctly refuse to run more than one at a
+      time because <code>OpIntegrityCheck</code> is in its own conflict list. Without this check, 30 simultaneous
+      <code>CHECKDB</code> operations would completely saturate the server's I/O — even though each one targets a
+      different database and passes the database-level conflict check.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Maintenance Windows</h2>
+
+  <p>
+    Heavy operations must be confined to maintenance windows — time periods when the server experiences minimal
+    user-facing load. The <code>MaintenanceWindow</code> struct stores a window definition in a timezone-aware,
+    DST-correct way.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">MaintenanceWindow</span> <span class="kw">struct</span> {
+    Name       <span class="tp">string</span>          <span class="st">`json:"name"`</span>
+    DaysOfWeek []<span class="tp">time.Weekday</span>  <span class="st">`json:"days_of_week"`</span>
+    StartHour  <span class="tp">int</span>             <span class="st">`json:"start_hour"`</span>
+    StartMin   <span class="tp">int</span>             <span class="st">`json:"start_min"`</span>
+    EndHour    <span class="tp">int</span>             <span class="st">`json:"end_hour"`</span>
+    EndMin     <span class="tp">int</span>             <span class="st">`json:"end_min"`</span>
+    Timezone   <span class="tp">string</span>          <span class="st">`json:"timezone"`</span> <span class="cm">// IANA e.g. "America/New_York"</span>
+    Enabled    <span class="tp">bool</span>            <span class="st">`json:"enabled"`</span>
+}
+
+<span class="cm">// IsActive returns true if 'now' falls within this window.</span>
+<span class="cm">// Handles midnight-crossing windows and DST transitions correctly.</span>
+<span class="kw">func</span> (<span class="nm">w</span> *<span class="tp">MaintenanceWindow</span>) <span class="fn">IsActive</span>(now <span class="tp">time.Time</span>) <span class="tp">bool</span> {
+    loc, err := time.<span class="fn">LoadLocation</span>(w.Timezone)
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    local := now.<span class="fn">In</span>(loc)
+    weekday := local.<span class="fn">Weekday</span>()
+
+    inDay := <span class="nm">false</span>
+    <span class="kw">for</span> _, d := <span class="kw">range</span> w.DaysOfWeek {
+        <span class="kw">if</span> d == weekday {
+            inDay = <span class="nm">true</span>
+            <span class="kw">break</span>
+        }
+    }
+    <span class="kw">if</span> !inDay {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+
+    h, m, _ := local.<span class="fn">Clock</span>()
+    current := h*<span class="nm">60</span> + m
+    start   := w.StartHour*<span class="nm">60</span> + w.StartMin
+    end     := w.EndHour*<span class="nm">60</span> + w.EndMin
+
+    <span class="kw">if</span> end &lt; start {
+        <span class="cm">// window crosses midnight: e.g. 23:00–02:00</span>
+        <span class="kw">return</span> current &gt;= start || current &lt; end
+    }
+    <span class="kw">return</span> current &gt;= start &amp;&amp; current &lt; end
+}</code></pre>
+
+  <p>
+    The midnight-crossing check (<code>if end &lt; start</code>) handles windows like "23:00–02:00" that span two
+    calendar days. Without it, a naive range check would always return false for any time in a cross-midnight window.
+  </p>
+
+  <div class="callout info">
+    <div class="label">TIMEZONE HANDLING</div>
+    <p>
+      Time zone handling is critical and often gets wrong. A window defined as <em>"01:00–05:00
+      America/New_York"</em> will correctly shift by one hour during DST transitions because
+      <code>time.LoadLocation</code> plus <code>.In()</code> perform the full IANA timezone conversion at call time.
+      <strong>Never store UTC offsets</strong> (like <code>-05:00</code>) — they are fixed and will be wrong for half
+      the year in regions that observe DST. Always store IANA timezone names like <code>"America/New_York"</code> or
+      <code>"Europe/London"</code>.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A database has RecoveryModel = 'SIMPLE'. What happens when the log backup policy tries to target it?"
+         data-correct="B"
+         data-feedback-correct="Correct. The TargetSelector on the log backup policy specifies recovery_models: [FULL]. During GenerateAll(), the generator checks each database's RecoveryModel and skips SIMPLE and BULK_LOGGED databases. No job is generated — no runtime failure occurs."
+         data-feedback-wrong="The check happens during job generation, not at execution time. Think about where TargetSelector.Matches() is called.">
+      <div class="quiz-option" data-key="A">The log backup runs successfully but is a full backup instead</div>
+      <div class="quiz-option" data-key="B">The policy generator's TargetSelector filters it out because recovery_models only includes FULL</div>
+      <div class="quiz-option" data-key="C">The log backup fails at execution time with a SQL Server error</div>
+      <div class="quiz-option" data-key="D">The scheduler marks it as excluded and disables all backups for that database</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A full backup is running on database 'Northwind'. An integrity check job fires for the same database. What happens?"
+         data-correct="C"
+         data-feedback-correct="Correct. The ServerConcurrencyController calls CheckDBConflicts() before dispatching any job. Since full_backup is in the conflict list for integrity_check, the check returns an error and the orchestrator records StatusConflict. The job will attempt again on the next tick."
+         data-feedback-wrong="Look at the OperationConflicts map. What does integrity_check conflict with?">
+      <div class="quiz-option" data-key="A">Both run concurrently — they're different operation types</div>
+      <div class="quiz-option" data-key="B">The integrity check queues behind the backup and runs immediately after</div>
+      <div class="quiz-option" data-key="C">HasConflict(OpIntegrityCheck, OpFullBackup) returns true, so the integrity check is skipped with StatusConflict</div>
+      <div class="quiz-option" data-key="D">The orchestrator kills the backup to let the integrity check run because it has higher priority</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why does IsSystemDB() check for 'postgres', 'template0', and 'template1' in addition to SQL Server system databases?"
+         data-correct="A"
+         data-feedback-correct="Correct. The Database model is engine-agnostic. A single IsSystemDB() check covers both SQL Server (master, msdb, model, tempdb) and PostgreSQL (postgres, template0, template1) system databases so policies that exclude system databases work correctly for the entire mixed fleet."
+         data-feedback-wrong="Remember the scheduler targets a mixed SQL Server + PostgreSQL fleet. The model needs to cover both.">
+      <div class="quiz-option" data-key="A">The scheduler handles both SQL Server and PostgreSQL fleets from a single codebase — IsSystemDB() works across both engines</div>
+      <div class="quiz-option" data-key="B">Those are reserved names in Go's database/sql package</div>
+      <div class="quiz-option" data-key="C">PostgreSQL requires explicit exclusion or it will refuse maintenance operations</div>
+      <div class="quiz-option" data-key="D">template0 and template1 are actually user databases in some PostgreSQL versions</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Two VACUUM FULL operations fire on the same PostgreSQL server — on different databases. Does the server-level conflict check block the second one?"
+         data-correct="B"
+         data-feedback-correct="Correct. ServerLevelConflicts maps OpVacuumFull to [OpVacuumFull]. CheckServerConflicts() checks whether ANY currently running operation on the server is a vacuum_full. If one is already running, the second is blocked regardless of which database it targets."
+         data-feedback-wrong="Server-level conflicts are checked independently of database-level conflicts. The key is in the name: ServerLevelConflicts.">
+      <div class="quiz-option" data-key="A">No — they're on different databases, so no conflict exists</div>
+      <div class="quiz-option" data-key="B">Yes — vacuum_full is in ServerLevelConflicts with itself, so only one may run per server at a time</div>
+      <div class="quiz-option" data-key="C">Only if the server has MaxConcurrentOps = 1</div>
+      <div class="quiz-option" data-key="D">Only if both databases are on the same tablespace</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <a href="0001-why-a-scheduler.html">← Lesson 1: Why a Database Fleet Needs a Scheduler</a>
+    <a href="0003-policy-engine.html">Lesson 3: Policy Engine and Job Generation →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://pkg.go.dev/time" target="_blank">Go standard library: time — Time, Duration, LoadLocation, Weekday</a></li>
+      <li><a href="https://pkg.go.dev/strings" target="_blank">Go standard library: strings — ToLower and string utilities</a></li>
+      <li><a href="https://docs.microsoft.com/en-us/sql/t-sql/database-console-commands/dbcc-checkdb-transact-sql" target="_blank">Microsoft Docs — DBCC CHECKDB (Transact-SQL)</a></li>
+      <li><a href="https://docs.microsoft.com/en-us/sql/relational-databases/backup-restore/recovery-models-sql-server" target="_blank">Microsoft Docs — SQL Server Recovery Models</a></li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-vacuum.html" target="_blank">PostgreSQL Docs — VACUUM</a></li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-reindex.html" target="_blank">PostgreSQL Docs — REINDEX CONCURRENTLY</a></li>
+      <li><a href="https://www.iana.org/time-zones" target="_blank">IANA Time Zone Database</a></li>
+      <li><a href="https://pkg.go.dev/encoding/json" target="_blank">Go standard library: encoding/json — struct tags, omitempty, json:"-"</a></li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: Policy Engine and Staggered Scheduling — Concurrent Database Job Scheduler in Go</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0003-policy-engine.mp3">
+    <span class="tag">Lesson 3</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0002-data-models.html">← Lesson 2</a></span>
+  </div>
+
+  <h1>Policy Engine and Staggered Scheduling</h1>
+
+  <p>
+    A policy is a template that answers three questions: what operation should run, against which databases should it
+    target, and according to what schedule? The policy engine sits between the static policy definitions and the live
+    database inventory, generating a concrete job for every (policy, database) pair that matches. This lesson covers how
+    policies are structured, how targets are filtered, how timeouts scale with database size, and how the stagger
+    algorithm prevents 10,000 simultaneous backup jobs at 1:00&nbsp;AM.
+  </p>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The <code>MaintenancePolicy</code> Type</h2>
+
+  <p>
+    Every scheduled operation is governed by a <code>MaintenancePolicy</code>. A single policy declaration covers an
+    entire class of databases rather than naming each one individually. The two root structs are
+    <code>MaintenancePolicy</code> and <code>SchedulePolicy</code>:
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">MaintenancePolicy</span> <span class="kw">struct</span> {
+    Name         <span class="tp">string</span>             <span class="st">`yaml:"name"`</span>
+    Description  <span class="tp">string</span>             <span class="st">`yaml:"description"`</span>
+    Operation    <span class="tp">OperationType</span>      <span class="st">`yaml:"operation"`</span>
+    Schedule     <span class="tp">SchedulePolicy</span>     <span class="st">`yaml:"schedule"`</span>
+    Targets      <span class="tp">TargetSelector</span>     <span class="st">`yaml:"targets"`</span>
+    Config       <span class="kw">map</span>[<span class="tp">string</span>]<span class="kw">any</span>     <span class="st">`yaml:"config"`</span>
+    Priority     <span class="tp">int</span>                <span class="st">`yaml:"priority"`</span> <span class="cm">// 1 = highest</span>
+    Timeout      <span class="tp">TimeoutPolicy</span>      <span class="st">`yaml:"timeout"`</span>
+    Retry        <span class="tp">RetryPolicy</span>        <span class="st">`yaml:"retry"`</span>
+    Notification <span class="tp">NotificationPolicy</span> <span class="st">`yaml:"notification"`</span>
+    Enabled      <span class="tp">bool</span>               <span class="st">`yaml:"enabled"`</span>
+}
+
+<span class="kw">type</span> <span class="tp">SchedulePolicy</span> <span class="kw">struct</span> {
+    CronExpr              <span class="tp">string</span>        <span class="st">`yaml:"cron_expr"`</span>
+    RequireWindow         <span class="tp">bool</span>          <span class="st">`yaml:"require_window"`</span>
+    StaggerMinutes        <span class="tp">int</span>           <span class="st">`yaml:"stagger_minutes"`</span>
+    SkipIfRunRecently     <span class="tp">time.Duration</span> <span class="st">`yaml:"skip_if_run_recently"`</span>
+    RunMissedOnWindowOpen <span class="tp">bool</span>          <span class="st">`yaml:"run_missed_on_window_open"`</span>
+}</code></pre>
+
+  <p>
+    Each field has a concrete purpose. Consider a full-backup policy for production SQL Server databases:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Example value</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Operation</code></td>
+        <td><code>full_backup</code></td>
+        <td>Selects the correct executor and conflict set at dispatch time</td>
+      </tr>
+      <tr>
+        <td><code>CronExpr</code></td>
+        <td><code>"0 1 * * *"</code></td>
+        <td>Base fire time before stagger offsets are applied</td>
+      </tr>
+      <tr>
+        <td><code>RequireWindow</code></td>
+        <td><code>true</code></td>
+        <td>Full backups only run inside the defined maintenance window</td>
+      </tr>
+      <tr>
+        <td><code>StaggerMinutes</code></td>
+        <td><code>120</code></td>
+        <td>Each database gets a unique offset hashed into [0, 120) minutes</td>
+      </tr>
+      <tr>
+        <td><code>SkipIfRunRecently</code></td>
+        <td><code>20h</code></td>
+        <td>Prevents a second run if one succeeded within the last 20 hours</td>
+      </tr>
+      <tr>
+        <td><code>RunMissedOnWindowOpen</code></td>
+        <td><code>true</code></td>
+        <td>If the window opens and a scheduled run was missed, catch it up</td>
+      </tr>
+      <tr>
+        <td><code>Priority</code></td>
+        <td><code>1</code></td>
+        <td>Priority 1 (highest) preempts lower-priority jobs when the worker pool is full</td>
+      </tr>
+      <tr>
+        <td><code>Enabled</code></td>
+        <td><code>true</code></td>
+        <td>A fast circuit-breaker — set to <code>false</code> to pause without deleting the policy</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">READING THE CRON FIELD</div>
+    <p>
+      <code>CronExpr</code> is a standard five-field cron expression (minute hour dom month dow). The stagger algorithm
+      in <code>StaggerByHash</code> treats this as the <em>base</em> expression and produces a per-database offset.
+      The base expression itself is never registered with the cron library directly — only the staggered derivatives are.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The <code>TargetSelector</code> — Filtering the Fleet</h2>
+
+  <p>
+    The <code>TargetSelector</code> is the policy's filter predicate. It encodes which servers and databases a policy
+    applies to, using a combination of structural attributes and arbitrary tags:
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">TargetSelector</span> <span class="kw">struct</span> {
+    Engines          []<span class="tp">EngineType</span>        <span class="st">`yaml:"engines"`</span>
+    Tiers            []<span class="tp">ServerTier</span>        <span class="st">`yaml:"tiers"`</span>
+    Regions          []<span class="tp">string</span>            <span class="st">`yaml:"regions"`</span>
+    Tags             <span class="kw">map</span>[<span class="tp">string</span>]<span class="tp">string</span>  <span class="st">`yaml:"tags"`</span>
+    MinSizeBytes     <span class="tp">int64</span>              <span class="st">`yaml:"min_size_bytes"`</span>
+    MaxSizeBytes     <span class="tp">int64</span>              <span class="st">`yaml:"max_size_bytes"`</span>
+    ExcludeDBs       []<span class="tp">string</span>           <span class="st">`yaml:"exclude_dbs"`</span>
+    ExcludeServers   []<span class="tp">string</span>           <span class="st">`yaml:"exclude_servers"`</span>
+    IncludeSystemDBs <span class="tp">bool</span>               <span class="st">`yaml:"include_system_dbs"`</span>
+    RecoveryModels   []<span class="tp">string</span>           <span class="st">`yaml:"recovery_models"`</span>
+}</code></pre>
+
+  <p>
+    The <code>Matches</code> method is a pure function that applies all filters in sequence. The first failing check
+    returns <code>false</code> immediately — short-circuit evaluation keeps it fast across millions of evaluations:
+  </p>
+
+  <pre><code><span class="kw">func</span> (ts <span class="tp">TargetSelector</span>) <span class="fn">Matches</span>(server *<span class="tp">DBServer</span>, db *<span class="tp">Database</span>) <span class="tp">bool</span> {
+    <span class="cm">// Engine filter</span>
+    <span class="kw">if</span> <span class="fn">len</span>(ts.Engines) > <span class="nm">0</span> && !<span class="fn">contains</span>(ts.Engines, server.Engine) {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="cm">// Tier filter</span>
+    <span class="kw">if</span> <span class="fn">len</span>(ts.Tiers) > <span class="nm">0</span> && !<span class="fn">contains</span>(ts.Tiers, server.Tier) {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="cm">// System DB exclusion</span>
+    <span class="kw">if</span> !ts.IncludeSystemDBs && db.<span class="fn">IsSystemDB</span>() {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="cm">// Recovery model filter (SQL Server log backups)</span>
+    <span class="kw">if</span> <span class="fn">len</span>(ts.RecoveryModels) > <span class="nm">0</span> && !<span class="fn">contains</span>(ts.RecoveryModels, db.RecoveryModel) {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="cm">// Size filter</span>
+    <span class="kw">if</span> ts.MinSizeBytes > <span class="nm">0</span> && db.SizeBytes < ts.MinSizeBytes {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="kw">if</span> ts.MaxSizeBytes > <span class="nm">0</span> && db.SizeBytes > ts.MaxSizeBytes {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="cm">// Tag matching (all specified tags must be present)</span>
+    <span class="kw">for</span> k, v := <span class="kw">range</span> ts.Tags {
+        <span class="kw">if</span> server.Tags[k] != v {
+            <span class="kw">return</span> <span class="nm">false</span>
+        }
+    }
+    <span class="cm">// Explicit exclusions</span>
+    <span class="kw">if</span> <span class="fn">contains</span>(ts.ExcludeDBs, db.Name) {
+        <span class="kw">return</span> <span class="nm">false</span>
+    }
+    <span class="kw">return</span> <span class="nm">true</span>
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">TAG MATCHING SEMANTICS</div>
+    <p>
+      Tag matching uses <strong>AND logic</strong>: all specified tags must match. This lets you target subsets like
+      <code>{critical: true, environment: prod}</code> without adding new tier values. A database is excluded if it
+      matches <em>any</em> entry in <code>ExcludeDBs</code>. Tags are checked against the <em>server</em>'s tag map,
+      not the database's — servers carry environment and criticality metadata in this model.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Dynamic Timeout Calculation</h2>
+
+  <p>
+    A 30-minute timeout that is safe for a 10&nbsp;GB database will kill a 500&nbsp;GB database every time. A static
+    timeout per policy cannot work across a fleet with 5-order-of-magnitude size variance. The
+    <code>TimeoutPolicy</code> solves this with a linear formula capped at a maximum:
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">TimeoutPolicy</span> <span class="kw">struct</span> {
+    BaseTimeout  <span class="tp">time.Duration</span> <span class="st">`yaml:"base_timeout"`</span>
+    PerGBTimeout <span class="tp">time.Duration</span> <span class="st">`yaml:"per_gb_timeout"`</span>
+    MaxTimeout   <span class="tp">time.Duration</span> <span class="st">`yaml:"max_timeout"`</span>
+}
+
+<span class="kw">func</span> (tp <span class="tp">TimeoutPolicy</span>) <span class="fn">CalculateTimeout</span>(dbSizeBytes <span class="tp">int64</span>) <span class="tp">time.Duration</span> {
+    sizeGB := <span class="tp">float64</span>(dbSizeBytes) / (<span class="nm">1024</span> * <span class="nm">1024</span> * <span class="nm">1024</span>)
+    timeout := tp.BaseTimeout + <span class="tp">time.Duration</span>(<span class="tp">float64</span>(tp.PerGBTimeout)*sizeGB)
+    <span class="kw">if</span> tp.MaxTimeout > <span class="nm">0</span> && timeout > tp.MaxTimeout {
+        <span class="kw">return</span> tp.MaxTimeout
+    }
+    <span class="kw">return</span> timeout
+}</code></pre>
+
+  <p>
+    The following table works through the formula for a policy with
+    <code>base_timeout=10m</code>, <code>per_gb_timeout=3m</code>, <code>max_timeout=8h</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Database Size</th>
+        <th>Base</th>
+        <th>Per-GB contribution</th>
+        <th>Calculated total</th>
+        <th>After 8h cap</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>100&nbsp;MB (0.1&nbsp;GB)</td>
+        <td>10m</td>
+        <td>0.1 × 3m = 0.3m</td>
+        <td>10m 18s</td>
+        <td>10m 18s</td>
+      </tr>
+      <tr>
+        <td>10&nbsp;GB</td>
+        <td>10m</td>
+        <td>10 × 3m = 30m</td>
+        <td>40m</td>
+        <td>40m</td>
+      </tr>
+      <tr>
+        <td>100&nbsp;GB</td>
+        <td>10m</td>
+        <td>100 × 3m = 300m</td>
+        <td>5h 10m</td>
+        <td>5h 10m</td>
+      </tr>
+      <tr>
+        <td>1&nbsp;TB (1,024&nbsp;GB)</td>
+        <td>10m</td>
+        <td>1024 × 3m = 3,072m</td>
+        <td>51h 22m</td>
+        <td><strong>8h (capped)</strong></td>
+      </tr>
+      <tr>
+        <td>5&nbsp;TB</td>
+        <td>10m</td>
+        <td>5,120 × 3m = 15,360m</td>
+        <td>256h 10m</td>
+        <td><strong>8h (capped)</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      Dynamic timeouts are what make a single policy safe for databases ranging from 10&nbsp;MB to 10&nbsp;TB. Without
+      per-GB scaling, a 30-minute timeout kills a 5&nbsp;TB backup every time. Without a maximum cap, a misconfigured
+      per-GB rate could set 50-hour timeouts that hold worker-pool slots indefinitely and mask genuinely stuck jobs.
+      The cap is a safety valve — a job that hits it should alert.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Thundering Herd Problem</h2>
+
+  <p>
+    Consider a fleet of 1,000 databases all governed by a full-backup policy with <code>cron_expr: "0 1 * * *"</code>.
+    At 01:00:00 the cron library fires. The policy generator evaluates all 1,000 databases as matching. All 1,000 jobs
+    enter the worker-pool queue in the same scheduler tick.
+  </p>
+
+  <p>
+    The result is a <em>thundering herd</em>: backup storage receives 1,000 simultaneous write streams, SAN I/O
+    queues saturate, network bandwidth on the backup path spikes to the physical limit, and the databases themselves
+    see elevated I/O latency that leaks into production query performance — all at the same instant, every night.
+    The diagram below contrasts the two outcomes:
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+gantt
+    title Job Dispatch Timeline — 1000 databases, 120-minute stagger window
+    dateFormat HH:mm
+    axisFormat %H:%M
+    section Without Stagger
+    All 1000 jobs fire simultaneously : crit, 01:00, 1m
+    section With Stagger
+    Databases 0-100    : 01:00, 12m
+    Databases 100-200  : 01:12, 12m
+    Databases 200-300  : 01:24, 12m
+    Databases 300-400  : 01:36, 12m
+    Databases 400-500  : 01:48, 12m
+    Databases 500-600  : 02:00, 12m
+    Databases 600-700  : 02:12, 12m
+    Databases 700-800  : 02:24, 12m
+    Databases 800-900  : 02:36, 12m
+    Databases 900-1000 : 02:48, 12m
+    </div>
+    <div class="diagram-caption">
+      Figure 3.1 — Without stagger, all 1,000 backup jobs fire at 01:00 AM simultaneously (red bar). With a
+      120-minute stagger window, batches of ~100 databases are spread evenly across the window, reducing peak load
+      by roughly 10×.
+    </div>
+  </div>
+
+  <p>
+    The stagger window does not increase total backup time per database — each database still runs its full backup.
+    It staggers the <em>start times</em> so the fleet's aggregate I/O demand is smooth rather than spiked.
+  </p>
+
+  <div class="callout warning">
+    <div class="label">GOTCHA — STAGGER WINDOW VS. MAINTENANCE WINDOW</div>
+    <p>
+      The stagger window must fit inside the maintenance window. A 120-minute stagger on a 90-minute maintenance
+      window means databases hashed into [90, 119] minutes fire outside the window and are skipped.
+      Always set <code>stagger_minutes</code> ≤ <code>window duration − max expected job runtime</code>.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The <code>StaggerByHash</code> Algorithm</h2>
+
+  <p>
+    The stagger algorithm must satisfy two properties: (1) each database gets a <em>stable</em> offset so the
+    scheduler doesn't reschedule every database every time a new one is added, and (2) offsets are
+    <em>uniformly distributed</em> across [0, staggerMinutes) so no sub-window is overloaded.
+    FNV-32a hash of the database key achieves both:
+  </p>
+
+  <pre><code><span class="cm">// StaggerByHash assigns a consistent cron offset to a database based</span>
+<span class="cm">// on a hash of its key. The same key always gets the same offset,</span>
+<span class="cm">// even as the total number of databases changes.</span>
+<span class="kw">func</span> <span class="fn">StaggerByHash</span>(baseCron <span class="tp">string</span>, staggerMinutes <span class="tp">int</span>, hashKey <span class="tp">string</span>) (<span class="tp">string</span>, <span class="tp">error</span>) {
+    h := fnv.<span class="fn">New32a</span>()
+    h.<span class="fn">Write</span>([]<span class="tp">byte</span>(hashKey))
+    hash := h.<span class="fn">Sum32</span>()
+
+    <span class="cm">// Map hash to [0, staggerMinutes)</span>
+    offset := <span class="tp">int</span>(hash % <span class="tp">uint32</span>(staggerMinutes))
+
+    <span class="kw">return</span> <span class="fn">applyMinuteOffset</span>(baseCron, offset)
+}
+
+<span class="cm">// applyMinuteOffset shifts the minute field of a cron expression by offset minutes,</span>
+<span class="cm">// handling hour overflow correctly.</span>
+<span class="kw">func</span> <span class="fn">applyMinuteOffset</span>(cronExpr <span class="tp">string</span>, offset <span class="tp">int</span>) (<span class="tp">string</span>, <span class="tp">error</span>) {
+    parts := strings.<span class="fn">Fields</span>(cronExpr)
+    <span class="kw">if</span> <span class="fn">len</span>(parts) != <span class="nm">5</span> {
+        <span class="kw">return</span> <span class="st">""</span>, fmt.<span class="fn">Errorf</span>(<span class="st">"expected 5-field cron, got %d fields"</span>, <span class="fn">len</span>(parts))
+    }
+
+    baseMin, err := strconv.<span class="fn">Atoi</span>(parts[<span class="nm">0</span>])
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="kw">return</span> <span class="st">""</span>, fmt.<span class="fn">Errorf</span>(<span class="st">"minute field %q is not a simple integer: %w"</span>, parts[<span class="nm">0</span>], err)
+    }
+
+    newMin  := (baseMin + offset) % <span class="nm">60</span>
+    overflow := (baseMin + offset) / <span class="nm">60</span>
+
+    parts[<span class="nm">0</span>] = strconv.<span class="fn">Itoa</span>(newMin)
+
+    <span class="kw">if</span> overflow > <span class="nm">0</span> && parts[<span class="nm">1</span>] != <span class="st">"*"</span> {
+        baseHour, err := strconv.<span class="fn">Atoi</span>(parts[<span class="nm">1</span>])
+        <span class="kw">if</span> err == <span class="nm">nil</span> {
+            parts[<span class="nm">1</span>] = strconv.<span class="fn">Itoa</span>((baseHour + overflow) % <span class="nm">24</span>)
+        }
+    }
+
+    <span class="kw">return</span> strings.<span class="fn">Join</span>(parts, <span class="st">" "</span>), <span class="nm">nil</span>
+}</code></pre>
+
+  <h3>Worked example</h3>
+  <p>
+    Input: <code>baseCron="0 1 * * *"</code>, <code>staggerMinutes=120</code>,
+    <code>hashKey="prod-db-server-01:Northwind"</code>
+  </p>
+  <ol>
+    <li>FNV-32a hash of <code>"prod-db-server-01:Northwind"</code> → some 32-bit integer, e.g. <code>3,827,045,193</code></li>
+    <li><code>offset = 3,827,045,193 % 120 = 73</code></li>
+    <li><code>applyMinuteOffset("0 1 * * *", 73)</code>: base minute 0 + 73 = 73; 73 &lt; 60 is false, so <code>newMin = 73 % 60 = 13</code>, <code>overflow = 1</code></li>
+    <li>Hour field: <code>1 + 1 = 2</code></li>
+    <li>Result: <code>"13 2 * * *"</code> → the Northwind database runs its backup at <strong>2:13&nbsp;AM</strong></li>
+  </ol>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT — STABILITY</div>
+    <p>
+      The hash is <em>deterministic</em>: the same database always gets the same slot regardless of what other
+      databases exist in the fleet. This stability means the scheduler does not thrash when databases are added or
+      removed. A new database gets its own consistent slot without shifting all the others. This is the crucial
+      difference from round-robin or modular-index approaches, which renumber every slot when the total count
+      changes.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Job Generation — <code>GenerateAll</code></h2>
+
+  <p>
+    The output of the policy engine is a <code>GeneratedJob</code> per matching (policy, database) pair.
+    All fields needed to dispatch and track the job are pre-computed here, so the orchestrator receives a
+    self-contained value:
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">GeneratedJob</span> <span class="kw">struct</span> {
+    ID            <span class="tp">string</span>          <span class="cm">// SHA256 prefix of "policyName:serverID:dbName"</span>
+    PolicyName    <span class="tp">string</span>
+    Operation     <span class="tp">OperationType</span>
+    Server        *<span class="tp">DBServer</span>
+    Database      *<span class="tp">Database</span>
+    CronExpr      <span class="tp">string</span>          <span class="cm">// staggered from policy base</span>
+    Timeout       <span class="tp">time.Duration</span>   <span class="cm">// calculated from DB size</span>
+    Priority      <span class="tp">int</span>             <span class="cm">// policy.Priority * db.Priority</span>
+    Config        <span class="kw">map</span>[<span class="tp">string</span>]<span class="kw">any</span>  <span class="cm">// policy config + db-specific overrides</span>
+    MaxRetries    <span class="tp">int</span>
+    RetryDelay    <span class="tp">time.Duration</span>
+    BackoffMult   <span class="tp">float64</span>
+    ConflictsWith []<span class="tp">OperationType</span>
+    RequireWindow <span class="tp">bool</span>
+    SkipIfRecent  <span class="tp">time.Duration</span>
+}</code></pre>
+
+  <p>
+    The deterministic ID lets any node in the cluster derive the same distributed-lock key for the same job:
+  </p>
+
+  <pre><code><span class="kw">func</span> <span class="fn">generateJobID</span>(policyName, serverID, dbName <span class="tp">string</span>) <span class="tp">string</span> {
+    key := fmt.<span class="fn">Sprintf</span>(<span class="st">"%s:%s:%s"</span>, policyName, serverID, dbName)
+    sum := sha256.<span class="fn">Sum256</span>([]<span class="tp">byte</span>(key))
+    <span class="kw">return</span> hex.<span class="fn">EncodeToString</span>(sum[:<span class="nm">8</span>]) <span class="cm">// first 16 hex chars</span>
+}</code></pre>
+
+  <p>
+    <code>GenerateAll</code> iterates the cross product of policies and servers, calling
+    <code>TargetSelector.Matches</code> on each database, then constructs the <code>GeneratedJob</code>:
+  </p>
+
+  <ol>
+    <li>For each enabled policy in the policy store</li>
+    <li>Query inventory for all servers and their databases</li>
+    <li>For each server × database pair: call <code>policy.Targets.Matches(server, db)</code></li>
+    <li>On match: generate deterministic ID, call <code>StaggerByHash</code> for the cron expression, call <code>CalculateTimeout</code> with <code>db.SizeBytes</code>, merge <code>policy.Config</code> with any database-level config overrides</li>
+    <li>Append to results slice</li>
+    <li>Return slice sorted by (priority ASC, jobID ASC) for deterministic dispatch order</li>
+  </ol>
+
+  <div class="callout info">
+    <div class="label">PERFORMANCE NOTE</div>
+    <p>
+      Running <code>GenerateAll</code> against 1,000 servers × 50 databases × 20 policies = 1,000,000
+      (policy, database) evaluations. Most pairs don't match — <code>TargetSelector</code> quickly eliminates
+      non-matching engines, tiers, and sizes in its early-exit checks. In practice this runs in under 200ms for
+      50,000 databases when inventory is cached in memory. The result is recomputed on each inventory refresh cycle,
+      not on every tick.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>A Real Policy Example — Production Full Backup</h2>
+
+  <p>
+    The following YAML is a complete, production-grade policy definition for full backups of production SQL Server
+    databases. Reading it field-by-field illustrates how all the preceding concepts compose:
+  </p>
+
+  <pre><code><span class="nm">name</span>: sqlserver-full-backup-prod
+<span class="nm">description</span>: Weekly full backup for all production SQL Server databases
+<span class="nm">operation</span>: full_backup
+
+<span class="nm">schedule</span>:
+  <span class="nm">cron_expr</span>: <span class="st">"0 1 * * *"</span>
+  <span class="nm">require_window</span>: <span class="nm">true</span>
+  <span class="nm">stagger_minutes</span>: <span class="nm">120</span>
+  <span class="nm">skip_if_run_recently</span>: <span class="nm">20h</span>
+
+<span class="nm">targets</span>:
+  <span class="nm">engines</span>: [sqlserver]
+  <span class="nm">tiers</span>: [production]
+  <span class="nm">exclude_dbs</span>: [tempdb]
+
+<span class="nm">config</span>:
+  <span class="nm">compression</span>: <span class="nm">true</span>
+  <span class="nm">checksum</span>: <span class="nm">true</span>
+  <span class="nm">verify</span>: <span class="nm">true</span>
+  <span class="nm">backup_path</span>: <span class="st">"/backups/sqlserver/{server}/{database}/"</span>
+  <span class="nm">retention_days</span>: <span class="nm">30</span>
+
+<span class="nm">priority</span>: <span class="nm">1</span>
+
+<span class="nm">timeout</span>:
+  <span class="nm">base_timeout</span>: 10m
+  <span class="nm">per_gb_timeout</span>: 3m
+  <span class="nm">max_timeout</span>: 8h
+
+<span class="nm">retry</span>:
+  <span class="nm">max_retries</span>: <span class="nm">2</span>
+  <span class="nm">initial_delay</span>: 5m
+  <span class="nm">backoff_multiplier</span>: <span class="nm">2.0</span>
+
+<span class="nm">notification</span>:
+  <span class="nm">on_failure</span>: <span class="nm">true</span>
+  <span class="nm">on_timeout</span>: <span class="nm">true</span>
+  <span class="nm">channels</span>: [slack, email]
+
+<span class="nm">enabled</span>: <span class="nm">true</span></code></pre>
+
+  <p>Walking through the decisions:</p>
+  <ul>
+    <li><strong>schedule.cron_expr <code>"0 1 * * *"</code></strong> — base fire time at 1:00&nbsp;AM; every database
+      gets a staggered derivative of this.</li>
+    <li><strong>require_window: true</strong> — full backups are heavy; they must not run outside the maintenance
+      window even if a retry or catch-up fires at an unexpected time.</li>
+    <li><strong>stagger_minutes: 120</strong> — 2-hour spread. A fleet of 2,000 production databases dispatches
+      roughly 16–17 databases per minute rather than 2,000 at once.</li>
+    <li><strong>skip_if_run_recently: 20h</strong> — guards against double-execution on manual triggers or aggressive
+      retry behaviour while still allowing a daily run every ~24 hours.</li>
+    <li><strong>exclude_dbs: [tempdb]</strong> — <code>tempdb</code> cannot be backed up in SQL Server; including it
+      would cause every job to fail.</li>
+    <li><strong>config.checksum + verify</strong> — enables <code>WITH CHECKSUM</code> and a
+      <code>RESTORE VERIFYONLY</code> pass post-backup. Slightly slower but detects corrupt backup files before
+      they're needed in a disaster recovery scenario.</li>
+    <li><strong>priority: 1</strong> — highest priority. When the worker pool is saturated, full backup jobs preempt
+      lower-priority index maintenance or statistics updates.</li>
+    <li><strong>retry.backoff_multiplier: 2.0</strong> — exponential backoff. First retry after 5 minutes, second
+      after 10 minutes. Avoids hammering a server that is temporarily under heavy load.</li>
+  </ul>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A policy has stagger_minutes=120 and 1,000 target databases. Database 'AdventureWorks' always hashes to offset 47. What cron expression does it get if the base is '0 1 * * *'?"
+         data-correct="B"
+         data-feedback-correct="Correct. applyMinuteOffset('0 1 * * *', 47) returns '47 1 * * *'. Base minute 0 + offset 47 = 47, which is < 60 so no hour overflow occurs. AdventureWorks will always run at 1:47 AM because the FNV hash of its key is deterministic."
+         data-feedback-wrong="The stagger offset is applied to the minute field of the cron expression. Base minute 0 + offset 47 = 47. No overflow since 47 < 60. Check the applyMinuteOffset function: overflow = (0 + 47) / 60 = 0.">
+      <div class="quiz-option" data-key="A">"0 1 * * *" — stagger only applies to the first run</div>
+      <div class="quiz-option" data-key="B">"47 1 * * *" — 47 minutes past 1:00 AM</div>
+      <div class="quiz-option" data-key="C">"0 2 * * *" — the hash wraps to the next hour</div>
+      <div class="quiz-option" data-key="D">A random offset assigned at scheduler startup</div>
+    </div>
+
+    <div class="quiz"
+         data-question="skip_if_run_recently: 20h is set on the daily full backup policy. The backup runs successfully at 1:00 AM. The policy also has a retry mechanism. At 1:30 AM a retry fires. What happens?"
+         data-correct="C"
+         data-feedback-correct="Correct. Before dispatching any job, the scheduling loop calls store.GetLastExecution(jobID). If the last execution was successful and occurred within SkipIfRunRecently duration, the job is marked StatusSkipped. This prevents redundant runs after a manual trigger or successful retry."
+         data-feedback-wrong="skip_if_run_recently applies to ALL dispatches, including retries. The check happens in the scheduling loop before lock acquisition. A successful run 30 minutes ago is well within the 20-hour guard window.">
+      <div class="quiz-option" data-key="A">The retry runs the backup again — retries bypass skip_if_run_recently</div>
+      <div class="quiz-option" data-key="B">The backup fails because the last backup is still open</div>
+      <div class="quiz-option" data-key="C">The scheduler checks GetLastExecution, sees a success 30 minutes ago, and skips with StatusSkipped</div>
+      <div class="quiz-option" data-key="D">The scheduler kills the previous backup before starting the retry</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A database is 800 GB. The policy timeout is base_timeout=10m, per_gb_timeout=3m, max_timeout=8h. What is the calculated timeout?"
+         data-correct="D"
+         data-feedback-correct="Correct. CalculateTimeout: base 10m + (800 GB × 3m/GB) = 10m + 2,400m = 2,410m. Since 2,410m > 480m (8h expressed in minutes), the result is capped at 8h. MaxTimeout protects against enormous databases setting unreasonable timeouts that hold worker-pool slots indefinitely."
+         data-feedback-wrong="Work through the formula: base_timeout + (sizeGB × per_gb_timeout) = 10m + (800 × 3m) = 2,410m. Then compare to max_timeout (8h = 480m). Since 2,410m > 480m, the cap applies.">
+      <div class="quiz-option" data-key="A">10 minutes (base timeout only)</div>
+      <div class="quiz-option" data-key="B">40 hours (800 × 3m, no cap applied)</div>
+      <div class="quiz-option" data-key="C">8 hours — all large databases automatically get max_timeout</div>
+      <div class="quiz-option" data-key="D">2,410 minutes calculated (10 + 800×3), capped to 8h because it exceeds MaxTimeout</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does the deterministic job ID (SHA256 of policyName:serverID:dbName) enable?"
+         data-correct="A"
+         data-feedback-correct="Correct. The distributed lock key is derived from the job ID plus a time bucket (e.g., maint:JOBID:2024-01-15T01). Because the ID is deterministic across all scheduler nodes, every node competes for exactly the same Redis key — ensuring exactly-once execution even in split-brain scenarios."
+         data-feedback-wrong="Think about what property the lock key needs for distributed exactly-once execution. The lock key must be identical on every node for a given job — that's only possible if the job ID is derived deterministically from the same inputs.">
+      <div class="quiz-option" data-key="A">The distributed lock key is derived from the job ID, ensuring the same job on different nodes competes for the same lock</div>
+      <div class="quiz-option" data-key="B">It prevents the same database from being scheduled by two different policies simultaneously</div>
+      <div class="quiz-option" data-key="C">It provides a stable sort order for job priority in the worker queue</div>
+      <div class="quiz-option" data-key="D">It lets the database driver cache the query execution plan across runs</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <a href="0002-data-models.html">← Lesson 2: Data Models — Servers, Databases, and Operations</a>
+    <a href="0004-coordination.html">Lesson 4: Coordination — Exactly-Once Execution →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://pkg.go.dev/hash/fnv" target="_blank">Go standard library — <code>hash/fnv</code> (FNV hash functions)</a></li>
+      <li><a href="https://pkg.go.dev/crypto/sha256" target="_blank">Go standard library — <code>crypto/sha256</code></a></li>
+      <li><a href="https://pkg.go.dev/time" target="_blank">Go standard library — <code>time</code> package (Duration arithmetic)</a></li>
+      <li><a href="https://github.com/robfig/cron" target="_blank">robfig/cron v3 — Go cron expression parser and scheduler</a></li>
+      <li><a href="https://docs.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql" target="_blank">Microsoft Docs — BACKUP (Transact-SQL), WITH CHECKSUM and COMPRESSION options</a></li>
+      <li><a href="https://www.postgresql.org/docs/current/app-pgdump.html" target="_blank">PostgreSQL Docs — pg_dump reference</a></li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

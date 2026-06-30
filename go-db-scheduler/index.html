@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Concurrent Database Job Scheduler in Go</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .course-index { max-width: 760px; margin: 0 auto; }
+    .lesson-list { list-style: none; padding: 0; display: grid; gap: 0.8rem; margin-top: 1.5rem; }
+    .lesson-list li a { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 1.2rem; background: #fff; border: 1px solid #e0e0dc; border-radius: 6px; text-decoration: none; color: inherit; transition: box-shadow 0.15s, border-color 0.15s; }
+    .lesson-list li a:hover { box-shadow: 0 3px 12px rgba(0,0,0,0.07); border-color: #007d9c; }
+    .lesson-num { font-size: 0.78rem; font-weight: 700; color: #007d9c; background: #e6f7fb; padding: 0.2rem 0.5rem; border-radius: 4px; white-space: nowrap; }
+    .lesson-title { font-weight: 600; font-size: 0.95rem; }
+    .lesson-topics { font-size: 0.82rem; color: #777; margin-top: 0.15rem; }
+    .back-link { display: inline-block; margin-bottom: 1.5rem; font-size: 0.85rem; color: #007d9c; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .course-intro { margin: 1rem 0 0.5rem; line-height: 1.65; }
+    .scale-badges { display: flex; gap: 0.8rem; flex-wrap: wrap; margin: 1.2rem 0 0.5rem; }
+    .scale-badge { background: #e6f7fb; color: #005f78; border: 1px solid #b3dde8; border-radius: 4px; padding: 0.3rem 0.7rem; font-size: 0.82rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: 600; }
+  </style>
+</head>
+<body>
+<div class="page course-index">
+
+  <a class="back-link" href="../index.html">← All Courses</a>
+
+  <div class="lesson-meta">
+    <span class="tag">Course</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>6 lessons · ~4 hours</span>
+  </div>
+
+  <h1>Concurrent Database Job Scheduler in Go</h1>
+
+  <p class="course-intro">
+    Build a distributed, policy-driven maintenance scheduler that runs backup, integrity check,
+    vacuum, and index operations across tens of thousands of SQL&nbsp;Server and PostgreSQL databases —
+    completely asynchronously, at scale. Inspired by how Hermes and modern AI agent platforms
+    implement cron-style job scheduling.
+  </p>
+
+  <div class="scale-badges">
+    <span class="scale-badge">500–1,000 servers</span>
+    <span class="scale-badge">10K–50K databases</span>
+    <span class="scale-badge">1M+ jobs/day</span>
+    <span class="scale-badge">50–200 concurrent jobs</span>
+  </div>
+
+  <ul class="lesson-list">
+    <li>
+      <a href="lessons/0001-why-a-scheduler.html">
+        <div>
+          <span class="lesson-num">Lesson 1</span>
+          <span class="lesson-title">Why a Database Fleet Needs a Scheduler</span>
+          <div class="lesson-topics">Scale problem · policy-driven design · Hermes inspiration · system architecture</div>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a href="lessons/0002-data-models.html">
+        <div>
+          <span class="lesson-num">Lesson 2</span>
+          <span class="lesson-title">Data Models — Servers, Databases, and Operations</span>
+          <div class="lesson-topics">DBServer · Database · OperationType · conflict matrix · operation weights · maintenance windows</div>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a href="lessons/0003-policy-engine.html">
+        <div>
+          <span class="lesson-num">Lesson 3</span>
+          <span class="lesson-title">Policy Engine and Staggered Scheduling</span>
+          <div class="lesson-topics">MaintenancePolicy · TargetSelector · dynamic timeouts · thundering herd · StaggerByHash · job generation</div>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a href="lessons/0004-coordination.html">
+        <div>
+          <span class="lesson-num">Lesson 4</span>
+          <span class="lesson-title">Coordination — Exactly-Once Execution</span>
+          <div class="lesson-topics">Leader election · Redis SET NX · Lua CAS · Kubernetes Lease · execution store · distributed lock</div>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a href="lessons/0005-orchestrator.html">
+        <div>
+          <span class="lesson-num">Lesson 5</span>
+          <span class="lesson-title">The Orchestrator — Concurrency Control and the Scheduling Loop</span>
+          <div class="lesson-topics">Per-server semaphores · conflict detection · worker pool · tick loop · maintenance windows · graceful shutdown</div>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a href="lessons/0006-executors-and-ops.html">
+        <div>
+          <span class="lesson-num">Lesson 6</span>
+          <span class="lesson-title">Executors, Observability, and Production Deployment</span>
+          <div class="lesson-topics">T-SQL operations · PostgreSQL executor · Prometheus metrics · Grafana panels · Kubernetes · production checklist</div>
+        </div>
+      </a>
+    </li>
+  </ul>
+
+</div>
+</body>
+</html>

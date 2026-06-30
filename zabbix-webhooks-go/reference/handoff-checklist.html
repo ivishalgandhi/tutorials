@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Handoff Checklist — Questions for Your Zabbix Team</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>Handoff Checklist: Questions for Your Zabbix Team</h1>
+
+  <p>
+    When another team manages Zabbix, you cannot guess the network, security, or operational
+    boundaries. Use this checklist in your kickoff meeting. The answers shape how your Go receiver
+    is exposed, authenticated, and scaled.
+  </p>
+
+  <h2>1. Endpoint and networking</h2>
+
+  <ul>
+    <li>
+      <strong>What URL should we give you?</strong>
+      <br/>
+      Decide whether the receiver runs on a public host, a corporate DMZ, or an internal network
+      segment that the Zabbix server can reach.
+    </li>
+    <li>
+      <strong>Can the Zabbix server reach our IP and port?</strong>
+      <br/>
+      Firewalls, NAT, and cloud security groups often block outbound HTTPS from the Zabbix server.
+    </li>
+    <li>
+      <strong>Do you require a proxy?</strong>
+      <br/>
+      If so, the webhook must expose an <code>HTTPProxy</code> parameter and call
+      <code>req.setProxy()</code> in the JavaScript.
+    </li>
+    <li>
+      <strong>Is TLS required, and what certificate trust is in place?</strong>
+      <br/>
+      Self-signed certs, internal CAs, or mTLS requirements change how you run the receiver.
+    </li>
+  </ul>
+
+  <h2>2. Authentication</h2>
+
+  <ul>
+    <li>
+      <strong>What shared secret or token should the webhook send?</strong>
+      <br/>
+      A bearer token is the simplest shared secret. Agree on rotation, storage, and who can see it.
+    </li>
+    <li>
+      <strong>Do you require IP allow-listing, mTLS, or HMAC signatures?</strong>
+      <br/>
+      These are stronger than a bearer token but add complexity on both sides.
+    </li>
+    <li>
+      <strong>How do we rotate the secret without dropping alerts?</strong>
+      <br/>
+      Support two valid tokens during rotation, or accept the secret via a header you can change in
+      the Zabbix media type.
+    </li>
+  </ul>
+
+  <h2>3. Events and scope</h2>
+
+  <ul>
+    <li>
+      <strong>Which triggers will send to our webhook?</strong>
+      <br/>
+      Ask for the action name, conditions, and a list of host groups or templates involved.
+    </li>
+    <li>
+      <strong>Will we receive recovery events?</strong>
+      <br/>
+      Recovery events share the same <code>{EVENT.ID}</code> as the problem, so your receiver must
+      update the existing row rather than insert a new one.
+    </li>
+    <li>
+      <strong>Will we receive updates (acknowledgments, manual close, severity changes)?</strong>
+      <br/>
+      These need separate handling in the receiver and a different event correlation strategy.
+    </li>
+    <li>
+      <strong>What is the expected event volume?</strong>
+      <br/>
+      Use this to size the receiver, database, and idempotency retention window.
+    </li>
+  </ul>
+
+  <h2>4. Payload and macros</h2>
+
+  <ul>
+    <li>
+      <strong>Which Zabbix macros will be included?</strong>
+      <br/>
+      At minimum confirm <code>{EVENT.ID}</code>, <code>{EVENT.VALUE}</code>,
+      <code>{EVENT.CLOCK}</code>, <code>{EVENT.SEVERITY}</code>, <code>{HOST.NAME}</code>,
+      <code>{TRIGGER.NAME}</code>, and <code>{EVENT.TAGSJSON}</code>.
+    </li>
+    <li>
+      <strong>Can we agree on a fixed JSON schema?</strong>
+      <br/>
+      A schema contract prevents silent breakage when either side changes.
+    </li>
+    <li>
+      <strong>What is the maximum payload size?</strong>
+      <br/>
+      Long messages or many tags can exceed your receiver's body limit or Zabbix's macro expansion
+      limit.
+    </li>
+  </ul>
+
+  <h2>5. Retry and timeout behavior</h2>
+
+  <ul>
+    <li>
+      <strong>What is the webhook Timeout setting?</strong>
+      <br/>
+      Zabbix allows 1–60s; default is 30s. Your receiver must respond faster than this.
+    </li>
+    <li>
+      <strong>How many attempts and what interval are configured?</strong>
+      <br/>
+      Defaults are 3 attempts with 10s intervals. This affects your idempotency window and alert
+      latency.
+    </li>
+    <li>
+      <strong>What status codes will Zabbix treat as success vs. failure?</strong>
+      <br/>
+      Zabbix retries on any non-2xx. A 400 for a malformed payload should not be retried, but
+      Zabbix will retry it anyway; reject bad payloads only for truly unrecoverable cases.
+    </li>
+  </ul>
+
+  <h2>6. Testing and go-live</h2>
+
+  <ul>
+    <li>
+      <strong>Can we test against a staging Zabbix action before production?</strong>
+      <br/>
+      The media type test button has a 3-second hard-coded timeout, so real trigger testing is
+      more reliable.
+    </li>
+    <li>
+      <strong>Who will create the media type and action?</strong>
+      <br/>
+      Often the Zabbix team must do this because it requires Admin privileges.
+    </li>
+    <li>
+      <strong>Who owns the webhook on call?</strong>
+      <br/>
+      Clarify which team responds when deliveries fail or the receiver is down.
+    </li>
+  </ul>
+
+  <h2>7. Observability</h2>
+
+  <ul>
+    <li>
+      <strong>Where do failed webhook attempts show up?</strong>
+      <br/>
+      Zabbix logs them in <strong>Reports → Action log</strong> and in the server log.
+    </li>
+    <li>
+      <strong>Can we get alerts if the webhook fails repeatedly?</strong>
+      <br/>
+      Ask the Zabbix team to set up an internal escalation when the media type error rate rises.
+    </li>
+    <li>
+      <strong>What should we expose from our receiver?</strong>
+      <br/>
+      A <code>/health</code> endpoint and metrics for delivery count, duplicate count, and error
+      rate help both teams.
+    </li>
+  </ul>
+
+  <div class="callout key">
+    <div class="label">One-page summary</div>
+    <p>
+      After the meeting, write down: the endpoint URL, the auth method, the agreed JSON schema,
+      the macro list, the timeout/attempt settings, and the on-call rotation. Email it to both
+      teams. This prevents "it worked in my test" surprises later.
+    </p>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 4: Coordination — Exactly-Once Execution — Concurrent Database Job Scheduler in Go</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0004-coordination.mp3">
+    <span class="tag">Lesson 4</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0003-policy-engine.html">← Lesson 3</a></span>
+  </div>
+
+  <h1>Coordination — Exactly-Once Execution</h1>
+
+  <p>
+    Running 50 scheduler nodes in Kubernetes sounds robust — until two of them both decide to execute the same backup
+    job simultaneously, and you discover that two processes writing to the same backup file have corrupted it. The
+    coordination layer is what transforms a distributed group of nodes into a single logical scheduler. It has three
+    components: <strong>leader election</strong> (deciding which node dispatches jobs), a
+    <strong>distributed lock</strong> (defense-in-depth for split-brain scenarios), and an
+    <strong>execution store</strong> (shared memory of what has run and what is currently running).
+  </p>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Exactly-Once Problem</h2>
+
+  <p>
+    In a distributed system, exactly-once execution is hard. The naive approach — "only the leader dispatches jobs"
+    — is fragile: a network partition can leave two nodes both believing they are leader (a
+    <em>split-brain</em> scenario). The diagram below shows a split-brain event and how the distributed lock
+    acts as a second line of defence:
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant N1 as Node 1 (was leader)
+    participant R as Redis
+    participant N2 as Node 2 (new leader)
+
+    Note over N1,R: Network partition — N1 can't reach Redis
+    Note over N1: N1 still thinks it's leader (stale)
+    R->>N2: Lease expired — you are the new leader
+    N2->>R: SET maint:job-abc:01:00 NX — acquired lock
+    N2->>N2: Executing full_backup on Northwind
+    N1->>R: SET maint:job-abc:01:00 NX — ALREADY HELD
+    Note over N1: Lock acquisition fails — job skipped on N1
+    Note over N1,N2: Exactly-once preserved despite split-brain
+    </div>
+    <div class="diagram-caption">
+      Figure 4.1 — Split-brain scenario. Node 1 loses connectivity to Redis and can no longer renew its leader
+      lease. Node 2 acquires leadership and the job lock. When Node 1's network recovers, its attempt to acquire
+      the same lock fails — the job runs exactly once.
+    </div>
+  </div>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT — DEFENSE IN DEPTH</div>
+    <p>
+      Leader election alone is insufficient — it relies on the leader stepping down gracefully when connectivity
+      is lost. The distributed lock is defense-in-depth: even if a node incorrectly believes it is leader, it
+      cannot execute a job that someone else is already running. You need <em>both</em> layers. Leader election
+      handles the common case; the distributed lock handles the failure case.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Redis Leader Election — <code>SET NX</code> with Heartbeat</h2>
+
+  <p>
+    The Redis leader election implementation uses a single key with a short TTL. The node that successfully sets
+    the key owns leadership. It renews (heartbeats) the TTL every 5 seconds. If it stops heartbeating — because
+    the process died or lost network access — the TTL expires and another node takes over:
+  </p>
+
+  <pre><code><span class="cm">// redisLeader holds a Redis key to signal leadership.</span>
+<span class="cm">// TTL is 15s; heartbeat renews every 5s.</span>
+<span class="kw">type</span> <span class="tp">redisLeader</span> <span class="kw">struct</span> {
+    client    *redis.<span class="tp">Client</span>
+    key       <span class="tp">string</span>       <span class="cm">// e.g. "dbmaint:leader"</span>
+    nodeID    <span class="tp">string</span>       <span class="cm">// unique per instance (hostname or UUID)</span>
+    isLeader  atomic.<span class="tp">Bool</span>
+    callbacks []<span class="kw">func</span>(<span class="tp">bool</span>)
+    mu        sync.<span class="tp">Mutex</span>
+}
+
+<span class="kw">const</span> leaderTTL          = <span class="nm">15</span> * time.<span class="tp">Second</span>
+<span class="kw">const</span> heartbeatInterval  = <span class="nm">5</span> * time.<span class="tp">Second</span>
+
+<span class="kw">func</span> (l *<span class="tp">redisLeader</span>) <span class="fn">Start</span>(ctx <span class="tp">context.Context</span>) <span class="tp">error</span> {
+    ticker := time.<span class="fn">NewTicker</span>(heartbeatInterval)
+    <span class="kw">defer</span> ticker.<span class="fn">Stop</span>()
+    <span class="kw">for</span> {
+        <span class="kw">select</span> {
+        <span class="kw">case</span> &lt;-ctx.<span class="fn">Done</span>():
+            l.<span class="fn">stepDown</span>(ctx)
+            <span class="kw">return</span> <span class="nm">nil</span>
+        <span class="kw">case</span> &lt;-ticker.C:
+            l.<span class="fn">tryAcquireOrRenew</span>(ctx)
+        }
+    }
+}
+
+<span class="kw">func</span> (l *<span class="tp">redisLeader</span>) <span class="fn">tryAcquireOrRenew</span>(ctx <span class="tp">context.Context</span>) {
+    <span class="cm">// Try to SET key to our nodeID with NX (only if not exists) and TTL</span>
+    set, err := l.client.<span class="fn">SetNX</span>(ctx, l.key, l.nodeID, leaderTTL).<span class="fn">Result</span>()
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="cm">// Can't reach Redis — step down; TTL will expire naturally</span>
+        <span class="kw">if</span> l.isLeader.<span class="fn">Load</span>() {
+            l.<span class="fn">setLeader</span>(<span class="nm">false</span>)
+        }
+        <span class="kw">return</span>
+    }
+    <span class="kw">if</span> set {
+        <span class="cm">// We won the election</span>
+        l.<span class="fn">setLeader</span>(<span class="nm">true</span>)
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// Key exists — check if we already hold it</span>
+    owner, err := l.client.<span class="fn">Get</span>(ctx, l.key).<span class="fn">Result</span>()
+    <span class="kw">if</span> err != <span class="nm">nil</span> || owner != l.nodeID {
+        l.<span class="fn">setLeader</span>(<span class="nm">false</span>)
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// We hold it — renew the TTL</span>
+    l.client.<span class="fn">Expire</span>(ctx, l.key, leaderTTL)
+    l.<span class="fn">setLeader</span>(<span class="nm">true</span>)
+}</code></pre>
+
+  <div class="callout warning">
+    <div class="label">GOTCHA — TTL AND HEARTBEAT SIZING</div>
+    <p>
+      The 15-second TTL means a leader that loses connectivity to Redis keeps dispatching for up to 15 seconds
+      before another node takes over. The heartbeat interval (5 seconds) must be significantly shorter than the
+      TTL to ensure the key is renewed well before expiry — a good rule of thumb is TTL ≥ 3× heartbeat interval.
+      A shorter TTL means faster failover but more Redis load and more sensitivity to transient latency spikes.
+      A longer TTL increases the split-brain window. Tune these for your network's P99 latency to Redis.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Redis Distributed Lock — Lua Scripts for Safety</h2>
+
+  <p>
+    A simple <code>SET NX</code> + <code>DEL</code> sequence is <em>unsafe</em> as a distributed lock. Consider:
+    node A sets the key and starts a long job. The lock's TTL expires before the job finishes. Node B sets the same
+    key. Node A's job finishes and calls <code>DEL key</code> — it has just deleted node B's lock. A third node C
+    then acquires the lock and runs the job concurrently with node B. The Lua script approach prevents this by
+    making the check-and-delete atomic:
+  </p>
+
+  <pre><code><span class="cm">// Acquire sets the lock key to a random token with NX + TTL.</span>
+<span class="cm">// Returns true on success; the token is stored for safe release.</span>
+<span class="kw">func</span> (l *<span class="tp">redisLock</span>) <span class="fn">Acquire</span>(ctx <span class="tp">context.Context</span>, key <span class="tp">string</span>, ttl <span class="tp">time.Duration</span>) (<span class="tp">bool</span>, <span class="tp">error</span>) {
+    token := <span class="fn">generateToken</span>() <span class="cm">// 128-bit random value</span>
+    ok, err := l.client.<span class="fn">SetNX</span>(ctx, l.prefix+key, token, ttl).<span class="fn">Result</span>()
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="kw">return</span> <span class="nm">false</span>, err
+    }
+    <span class="kw">if</span> ok {
+        l.mu.<span class="fn">Lock</span>()
+        l.tokens[key] = token
+        l.mu.<span class="fn">Unlock</span>()
+    }
+    <span class="kw">return</span> ok, <span class="nm">nil</span>
+}
+
+<span class="cm">// releaseLua atomically checks our token then deletes — safe against</span>
+<span class="cm">// a lock that expired and was re-acquired by someone else.</span>
+<span class="kw">var</span> releaseLua = redis.<span class="fn">NewScript</span>(<span class="st">`
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+  else
+    return 0
+  end
+`</span>)
+
+<span class="kw">func</span> (l *<span class="tp">redisLock</span>) <span class="fn">Release</span>(ctx <span class="tp">context.Context</span>, key <span class="tp">string</span>) <span class="tp">error</span> {
+    l.mu.<span class="fn">Lock</span>()
+    token := l.tokens[key]
+    <span class="kw">delete</span>(l.tokens, key)
+    l.mu.<span class="fn">Unlock</span>()
+
+    <span class="kw">if</span> token == <span class="st">""</span> {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(<span class="st">"no token held for key %q"</span>, key)
+    }
+    _, err := releaseLua.<span class="fn">Run</span>(ctx, l.client, []<span class="tp">string</span>{l.prefix + key}, token).<span class="fn">Int</span>()
+    <span class="kw">return</span> err
+}</code></pre>
+
+  <p>
+    Long-running jobs also need to extend their lock TTL to prevent expiry mid-execution. The extend script follows
+    the same atomic check-then-act pattern:
+  </p>
+
+  <pre><code><span class="cm">// extendLua atomically checks our token then refreshes the TTL.</span>
+<span class="kw">var</span> extendLua = redis.<span class="fn">NewScript</span>(<span class="st">`
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  else
+    return 0
+  end
+`</span>)</code></pre>
+
+  <p>
+    A goroutine spawned alongside the job executor calls <code>extendLua</code> at
+    <code>ttl / 3</code> intervals. If the job goroutine exits (success, failure, or panic), the extension
+    goroutine is cancelled via context, and the lock expires naturally or is explicitly released.
+  </p>
+
+  <div class="callout danger">
+    <div class="label">CRITICAL — NEVER USE GET + DEL WITHOUT LUA</div>
+    <p>
+      Never use <code>GET</code> + <code>DEL</code> as two separate Redis commands without the Lua script.
+      Between the <code>GET</code> check and the <code>DEL</code>, another goroutine or another process can
+      expire the lock and a third party can acquire it. Your <code>DEL</code> would then release someone else's
+      lock, breaking exactly-once. The Lua script runs <strong>atomically</strong> on the Redis server — nothing
+      can interleave between the <code>GET</code> and the <code>DEL</code> inside the script.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Kubernetes Lease — Production Leader Election</h2>
+
+  <p>
+    For Kubernetes-native deployments, the <code>coordination.k8s.io/v1 Lease</code> object is a better choice
+    than a Redis key: it uses the K8s API server (already present and highly available), integrates with RBAC,
+    and is the same mechanism used by the Kubernetes controller manager itself. The
+    <code>client-go</code> leader-election library wraps this behind a clean callback interface:
+  </p>
+
+  <pre><code><span class="cm">// k8sLeader uses the Kubernetes coordination.k8s.io/v1 Lease object</span>
+<span class="cm">// as a distributed lock for leader election.</span>
+<span class="kw">func</span> <span class="fn">NewK8sLeader</span>(client <span class="tp">kubernetes.Interface</span>, namespace, name, nodeID <span class="tp">string</span>) *<span class="tp">k8sLeader</span> {
+    <span class="kw">return</span> &<span class="tp">k8sLeader</span>{
+        client:    client,
+        namespace: namespace,
+        name:      name,
+        nodeID:    nodeID,
+    }
+}
+
+<span class="kw">func</span> (l *<span class="tp">k8sLeader</span>) <span class="fn">Start</span>(ctx <span class="tp">context.Context</span>) <span class="tp">error</span> {
+    le, err := leaderelection.<span class="fn">NewLeaderElector</span>(leaderelection.<span class="tp">LeaderElectionConfig</span>{
+        Lock: &resourcelock.<span class="tp">LeaseLock</span>{
+            LeaseMeta: metav1.<span class="tp">ObjectMeta</span>{
+                Name:      l.name,
+                Namespace: l.namespace,
+            },
+            Client: l.client.<span class="fn">CoordinationV1</span>(),
+            LockConfig: resourcelock.<span class="tp">ResourceLockConfig</span>{
+                Identity: l.nodeID,
+            },
+        },
+        LeaseDuration:   <span class="nm">15</span> * time.<span class="tp">Second</span>,
+        RenewDeadline:   <span class="nm">10</span> * time.<span class="tp">Second</span>,
+        RetryPeriod:     <span class="nm">2</span> * time.<span class="tp">Second</span>,
+        ReleaseOnCancel: <span class="nm">true</span>,
+        Callbacks: leaderelection.<span class="tp">LeaderCallbacks</span>{
+            OnStartedLeading: <span class="kw">func</span>(ctx <span class="tp">context.Context</span>) {
+                l.<span class="fn">setLeader</span>(<span class="nm">true</span>)
+                &lt;-ctx.<span class="fn">Done</span>()
+            },
+            OnStoppedLeading: <span class="kw">func</span>() { l.<span class="fn">setLeader</span>(<span class="nm">false</span>) },
+            OnNewLeader:      <span class="kw">func</span>(identity <span class="tp">string</span>) { l.leaderID.<span class="fn">Store</span>(&identity) },
+        },
+    })
+    <span class="kw">if</span> err != <span class="nm">nil</span> {
+        <span class="kw">return</span> err
+    }
+    le.<span class="fn">Run</span>(ctx)
+    <span class="kw">return</span> <span class="nm">nil</span>
+}</code></pre>
+
+  <p>
+    The three durations in <code>LeaderElectionConfig</code> are worth understanding precisely:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Value</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>LeaseDuration</code></td>
+        <td>15s</td>
+        <td>How long a candidate waits before stealing an expired lease</td>
+      </tr>
+      <tr>
+        <td><code>RenewDeadline</code></td>
+        <td>10s</td>
+        <td>How long the leader tries to renew before giving up and stepping down</td>
+      </tr>
+      <tr>
+        <td><code>RetryPeriod</code></td>
+        <td>2s</td>
+        <td>How often a non-leader polls the API server to check for an available lease</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    A comparison of the two election backends helps choose the right one for your environment:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Aspect</th>
+        <th>Redis</th>
+        <th>Kubernetes Lease</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Infrastructure required</td>
+        <td>Redis server (additional dependency)</td>
+        <td>K8s API server (already present in K8s deployments)</td>
+      </tr>
+      <tr>
+        <td>Failure detection mechanism</td>
+        <td>TTL-based key expiry</td>
+        <td>TTL-based Lease object expiry</td>
+      </tr>
+      <tr>
+        <td>Best fit</td>
+        <td>Non-K8s deployments (bare metal, VMs)</td>
+        <td>K8s-native deployments</td>
+      </tr>
+      <tr>
+        <td>RBAC required</td>
+        <td>No</td>
+        <td>Yes — <code>get/create/update</code> on <code>leases</code> resource</td>
+      </tr>
+      <tr>
+        <td>Works in single-node mode</td>
+        <td>Via <code>singleNodeLeader</code> fallback</td>
+        <td>Via <code>singleNodeLeader</code> fallback</td>
+      </tr>
+      <tr>
+        <td>Observability</td>
+        <td>Redis key inspection, custom metrics</td>
+        <td><code>kubectl get lease -n &lt;ns&gt;</code>, K8s events</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Single-Node Fallback — Development and Small Deployments</h2>
+
+  <p>
+    Not every deployment needs distributed coordination. A single developer running the scheduler locally, or a
+    small deployment on one server, needs no leader election infrastructure. The
+    <code>singleNodeLeader</code> satisfies the <code>LeaderElector</code> interface without touching any external
+    system:
+  </p>
+
+  <pre><code><span class="cm">// singleNodeLeader is always the leader. Used for development,</span>
+<span class="cm">// single-server deployments, and testing. No infrastructure required.</span>
+<span class="kw">type</span> <span class="tp">singleNodeLeader</span> <span class="kw">struct</span> {
+    nodeID <span class="tp">string</span>
+}
+
+<span class="kw">func</span> (l *<span class="tp">singleNodeLeader</span>) <span class="fn">Start</span>(ctx <span class="tp">context.Context</span>) <span class="tp">error</span> {
+    &lt;-ctx.<span class="fn">Done</span>()
+    <span class="kw">return</span> <span class="nm">nil</span>
+}
+<span class="kw">func</span> (l *<span class="tp">singleNodeLeader</span>) <span class="fn">IsLeader</span>() <span class="tp">bool</span>               { <span class="kw">return</span> <span class="nm">true</span> }
+<span class="kw">func</span> (l *<span class="tp">singleNodeLeader</span>) <span class="fn">LeaderID</span>() <span class="tp">string</span>             { <span class="kw">return</span> l.nodeID }
+<span class="kw">func</span> (l *<span class="tp">singleNodeLeader</span>) <span class="fn">OnLeadershipChange</span>(<span class="kw">func</span>(<span class="tp">bool</span>)) {}</code></pre>
+
+  <div class="callout info">
+    <div class="label">ENVIRONMENT SWITCHING</div>
+    <p>
+      For local development and testing, <code>single_node</code> mode avoids Redis and Kubernetes entirely.
+      The scheduler still runs correctly — it just doesn't coordinate with other nodes. Switch to
+      <code>redis</code> or <code>kubernetes</code> coordination by changing one config line:
+      <code>coordination.mode: redis</code>. The core scheduling logic never checks the coordination mode
+      directly — it only calls <code>leader.IsLeader()</code>, which is the same method on all three
+      implementations.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Execution Store — Shared Job Memory</h2>
+
+  <p>
+    The execution store is the cluster's shared memory of what jobs have run, are running, and have failed. Every
+    scheduler node reads from and writes to it. The interface is small and focused:
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">ExecutionStore</span> <span class="kw">interface</span> {
+    <span class="fn">RecordStart</span>(ctx <span class="tp">context.Context</span>, record <span class="tp">ExecutionRecord</span>) <span class="tp">error</span>
+    <span class="fn">RecordComplete</span>(ctx <span class="tp">context.Context</span>, id <span class="tp">string</span>, result <span class="tp">ExecutionResult</span>) <span class="tp">error</span>
+    <span class="fn">GetHistory</span>(ctx <span class="tp">context.Context</span>, jobID <span class="tp">string</span>, limit <span class="tp">int</span>) ([]<span class="tp">ExecutionRecord</span>, <span class="tp">error</span>)
+    <span class="fn">GetLastExecution</span>(ctx <span class="tp">context.Context</span>, jobID <span class="tp">string</span>) (*<span class="tp">ExecutionRecord</span>, <span class="tp">error</span>)
+    <span class="fn">GetRunning</span>(ctx <span class="tp">context.Context</span>) ([]<span class="tp">ExecutionRecord</span>, <span class="tp">error</span>)
+    <span class="fn">GetFailed</span>(ctx <span class="tp">context.Context</span>, since <span class="tp">time.Time</span>, limit <span class="tp">int</span>) ([]<span class="tp">ExecutionRecord</span>, <span class="tp">error</span>)
+    <span class="fn">Cleanup</span>(ctx <span class="tp">context.Context</span>, olderThan <span class="tp">time.Duration</span>) (<span class="tp">int64</span>, <span class="tp">error</span>)
+}</code></pre>
+
+  <p>
+    The Redis implementation uses a hash per record plus two sorted sets for indexing. All three writes happen
+    in a single pipeline to keep them atomic:
+  </p>
+
+  <pre><code><span class="cm">// RecordStart stores an execution record in Redis.</span>
+<span class="cm">// Key:   exec:RECORD_ID → hash of all fields</span>
+<span class="cm">// Index: execidx:job:JOB_ID → sorted set scored by start timestamp</span>
+<span class="cm">// TTL:   30 days</span>
+<span class="kw">func</span> (s *<span class="tp">redisStore</span>) <span class="fn">RecordStart</span>(ctx <span class="tp">context.Context</span>, rec <span class="tp">ExecutionRecord</span>) <span class="tp">error</span> {
+    pipe := s.client.<span class="fn">Pipeline</span>()
+
+    key := <span class="st">"exec:"</span> + rec.ID
+    pipe.<span class="fn">HSet</span>(ctx, key, <span class="fn">encodeRecord</span>(rec))
+    pipe.<span class="fn">Expire</span>(ctx, key, <span class="nm">30</span>*<span class="nm">24</span>*time.<span class="tp">Hour</span>)
+
+    <span class="cm">// Index by job ID so GetHistory is fast</span>
+    pipe.<span class="fn">ZAdd</span>(ctx, <span class="st">"execidx:job:"</span>+rec.JobID, redis.<span class="tp">Z</span>{
+        Score:  <span class="tp">float64</span>(rec.StartedAt.<span class="fn">Unix</span>()),
+        Member: rec.ID,
+    })
+    <span class="cm">// Index by status so GetRunning and GetFailed are fast</span>
+    pipe.<span class="fn">ZAdd</span>(ctx, <span class="st">"execidx:status:"</span>+<span class="tp">string</span>(rec.Status), redis.<span class="tp">Z</span>{
+        Score:  <span class="tp">float64</span>(rec.StartedAt.<span class="fn">Unix</span>()),
+        Member: rec.ID,
+    })
+
+    _, err := pipe.<span class="fn">Exec</span>(ctx)
+    <span class="kw">return</span> err
+}</code></pre>
+
+  <p>
+    The status index is what makes the <code>GetRunning</code> and <code>GetFailed</code> queries efficient.
+    They are ZRANGEBYSCORE queries on <code>execidx:status:running</code> and
+    <code>execidx:status:failed</code> respectively — O(log N + M) where M is the result count, regardless of
+    total history size. When a record transitions from running to completed or failed, the orchestrator calls
+    <code>RecordComplete</code>, which moves the member from the running sorted set to the completed/failed one.
+  </p>
+
+  <div class="callout info">
+    <div class="label">STALE JOB DETECTION</div>
+    <p>
+      <code>GetRunning</code> is used by the orchestrator to detect stale jobs — those that appear as
+      <code>StatusRunning</code> in the store but whose executor goroutine has crashed without recording a
+      result. The executor heartbeats its record's <code>UpdatedAt</code> field every 30 seconds. Any record
+      with <code>UpdatedAt</code> older than <code>StaleJobTimeout</code> (default 5 minutes) is considered
+      stale, moved to <code>StatusFailed</code>, and the lock is released so the job can be retried on the
+      next tick.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Lock Key Design — Preventing Re-Run at the Same Minute</h2>
+
+  <p>
+    The orchestrator's scheduling loop ticks every 30 seconds (configurable). A job due at 1:47&nbsp;AM would be
+    seen on both the 1:47:00 tick and the 1:47:30 tick. The lock key includes a time bucket that is the same for
+    both ticks, ensuring only one dispatch succeeds:
+  </p>
+
+  <pre><code><span class="cm">// lockKey returns a lock key scoped to this job's scheduled minute.</span>
+<span class="cm">// This prevents re-dispatching the same job multiple times within one minute</span>
+<span class="cm">// while allowing it to fire again in the next scheduled window.</span>
+<span class="kw">func</span> <span class="fn">lockKey</span>(jobID <span class="tp">string</span>, scheduledAt <span class="tp">time.Time</span>) <span class="tp">string</span> {
+    bucket := scheduledAt.<span class="fn">Truncate</span>(time.<span class="tp">Minute</span>).<span class="fn">Format</span>(<span class="st">"2006-01-02T15:04"</span>)
+    <span class="kw">return</span> fmt.<span class="fn">Sprintf</span>(<span class="st">"maint:%s:%s"</span>, jobID, bucket)
+}
+<span class="cm">// Example: "maint:a3b4c5d6e7f8a9b0:2024-01-15T01:47"</span></code></pre>
+
+  <p>
+    Concretely: <code>1:47:00.Truncate(Minute) = 1:47:00</code> and
+    <code>1:47:30.Truncate(Minute) = 1:47:00</code>. Both ticks produce the same lock key. The first tick's
+    <code>SetNX</code> succeeds; the second tick's fails. The job runs once.
+  </p>
+
+  <p>
+    The lock TTL for the job-dispatch lock is set to the job's configured timeout plus a buffer (typically
+    10 minutes). This ensures the lock is released even if the executor fails without calling
+    <code>Release</code> — but not so quickly that a legitimately running long job loses its lock to a
+    competing node.
+  </p>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT — THE TIME BUCKET</div>
+    <p>
+      The time bucket is what prevents the same job firing twice when the orchestrator ticks every 30 seconds.
+      If the scheduler checks at 1:47:00 and again at 1:47:30, both ticks see the same lock key
+      <code>"maint:JOBID:2024-01-15T01:47"</code>. The second tick's <code>SetNX</code> fails because the first
+      tick holds the key — single execution guaranteed. The next day at 1:47&nbsp;AM, the bucket is
+      <code>"...2024-01-16T01:47"</code> — a completely new key — so the job fires again as intended.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Why does the Redis lock use a random 128-bit token rather than just the node ID?"
+         data-correct="C"
+         data-feedback-correct="Correct. Consider the failure sequence: node A acquires the lock with its nodeID. The lock TTL expires (job took too long). Node B acquires the same lock with its nodeID. Node A finishes and tries to release. Without a unique token, node A's DEL would release node B's lock. With the Lua script comparing against the stored token, node A's release fails safely — its token no longer matches what's in Redis."
+         data-feedback-wrong="Think about what happens if a lock expires and gets re-acquired before the original holder tries to release it. Without a unique per-acquisition token, the release command has no way to know whether the key it's deleting is the lock it originally set or someone else's.">
+      <div class="quiz-option" data-key="A">Node IDs are too long to store efficiently in Redis</div>
+      <div class="quiz-option" data-key="B">The token is used to encrypt the lock value for security</div>
+      <div class="quiz-option" data-key="C">If a lock expires and is re-acquired by another node, the original node's DEL (with its token) will fail the Lua check — preventing it from releasing someone else's lock</div>
+      <div class="quiz-option" data-key="D">Tokens rotate automatically on each heartbeat to prevent lock starvation</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A scheduler node loses connectivity to Redis for 20 seconds. The leader TTL is 15 seconds. What should the node do?"
+         data-correct="B"
+         data-feedback-correct="Correct. After 15 seconds (the TTL), the Redis key expires and another node will have acquired leadership. The disconnected node should stop considering itself leader. In-flight jobs that are already executing may continue to completion, but no new jobs should be dispatched — this is why tryAcquireOrRenew calls setLeader(false) as soon as it cannot reach Redis."
+         data-feedback-wrong="Think about what happens to the Redis key after 15 seconds of no heartbeat renewal. The key expires, and from Redis's perspective the node is no longer leader. Another node may have taken over. The disconnected node continuing to dispatch would create split-brain.">
+      <div class="quiz-option" data-key="A">Keep dispatching jobs — it was leader before losing connectivity and nothing has changed locally</div>
+      <div class="quiz-option" data-key="B">Stop dispatching new jobs after the TTL has elapsed, since another node will have taken over leadership</div>
+      <div class="quiz-option" data-key="C">Immediately kill all in-flight jobs and restart the process</div>
+      <div class="quiz-option" data-key="D">Write jobs to a local queue and flush them when Redis reconnects</div>
+    </div>
+
+    <div class="quiz"
+         data-question="The lock key format is 'maint:JOBID:2024-01-15T01:47'. The scheduler tick runs every 30 seconds. At 1:47:00 it dispatches the job and acquires the lock. At 1:47:30 the tick runs again. What happens?"
+         data-correct="A"
+         data-feedback-correct="Correct. Both ticks call scheduledAt.Truncate(time.Minute) which produces 1:47:00 for both 1:47:00 and 1:47:30. Both ticks therefore generate the identical lock key 'maint:JOBID:2024-01-15T01:47'. SetNX fails on the second tick because the first tick already holds the key — exactly one execution per scheduled minute."
+         data-feedback-wrong="Think about how Truncate(time.Minute) affects both tick times. 1:47:00 truncated to the minute is 1:47:00. 1:47:30 truncated to the minute is also 1:47:00. Both produce the same key.">
+      <div class="quiz-option" data-key="A">The second tick tries SetNX for the same key, fails because the first tick holds it, and skips — exactly-once within the minute</div>
+      <div class="quiz-option" data-key="B">The second tick acquires a new lock for key '...T01:47:30' and dispatches the job again</div>
+      <div class="quiz-option" data-key="C">The lock TTL has expired by 1:47:30 so the second tick acquires it and duplicates the job</div>
+      <div class="quiz-option" data-key="D">The scheduler detects it already dispatched this job in-memory and skips without checking the lock</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You are deploying the scheduler on a single bare-metal server without Redis. Which coordination mode should you use?"
+         data-correct="C"
+         data-feedback-correct="Correct. The singleNodeLeader always returns IsLeader()=true and requires no external infrastructure. For a single bare-metal deployment there is no competing node, so distributed coordination is unnecessary overhead. You can still layer a file-based distributed lock if you want to run multiple processes on the same server — but the leader election layer itself adds no value in a single-process deployment."
+         data-feedback-wrong="If there's only one server and one process, what property of distributed coordination are you actually trying to achieve? There's no competing node to coordinate with. The single_node mode satisfies the LeaderElector interface without requiring Redis or a Kubernetes cluster.">
+      <div class="quiz-option" data-key="A">kubernetes — it works without an actual K8s cluster running</div>
+      <div class="quiz-option" data-key="B">redis — it can run in memory-only mode without a Redis server</div>
+      <div class="quiz-option" data-key="C">single_node — it is always leader, requires no infrastructure, and is correct for single-process deployments</div>
+      <div class="quiz-option" data-key="D">file_lock — it uses OS file locks instead of Redis and works on any server</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <a href="0003-policy-engine.html">← Lesson 3: Policy Engine and Staggered Scheduling</a>
+    <a href="0005-executors.html">Lesson 5: Executors — SQL Server and PostgreSQL →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://redis.io/docs/manual/patterns/distributed-locks/" target="_blank">Redis Docs — Distributed Locks with Redis (Redlock algorithm)</a></li>
+      <li><a href="https://pkg.go.dev/github.com/go-redis/redis/v9" target="_blank">go-redis/redis v9 — Go Redis client (SetNX, Lua scripting, Pipeline)</a></li>
+      <li><a href="https://pkg.go.dev/k8s.io/client-go/tools/leaderelection" target="_blank">client-go — leaderelection package (Kubernetes Lease-based leader election)</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/architecture/leases/" target="_blank">Kubernetes Docs — Leases (coordination.k8s.io/v1)</a></li>
+      <li><a href="https://pkg.go.dev/sync/atomic" target="_blank">Go standard library — <code>sync/atomic</code> (atomic.Bool for isLeader flag)</a></li>
+      <li><a href="https://pkg.go.dev/context" target="_blank">Go standard library — <code>context</code> package (cancellation and timeouts)</a></li>
+      <li><a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html" target="_blank">Martin Kleppmann — "How to do distributed locking" (critique of Redlock)</a></li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

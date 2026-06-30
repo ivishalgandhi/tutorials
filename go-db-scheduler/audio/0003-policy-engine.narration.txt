@@ -1,0 +1,99 @@
+Welcome to Lesson 3: Policy Engine and Staggered Scheduling.
+
+This is part of the Concurrent Database Job Scheduler in Go course.
+
+Let's start.
+
+
+A policy is a template that answers three questions: what operation should run, against which databases should it target, and according to what schedule? The policy engine sits between the static policy definitions and the live database inventory, generating a concrete job for every policy-and-database pair that matches. This lesson covers how policies are structured, how targets are filtered, how timeouts scale with database size, and how the stagger algorithm prevents ten thousand simultaneous backup jobs at one AM.
+
+
+The MaintenancePolicy Type
+
+Every scheduled operation is governed by a MaintenancePolicy. A single policy declaration covers an entire class of databases rather than naming each one individually.
+
+For the complete struct definition, see the lesson text. Here are the key fields and why they matter.
+
+The Operation field — such as full_backup — selects the correct executor and conflict set at dispatch time.
+
+The cron expression is the base fire time before stagger offsets are applied. For example, zero-one-star-star-star means "fire at one AM every day."
+
+The RequireWindow field, when true, means the operation will only run inside the defined maintenance window. Full backups should always have this set to true.
+
+StaggerMinutes gives each database a unique offset hashed into a range from zero to that many minutes. A value of one hundred and twenty means jobs are spread across a two-hour window.
+
+SkipIfRunRecently prevents a second run if one succeeded within the last specified duration. For example, twenty hours prevents double-running a backup that completed at two AM when the next window opens at one AM.
+
+RunMissedOnWindowOpen means if the window opens and a scheduled run was missed — perhaps because the scheduler was down — it catches up on the missed run.
+
+Priority controls preemption when the worker pool is full. Priority one is the highest and preempts lower-priority jobs.
+
+The Enabled field is a fast circuit-breaker. Set it to false to pause a policy without deleting it.
+
+Important note about the cron field: the cron expression is the base expression. The stagger algorithm treats this as the starting point and produces a per-database offset. The base expression itself is never registered with the cron library directly — only the staggered derivatives are.
+
+
+The TargetSelector — Filtering the Fleet
+
+The TargetSelector is the policy's filter predicate. It encodes which servers and databases a policy applies to, using a combination of structural attributes and arbitrary tags.
+
+For the complete struct definition, see the lesson text.
+
+The Matches method applies all filters in sequence. The first failing check returns false immediately — short-circuit evaluation keeps it fast across millions of evaluations.
+
+Filters include: engine type (SQL Server or PostgreSQL), server tier (production, staging, development, disaster recovery), region, key-value tags, minimum and maximum size in bytes, explicit exclusion lists for databases and servers, whether to include system databases, and recovery model filter for log backup policies.
+
+Important note about tag matching: tag matching uses AND logic — all specified tags must match. This lets you target subsets like "critical production" without adding new tier values. Tags are checked against the server's tag map, not the database's — servers carry environment and criticality metadata in this model.
+
+
+Dynamic Timeout Calculation
+
+A thirty-minute timeout that is safe for a ten-gigabyte database will kill a five-hundred-gigabyte database every time. A static timeout per policy cannot work across a fleet with five orders of magnitude size variance.
+
+The TimeoutPolicy solves this with a linear formula capped at a maximum. The formula is: base timeout plus the database size in gigabytes multiplied by the per-gigabyte timeout, capped at the maximum timeout.
+
+Here is how the formula works for a policy with a ten-minute base, a three-minute per-gigabyte rate, and an eight-hour maximum.
+
+A hundred-megabyte database gets a timeout just over ten minutes.
+A ten-gigabyte database gets forty minutes.
+A hundred-gigabyte database gets five hours and ten minutes.
+A one-terabyte database would calculate over fifty hours — but the eight-hour cap applies.
+A five-terabyte database would calculate over two hundred and fifty hours — but again, the eight-hour cap applies.
+
+Key insight: dynamic timeouts are what make a single policy safe for databases ranging from ten megabytes to ten terabytes. Without per-gigabyte scaling, a thirty-minute timeout kills a five-terabyte backup every time. Without a maximum cap, a misconfigured per-gigabyte rate could set fifty-hour timeouts that hold worker-pool slots indefinitely and mask genuinely stuck jobs. The cap is a safety valve — a job that hits it should trigger an alert.
+
+
+The Thundering Herd Problem
+
+Consider a fleet of one thousand databases all governed by a full-backup policy set to fire at one AM. At one AM, the cron library fires. The policy generator evaluates all one thousand databases as matching. All one thousand jobs enter the worker-pool queue in the same scheduler tick.
+
+The result is a thundering herd: backup storage receives one thousand simultaneous write streams, storage I/O queues saturate, network bandwidth on the backup path spikes to the physical limit, and the databases themselves see elevated I/O latency that leaks into production query performance — all at the same instant, every night.
+
+Picture two timelines. Without stagger, all one thousand jobs fire simultaneously at one AM — one red bar. With a one-hundred-and-twenty-minute stagger window, batches of roughly one hundred databases are spread evenly across the window. The first batch fires at one AM. The next batch fires at twelve past one. The next at twenty-four past one. And so on until three AM. Peak load is reduced by roughly ten times.
+
+The stagger window does not increase total backup time per database — each database still runs its full backup. It staggers the start times so the fleet's aggregate I/O demand is smooth rather than spiked.
+
+Watch out: the stagger window must fit inside the maintenance window. A one-hundred-and-twenty-minute stagger on a ninety-minute maintenance window means databases hashed into the ninety-to-one-hundred-and-nineteen minute range fire outside the window and are skipped. Always set the stagger minutes to less than or equal to the window duration minus the maximum expected job runtime.
+
+
+The StaggerByHash Algorithm
+
+The stagger algorithm must satisfy two properties. First, each database must get a stable offset so the scheduler does not reschedule every database every time a new one is added. Second, offsets must be uniformly distributed across the range from zero to the stagger minutes so no sub-window is overloaded.
+
+The algorithm uses an FNV-32a hash of the database key. The same key always produces the same hash, which always maps to the same offset — even as the total number of databases in the fleet changes.
+
+Here is how it works in plain terms. The database's unique key is hashed with the FNV-32a algorithm, which produces a consistent 32-bit integer. That integer is divided by the stagger minutes to get a remainder. The remainder becomes the offset in minutes. Then the offset is applied to the base cron expression by shifting the minute field and handling overflow into the hour field.
+
+For the complete Go implementation of StaggerByHash and applyMinuteOffset, see the lesson text.
+
+
+The PolicyGenerator — Putting It Together
+
+The PolicyGenerator loops over all enabled policies and all servers. For each policy, it loops over all databases on that server. It calls TargetSelector.Matches to filter. For matching databases that need the operation and are not already running it, it calculates the dynamic timeout and creates a ScheduledJob.
+
+For the complete PolicyGenerator code, see the lesson text.
+
+
+That is the end of Lesson 3: Policy Engine and Staggered Scheduling.
+
+Return to the lesson page for the complete code, the full stagger algorithm, and the interactive quiz.

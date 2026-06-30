@@ -1,0 +1,122 @@
+Welcome to Lesson 1: Why a Database Fleet Needs a Scheduler.
+
+This is part of the Concurrent Database Job Scheduler in Go course.
+
+Let's start.
+
+
+The Scale Problem
+
+Running maintenance on a single database is trivial. A cron job and a shell script will do. But what happens when that single database becomes a fleet of ten thousand databases spread across five hundred servers, running a mix of SQL Server and PostgreSQL, across multiple regions and tiers?
+
+The naive approach — one cron entry per job per database — collapses under its own weight.
+
+Here is what the operational scale looks like. The fleet has between five hundred and one thousand servers. The number of databases runs from ten thousand at minimum to fifty thousand at the target scale. Jobs dispatched per day exceed one million — including lightweight health checks and log backups. Between fifty and two hundred jobs run concurrently at any time, throttled per server. A single job can take anywhere from five seconds for a health check to twelve hours for a corruption check on a ten-terabyte database.
+
+Those scale numbers reveal the problem immediately. With fifty thousand databases, a naive cron-based approach requires fifty thousand cron entries — just for full backups. Add differential backups, log backups, integrity checks, index maintenance, and statistics updates, and you are managing hundreds of thousands of static job definitions.
+
+Cron, a tool designed for a single host in the nineteen seventies, breaks in five specific ways at this scale.
+
+First: time drift and no coordination. When the same job is scheduled on multiple dispatcher nodes, each fires independently. You get duplicate executions and no way to ensure a job runs exactly once.
+
+Second: no conflict detection. Cron does not know that a full backup and an integrity check on the same database should never run simultaneously. It will happily fire both at midnight.
+
+Third: no window awareness. Cron expressions fire at a time. They have no concept of "only run this during the maintenance window on weekdays, accounting for daylight saving time, in a specific timezone."
+
+Fourth: the thundering herd. If five thousand databases all have a daily backup scheduled at one AM, all five thousand backup jobs start at the same second. Disk I/O, network bandwidth, and backup storage are instantly saturated.
+
+Fifth: static definitions cannot survive fleet churn. Databases are provisioned and deprovisioned daily. A static job list is perpetually stale.
+
+
+The Hermes Inspiration
+
+Modern AI agent platforms — and production-grade scheduling systems like Hermes — solved an analogous problem: how do you schedule work across a dynamically changing set of resources without hardcoding a job per resource?
+
+The answer is policies.
+
+In a policy-driven model, you do not define what should happen to each individual resource. Instead, you define rules that apply to classes of resources. The system generates work dynamically by evaluating those rules against live inventory.
+
+Consider the difference.
+
+The old way: "Back up database Northwind on server sql-prod-01 every day at one AM." Repeated fifty thousand times. For every database. Manually maintained.
+
+The new way: "Back up all online, non-read-only, production-tier SQL Server databases whose last full backup is older than twenty-four hours — every night between one AM and five AM, staggered across the window." Defined once. Applies automatically to every matching database, including ones added tomorrow.
+
+Hermes takes this further: when a new agent registers, existing policies immediately apply to it. No human intervention. No ticket. The scheduler discovers new work from inventory refresh, not from manual job creation. This is the model our database scheduler adopts.
+
+
+Policy-Driven versus Job-Driven Design
+
+The practical consequences of this design choice are large.
+
+With the old job-driven approach using fifty thousand job rows, adding a new database to the fleet requires manual work: an administrator must add a new row for each job type. Changing the schedule for a job type means updating one thousand rows — one per database. Conflict detection is not possible because static jobs have no runtime awareness of each other. The storage footprint is fifty thousand rows that must be kept in sync with fleet state forever. Thundering herds are likely because all jobs with the same cron expression fire at the same second.
+
+With the new policy-driven approach using twenty policies, adding a new database is automatic: it is discovered on the next inventory refresh and all matching policies apply immediately. Changing the schedule for a job type means updating one policy row. Conflict detection is built in, derived from an operation conflict matrix at dispatch time. The storage footprint is twenty policy rows plus the live inventory you already maintain. The thundering herd is eliminated by a stagger algorithm that distributes jobs across the maintenance window per server.
+
+Important insight: a policy is a template. Jobs are computed dynamically from policies multiplied by inventory. You store the recipe, not the meal. When inventory changes, the meal changes automatically — the recipe stays the same.
+
+
+System Architecture Overview
+
+The complete system has six layers.
+
+The Inventory Layer is the live registry of servers and databases, refreshed on a configurable interval. It mirrors discovered fleet state in a local store.
+
+The Policy Generation Layer evaluates every policy's target selector against live inventory on each scheduling tick and produces a set of job candidates. No candidates are persisted — they are computed fresh every time.
+
+The Scheduling Layer fires on policy-defined intervals. The stagger algorithm offsets each database's job start time within the maintenance window to prevent simultaneous execution. Jobs are pushed into a bounded channel queue.
+
+The Execution Layer is a worker pool of goroutines that drains the queue. Each goroutine dispatches to the appropriate engine executor — SQL Server or PostgreSQL — based on the server's engine field.
+
+The Coordination Layer ensures exactly-once execution. Leader election designates a single dispatcher node in multi-instance deployments. Distributed locks provide defense-in-depth for split-brain scenarios.
+
+The Observability Layer emits a Prometheus counter or gauge on every job state transition. Grafana dashboards surface queue depth, job latency, failure rates, and per-server concurrency in real time.
+
+
+The Ten Design Principles
+
+Every architectural decision in this course flows from ten explicit principles. Understanding them now will help you understand why the code is structured the way it is.
+
+Principle one: policy-driven, not job-driven. Maintenance rules are expressed as policies over classes of databases. Adding a database automatically enrolls it in all applicable policies.
+
+Principle two: exactly-once execution. Leader election designates a single active dispatcher. A distributed lock per job is acquired before execution begins, providing defense-in-depth for split-brain scenarios.
+
+Principle three: server-aware concurrency. Each server carries a maximum concurrent operations field. The worker pool tracks in-flight jobs per server and refuses to dispatch a new job if the server is at its limit.
+
+Principle four: conflict detection. The conflict matrix defines which operation pairs cannot run simultaneously on the same database. Before dispatching a job, the orchestrator checks for conflicts and defers the job if one is found.
+
+Principle five: maintenance window awareness. Heavy operations carry a "requires window" flag. The scheduler will not dispatch them outside a defined maintenance window. Windows are stored with timezone names so daylight saving transitions are handled correctly.
+
+Principle six: staggered scheduling. The stagger algorithm distributes jobs across a maintenance window proportionally. Given a four-hour window and one hundred and twenty databases on a server, each database receives a unique offset. No two databases on the same server fire simultaneously for the same operation type.
+
+Principle seven: dynamic timeouts. Job timeouts scale with database size. The timeout formula is a base time plus a per-gigabyte multiplier, capped at a maximum. A job that exceeds its timeout is cancelled and marked as timed out.
+
+Principle eight: environment agnostic. The scheduler runs identically on a developer laptop, bare metal, and Kubernetes. Environment differences are injected through a configuration struct — the core logic never checks the deployment environment directly.
+
+Principle nine: auto-discovery. The inventory refresh loop runs on a configurable interval. New databases are detected automatically. Deprovisioned databases stop generating jobs without manual intervention.
+
+Principle ten: graceful shutdown. On receiving a termination signal, the scheduler stops accepting new jobs, waits for in-flight jobs to complete up to a configurable drain timeout, then exits cleanly. The process will not exit mid-backup.
+
+
+What We Will Build
+
+This course is structured as six lessons that build the scheduler from the ground up.
+
+Lesson one, which you are completing now, covers the architecture and design principles.
+
+Lesson two covers the core data models: the server struct, the database struct, operation types, the conflict matrix, and maintenance windows.
+
+Lesson three covers the policy engine: the maintenance policy type, target selectors, the stagger algorithm, and dynamic timeouts.
+
+Lesson four covers coordination and exactly-once execution: leader election with Redis and Kubernetes, distributed locks with Lua scripts, and the execution store.
+
+Lesson five covers the orchestrator: the worker pool pattern, per-server semaphores, the tick loop, and graceful shutdown.
+
+Lesson six covers the executors and observability: SQL Server and PostgreSQL executors, Prometheus metrics, and production deployment.
+
+By lesson six you will have a full, production-grade scheduler ready to deploy.
+
+
+That is the end of Lesson 1: Why a Database Fleet Needs a Scheduler.
+
+Return to the lesson page for the full architecture diagrams, design principle details, and the interactive quiz.

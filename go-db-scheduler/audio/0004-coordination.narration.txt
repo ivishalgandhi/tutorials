@@ -1,0 +1,103 @@
+Welcome to Lesson 4: Coordination — Exactly-Once Execution.
+
+This is part of the Concurrent Database Job Scheduler in Go course.
+
+Let's start.
+
+
+Running fifty scheduler nodes in Kubernetes sounds robust — until two of them both decide to execute the same backup job simultaneously, and you discover that two processes writing to the same backup file have corrupted it.
+
+The coordination layer is what transforms a distributed group of nodes into a single logical scheduler. It has three components: leader election, which decides which node dispatches jobs; a distributed lock, which provides defense-in-depth for split-brain scenarios; and an execution store, which is the shared memory of what has run and what is currently running.
+
+
+The Exactly-Once Problem
+
+In a distributed system, exactly-once execution is hard. The naive approach — "only the leader dispatches jobs" — is fragile. A network partition can leave two nodes both believing they are leader. This is called a split-brain scenario.
+
+Picture this sequence of events. Node one is the current leader. A network partition happens — node one can no longer reach Redis. Node one still thinks it is leader, because its information is stale.
+
+Meanwhile, Redis sees that node one's lease has expired and tells node two: "You are the new leader."
+
+Node two acquires a lock for the backup job on Northwind database. Node two begins executing the full backup.
+
+Now node one's network recovers. It tries to acquire the same lock — but the lock is already held by node two. The lock acquisition fails. Node one skips the job.
+
+Result: the backup runs exactly once, despite a split-brain event.
+
+Key insight: leader election alone is insufficient. It relies on the leader stepping down gracefully when connectivity is lost. The distributed lock is defense-in-depth. Even if a node incorrectly believes it is leader, it cannot execute a job that someone else is already running. You need both layers. Leader election handles the common case. The distributed lock handles the failure case.
+
+
+Redis Leader Election — SET NX with Heartbeat
+
+The Redis leader election implementation uses a single key with a short time-to-live. The node that successfully sets the key owns leadership. It renews the time-to-live every five seconds by sending a heartbeat. If it stops heartbeating — because the process died or lost network access — the time-to-live expires and another node takes over.
+
+The implementation uses two constants: a fifteen-second lease time-to-live and a five-second heartbeat interval.
+
+In plain terms: every five seconds, each node tries to set a Redis key using the SET NX command, which only succeeds if the key does not already exist. If the set succeeds, the node won the election and becomes leader. If the key already exists, the node checks whether it currently holds it. If it does, it renews the time-to-live. If it does not hold the key, it sets itself as a non-leader. If Redis is unreachable, the node steps down immediately.
+
+For the complete Go implementation, see the lesson text.
+
+Watch out about time-to-live and heartbeat sizing: the fifteen-second time-to-live means a leader that loses connectivity to Redis keeps dispatching for up to fifteen seconds before another node takes over. The heartbeat interval must be significantly shorter than the time-to-live to ensure the key is renewed well before expiry — a good rule of thumb is time-to-live should be at least three times the heartbeat interval. A shorter time-to-live means faster failover but more Redis load. A longer time-to-live increases the split-brain window. Tune these for your network's 99th-percentile latency to Redis.
+
+
+Redis Distributed Lock — Lua Scripts for Safety
+
+A simple SET NX plus DEL sequence is unsafe as a distributed lock. Here is why.
+
+Node A sets the key and starts a long job. The lock's time-to-live expires before the job finishes. Node B sets the same key. Node A's job finishes and calls DEL on the key — it has just deleted node B's lock. A third node C then acquires the lock and runs the job concurrently with node B.
+
+The Lua script approach prevents this by making the check-and-delete atomic. The script checks whether the current value of the key matches the token we set when acquiring the lock. If it matches, we delete the key. If it does not match — meaning someone else re-acquired the lock after ours expired — we do nothing.
+
+Long-running jobs also need to extend their lock time-to-live to prevent expiry mid-execution. An extend script follows the same atomic check-then-act pattern: check our token, then refresh the time-to-live.
+
+A goroutine spawned alongside the job executor calls the extend script at one-third of the time-to-live intervals. If the job goroutine exits — whether by success, failure, or panic — the extension goroutine is cancelled via context, and the lock expires naturally or is explicitly released.
+
+For the complete Acquire, Release, and extend Lua script implementations, see the lesson text.
+
+Critical: never use GET plus DEL as two separate Redis commands without the Lua script. Between the GET check and the DEL, another goroutine or process can expire the lock and a third party can acquire it. Your DEL would then release someone else's lock, breaking exactly-once. The Lua script runs atomically on the Redis server — nothing can interleave between the GET and the DEL inside the script.
+
+
+Kubernetes Lease — Production Leader Election
+
+For Kubernetes-native deployments, the Kubernetes coordination Lease object is a better choice than a Redis key. It uses the Kubernetes API server, which is already present and highly available. It integrates with RBAC. And it is the same mechanism used by the Kubernetes controller manager itself.
+
+The client-go leader-election library wraps this behind a clean callback interface with three callbacks: OnStartedLeading, OnStoppedLeading, and OnNewLeader.
+
+Three durations in the configuration are worth understanding precisely.
+
+LeaseDuration: fifteen seconds — how long a candidate waits before stealing an expired lease.
+
+RenewDeadline: ten seconds — how long the leader tries to renew before giving up and stepping down.
+
+RetryPeriod: two seconds — how often a non-leader polls the API server to check for an available lease.
+
+Comparing the two election backends: Redis requires an additional infrastructure dependency, uses time-to-live based key expiry, and is best for non-Kubernetes deployments on bare metal or virtual machines. Kubernetes Lease requires only the API server you already have, uses Lease object expiry, is best for Kubernetes-native deployments, and requires RBAC permissions for get, create, and update on the leases resource.
+
+Both backends support a single-node fallback for local development.
+
+
+Single-Node Fallback — Development and Small Deployments
+
+Not every deployment needs distributed coordination. A single developer running the scheduler locally, or a small deployment on one server, needs no leader election infrastructure.
+
+The singleNodeLeader satisfies the LeaderElector interface without touching any external system. Its IsLeader method always returns true. Its Start method simply blocks until the context is cancelled.
+
+Important note about environment switching: for local development and testing, single-node mode avoids Redis and Kubernetes entirely. The scheduler still runs correctly — it just does not coordinate with other nodes. Switch to Redis or Kubernetes coordination by changing one config line. The core scheduling logic never checks the coordination mode directly — it only calls leader-dot-IsLeader, which is the same method on all three implementations.
+
+
+The Execution Store — Shared Job Memory
+
+The execution store is the cluster's shared memory of what jobs have run, are running, and have failed. Every scheduler node reads from and writes to it.
+
+The interface provides methods to: mark a job as running, record a job result, check whether a database has a conflict for a given operation, and query recently completed jobs.
+
+Two backends exist: a PostgreSQL-backed store for production deployments, and an in-memory store for testing and single-node development. Both satisfy the same interface — the orchestrator does not know which one it is talking to.
+
+The HasConflict method is called before every dispatch. It checks the store for any currently running jobs on the same database whose operation type conflicts with the proposed operation. If a conflict is found, the job is deferred rather than failed. It will be retried on the next scheduling tick.
+
+For the complete ExecutionStore interface and PostgreSQL implementation, see the lesson text.
+
+
+That is the end of Lesson 4: Coordination — Exactly-Once Execution.
+
+Return to the lesson page for the complete code, the split-brain sequence diagram, and the interactive quiz.

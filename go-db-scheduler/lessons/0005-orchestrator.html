@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 5: The Orchestrator — Concurrency Control and the Scheduling Loop</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0005-orchestrator.mp3">
+    <span class="tag">Lesson 5</span>
+    <span>Concurrent Database Job Scheduler in Go</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0004-coordination.html">← Lesson 4</a></span>
+    <span><a href="0006-executors-and-ops.html">Lesson 6 →</a></span>
+  </div>
+
+  <h1>The Orchestrator — Concurrency Control and the Scheduling Loop</h1>
+
+  <p>
+    Lessons 2–4 built the data models, policies, and coordination primitives. Now everything converges
+    in the <em>orchestrator</em>: the component that takes a stream of generated <code>ScheduledJob</code>
+    objects and dispatches them safely across 5,000 servers without overwhelming any single server,
+    running conflicting operations on the same database, or losing work during a shutdown.
+  </p>
+
+  <p>
+    This lesson introduces three new Go patterns you have not seen before:
+    the <strong>worker pool</strong>, the <strong>per-server semaphore</strong>, and
+    <strong>graceful shutdown via <code>signal.NotifyContext</code></strong>.
+    Each one is a standard Go idiom worth keeping in your toolbox permanently.
+  </p>
+
+  <div class="callout info">
+    <div class="label">REFERENCE SHEET</div>
+    <p>The patterns covered here are summarised in the
+    <a href="../reference/go-concurrency-patterns.html">Go Concurrency Patterns</a>
+    reference sheet. Keep it open in a second tab as you read.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Where the Orchestrator Sits</h2>
+
+  <p>
+    The diagram below zooms into the execution and scheduling layers from the overall architecture.
+    The orchestrator is the dispatcher: it receives the job stream produced by the policy generator
+    and cron tick, and routes each job to the right executor.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart TD
+    subgraph Tick["Tick Loop (every N seconds)"]
+        CRON["robfig/cron fires"]
+        GEN["PolicyGenerator.GenerateAll()"]
+        ENQUEUE["push to jobs channel"]
+    end
+
+    subgraph Orchestrator["Orchestrator"]
+        QUEUE["jobs chan *ScheduledJob\n(buffered — 500 slots)"]
+        W1["Worker goroutine 1"]
+        W2["Worker goroutine 2"]
+        WN["Worker goroutine N"]
+        SEM["Per-server semaphores\nmap[serverID]chan struct{}"]
+        CONF["Conflict detector\nHasConflict(db, op)"]
+        WIN["Window checker\nIsInWindow(server, now)"]
+    end
+
+    subgraph Executors["Executors"]
+        SS["SQLServerExecutor"]
+        PG["PostgreSQLExecutor"]
+    end
+
+    CRON --> GEN --> ENQUEUE --> QUEUE
+    QUEUE --> W1 & W2 & WN
+    W1 --> SEM
+    W1 --> CONF
+    W1 --> WIN
+    W1 --> SS
+    W1 --> PG
+    </div>
+    <div class="diagram-caption">
+      Figure 5.1 — The orchestrator dispatches jobs from a buffered channel through
+      per-server semaphores, conflict detection, and window checks before handing them to an executor.
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Why a Worker Pool? (Not a Goroutine Per Job)</h2>
+
+  <p>
+    The simplest way to process jobs concurrently in Go is to spawn a goroutine per job:
+  </p>
+
+  <pre><code><span class="cm">// ❌  NAIVE — do not use this</span>
+<span class="kw">for</span> _, job := <span class="kw">range</span> jobs {
+    <span class="kw">go</span> <span class="fn">execute</span>(job)   <span class="cm">// new goroutine for every single job</span>
+}</code></pre>
+
+  <p>
+    This looks fine for 10 jobs. With 50,000 databases × 6 operation types at a fleet tick, you can
+    generate 300,000 goroutines in milliseconds. Each goroutine starts with a 2 KB stack that grows
+    as needed. At 300,000 goroutines × 2 KB minimum = 600 MB just to start — before any work happens.
+    And the goroutines don't <em>finish</em> quickly: a full backup takes up to 12 hours.
+  </p>
+
+  <p>
+    The solution is a <strong>worker pool</strong>: a fixed number of goroutines that all read from
+    a single shared channel. You control concurrency by controlling the number of goroutines,
+    not the number of jobs.
+  </p>
+
+  <pre><code><span class="cm">// ✅  WORKER POOL — fixed N goroutines drain a shared channel</span>
+
+<span class="cm">// The channel is the queue. Buffer size = how many jobs can wait.</span>
+<span class="cm">// If full, the tick loop blocks (backpressure — intentional).</span>
+jobs := <span class="kw">make</span>(<span class="kw">chan</span> *<span class="tp">ScheduledJob</span>, <span class="nm">500</span>)
+
+<span class="kw">var</span> wg sync.<span class="tp">WaitGroup</span>   <span class="cm">// tracks all in-flight workers</span>
+
+<span class="kw">for</span> i := <span class="nm">0</span>; i &lt; workerCount; i++ {
+    wg.<span class="fn">Add</span>(<span class="nm">1</span>)
+    <span class="kw">go func</span>() {
+        <span class="kw">defer</span> wg.<span class="fn">Done</span>()   <span class="cm">// runs when this goroutine returns</span>
+        <span class="kw">for</span> job := <span class="kw">range</span> jobs {   <span class="cm">// blocks waiting for work</span>
+            <span class="cm">// "range over channel" exits automatically</span>
+            <span class="cm">// when close(jobs) is called (graceful shutdown)</span>
+            <span class="fn">dispatch</span>(ctx, job)
+        }
+    }()
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">GO BEGINNER — for range over a channel</div>
+    <p>
+      <code>for job := range jobs</code> is exactly like looping over a slice, except the loop
+      <em>blocks</em> waiting for the next value instead of immediately finishing. When
+      <code>close(jobs)</code> is called, the loop exits cleanly. This is the standard Go
+      pattern for "process work until told to stop."
+    </p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">GO BEGINNER — sync.WaitGroup</div>
+    <p>
+      A <code>WaitGroup</code> is a counter. <code>wg.Add(1)</code> increments it before launching
+      a goroutine. <code>wg.Done()</code> (called via <code>defer</code>) decrements it when the
+      goroutine finishes. <code>wg.Wait()</code> blocks until the counter reaches zero — meaning
+      all goroutines are done. This is how graceful shutdown waits for in-flight jobs to finish.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Per-Server Semaphore — Protecting MaxConcurrentOps</h2>
+
+  <p>
+    A global worker pool limits total parallelism, but it doesn't protect individual servers.
+    If 200 workers all pick jobs that happen to land on <code>sql-prod-01</code>, that server
+    gets 200 simultaneous backup processes — saturating its disk I/O completely regardless of
+    <code>MaxConcurrentOps</code>.
+  </p>
+
+  <p>
+    The per-server semaphore is the fix. It ensures that at most <code>MaxConcurrentOps</code>
+    jobs are running on any single server at any moment. The Go idiom for a semaphore is
+    a buffered channel:
+  </p>
+
+  <pre><code><span class="cm">// A buffered channel with capacity N is a semaphore with N permits.</span>
+<span class="cm">// This is explicitly documented in Effective Go:</span>
+<span class="cm">// https://go.dev/doc/effective_go#channels</span>
+
+<span class="kw">type</span> <span class="tp">serverSems</span> <span class="kw">struct</span> {
+    mu   sync.<span class="tp">Mutex</span>
+    sems <span class="kw">map</span>[<span class="tp">string</span>]<span class="kw">chan</span> <span class="kw">struct</span>{}   <span class="cm">// one semaphore per serverID</span>
+}
+
+<span class="cm">// sem() returns (or lazily creates) the semaphore for a server.</span>
+<span class="kw">func</span> (ss *<span class="tp">serverSems</span>) <span class="fn">sem</span>(serverID <span class="tp">string</span>, maxOps <span class="tp">int</span>) <span class="kw">chan</span> <span class="kw">struct</span>{} {
+    ss.mu.<span class="fn">Lock</span>()
+    <span class="kw">defer</span> ss.mu.<span class="fn">Unlock</span>()
+    <span class="kw">if</span> _, ok := ss.sems[serverID]; !ok {
+        ss.sems[serverID] = <span class="kw">make</span>(<span class="kw">chan</span> <span class="kw">struct</span>{}, maxOps)
+    }
+    <span class="kw">return</span> ss.sems[serverID]
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">GO BEGINNER — buffered channel as semaphore</div>
+    <p>
+      A buffered channel of capacity N can hold N values. A <em>send</em> (<code>sem &lt;- struct{}{}</code>)
+      succeeds immediately if there is room — it "acquires a permit." If the channel is full, the send
+      <em>blocks</em> until someone else does a <em>receive</em> (<code>&lt;-sem</code>), which "releases
+      a permit." The empty struct <code>struct{}{}</code> uses zero bytes — it's just a token, not real data.
+    </p>
+  </div>
+
+  <p>
+    The <code>dispatch</code> function acquires the semaphore before starting a job and releases it
+    when the job finishes, regardless of whether the job succeeded or failed:
+  </p>
+
+  <pre><code><span class="kw">func</span> (o *<span class="tp">Orchestrator</span>) <span class="fn">dispatch</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) {
+    <span class="cm">// ── 1. Check maintenance window ──────────────────────────</span>
+    <span class="kw">if</span> job.Policy.Schedule.RequireWindow {
+        <span class="kw">if</span> !job.Server.<span class="fn">IsInWindow</span>(time.<span class="fn">Now</span>()) {
+            job.Status = StatusSkipped   <span class="cm">// try again next tick</span>
+            <span class="kw">return</span>
+        }
+    }
+
+    <span class="cm">// ── 2. Check conflict ────────────────────────────────────</span>
+    <span class="kw">if</span> o.store.<span class="fn">HasConflict</span>(job.DB.ID, job.Operation) {
+        job.Status = StatusConflict   <span class="cm">// re-queued next tick, not failed</span>
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// ── 3. Acquire per-server semaphore ──────────────────────</span>
+    serverSem := o.sems.<span class="fn">sem</span>(job.Server.ID, job.Server.MaxConcurrentOps)
+    <span class="kw">select</span> {
+    <span class="kw">case</span> serverSem &lt;- <span class="kw">struct</span>{}{}:
+        <span class="cm">// acquired — proceed</span>
+    <span class="kw">case</span> &lt;-ctx.<span class="fn">Done</span>():
+        job.Status = StatusCanceled   <span class="cm">// shutdown arrived while waiting</span>
+        <span class="kw">return</span>
+    }
+    <span class="kw">defer</span> <span class="kw">func</span>() { &lt;-serverSem }()   <span class="cm">// release on return, always</span>
+
+    <span class="cm">// ── 4. Apply dynamic timeout ─────────────────────────────</span>
+    timeout := job.Policy.Timeout.<span class="fn">ForDatabase</span>(job.DB)
+    jobCtx, cancel := context.<span class="fn">WithTimeout</span>(ctx, timeout)
+    <span class="kw">defer</span> cancel()
+
+    <span class="cm">// ── 5. Mark running, execute, record result ──────────────</span>
+    o.store.<span class="fn">MarkRunning</span>(job)
+    result, err := o.executor(job.Server.Engine).<span class="fn">Execute</span>(jobCtx, job)
+    o.store.<span class="fn">RecordResult</span>(job, result, err)
+}</code></pre>
+
+  <div class="callout warning">
+    <div class="label">GOTCHA — select with semaphore acquire</div>
+    <p>
+      Use <code>select</code> (not a bare send) when acquiring the semaphore so that a shutdown signal
+      can unblock the goroutine. A bare <code>serverSem &lt;- struct{}{}</code> would block forever if
+      the server is at capacity and shutdown arrives — the program could never exit.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Tick Loop</h2>
+
+  <p>
+    The tick loop is the heartbeat of the scheduler. Every N seconds (default: 60), it evaluates
+    all policies against live inventory, generates the current set of candidate jobs, and pushes
+    them onto the job channel. The per-server semaphores and conflict detector in the workers
+    handle the traffic safely.
+  </p>
+
+  <pre><code><span class="kw">func</span> (o *<span class="tp">Orchestrator</span>) <span class="fn">run</span>(ctx <span class="tp">context.Context</span>) {
+    ticker := time.<span class="fn">NewTicker</span>(o.cfg.TickInterval)
+    <span class="kw">defer</span> ticker.<span class="fn">Stop</span>()
+
+    <span class="kw">for</span> {
+        <span class="kw">select</span> {
+        <span class="kw">case</span> &lt;-ctx.<span class="fn">Done</span>():
+            <span class="kw">return</span>   <span class="cm">// shutdown — stop generating new jobs</span>
+        <span class="kw">case</span> &lt;-ticker.C:
+            <span class="cm">// Generate jobs for the current moment</span>
+            candidates := o.generator.<span class="fn">GenerateAll</span>(ctx, time.<span class="fn">Now</span>())
+            <span class="kw">for</span> _, job := <span class="kw">range</span> candidates {
+                <span class="kw">select</span> {
+                <span class="kw">case</span> o.jobs &lt;- job:
+                    <span class="cm">// enqueued</span>
+                <span class="kw">case</span> &lt;-ctx.<span class="fn">Done</span>():
+                    <span class="kw">return</span>   <span class="cm">// shutdown mid-generation</span>
+                }
+            }
+        }
+    }
+}</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY THE CHANNEL IS BOUNDED</div>
+    <p>
+      The job channel has a fixed buffer (500 slots). If workers cannot drain the queue fast enough,
+      the <code>o.jobs &lt;- job</code> send will block — applying <em>backpressure</em> to the
+      generator. This is intentional: it prevents the scheduler from accumulating millions of
+      stale jobs during a slow period. The buffer size should be roughly
+      <code>workerCount × max_job_duration_multiplier</code> for your fleet.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>Graceful Shutdown — The Full Picture</h2>
+
+  <p>
+    Kubernetes sends <code>SIGTERM</code> before it kills a pod. Your scheduler might be in the middle
+    of a 6-hour CHECKDB job when this happens. Graceful shutdown is the mechanism that says:
+    "stop accepting new work, but let everything in-flight finish."
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant OS as OS / Kubernetes
+    participant Main as main()
+    participant Tick as Tick loop
+    participant Pool as Worker pool
+    participant Job as In-flight job
+
+    OS->>Main: SIGTERM
+    Main->>Tick: ctx.Done() — stop generating
+    Main->>Pool: close(jobs) — workers drain queue
+    Pool->>Job: dispatching continues until queue empty
+    Job-->>Pool: job completes (up to 5 min drain timeout)
+    Pool-->>Main: wg.Wait() unblocks
+    Main-->>OS: process exits cleanly
+    </div>
+    <div class="diagram-caption">
+      Figure 5.2 — SIGTERM triggers a two-phase shutdown: (1) stop new job generation, (2) drain
+      all in-flight jobs before exit. In-progress jobs are never killed mid-execution.
+    </div>
+  </div>
+
+  <pre><code><span class="kw">func</span> <span class="fn">main</span>() {
+    <span class="cm">// 1. ctx is cancelled when SIGTERM or SIGINT arrives.</span>
+    <span class="cm">//    stop() tells the OS "we handled it, no default behaviour."</span>
+    ctx, stop := signal.<span class="fn">NotifyContext</span>(
+        context.<span class="fn">Background</span>(),
+        syscall.SIGTERM, syscall.SIGINT,
+    )
+    <span class="kw">defer</span> stop()
+
+    jobs := <span class="kw">make</span>(<span class="kw">chan</span> *<span class="tp">ScheduledJob</span>, <span class="nm">500</span>)
+    <span class="kw">var</span> wg sync.<span class="tp">WaitGroup</span>
+
+    <span class="cm">// 2. Start N worker goroutines in the background.</span>
+    <span class="kw">for</span> i := <span class="nm">0</span>; i &lt; workerCount; i++ {
+        wg.<span class="fn">Add</span>(<span class="nm">1</span>)
+        <span class="kw">go func</span>() {
+            <span class="kw">defer</span> wg.<span class="fn">Done</span>()
+            <span class="kw">for</span> job := <span class="kw">range</span> jobs {
+                o.<span class="fn">dispatch</span>(ctx, job)
+            }
+        }()
+    }
+
+    <span class="cm">// 3. Run the tick loop until SIGTERM.</span>
+    o.<span class="fn">run</span>(ctx)   <span class="cm">// blocks here until ctx is cancelled</span>
+
+    <span class="cm">// 4. Stop new jobs: closing the channel signals all workers</span>
+    <span class="cm">//    to finish their current job and then exit the range loop.</span>
+    close(jobs)
+
+    <span class="cm">// 5. Drain with a 5-minute deadline.</span>
+    <span class="cm">//    IMPORTANT: use a fresh context — the original ctx is already cancelled.</span>
+    drainCtx, cancel := context.<span class="fn">WithTimeout</span>(context.<span class="fn">Background</span>(), <span class="nm">5</span>*time.<span class="tp">Minute</span>)
+    <span class="kw">defer</span> cancel()
+
+    done := <span class="kw">make</span>(<span class="kw">chan</span> <span class="kw">struct</span>{})
+    <span class="kw">go func</span>() {
+        wg.<span class="fn">Wait</span>()
+        close(done)
+    }()
+
+    <span class="kw">select</span> {
+    <span class="kw">case</span> &lt;-done:
+        log.<span class="fn">Println</span>(<span class="st">"all jobs completed — clean exit"</span>)
+    <span class="kw">case</span> &lt;-drainCtx.<span class="fn">Done</span>():
+        log.<span class="fn">Println</span>(<span class="st">"drain timeout — some jobs still running, forcing exit"</span>)
+    }
+}</code></pre>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT — FRESH CONTEXT FOR DRAIN</div>
+    <p>
+      When <code>SIGTERM</code> arrives, <code>ctx</code> is cancelled. You cannot use it to create
+      the drain timeout — <code>context.WithTimeout(ctx, 5*time.Minute)</code> would immediately
+      return a context that is already done. Always create the drain context from
+      <code>context.Background()</code>, a context that is never cancelled.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <h2>The Complete Orchestrator in One View</h2>
+
+  <p>
+    Putting it all together, here is the <code>Orchestrator</code> struct and its method set.
+    This is the skeleton; Lesson 6 fills in the <code>Execute</code> method on each executor.
+  </p>
+
+  <pre><code><span class="kw">type</span> <span class="tp">Orchestrator</span> <span class="kw">struct</span> {
+    cfg       <span class="tp">Config</span>
+    generator *<span class="tp">PolicyGenerator</span>
+    store     <span class="tp">ExecutionStore</span>    <span class="cm">// interface — records job state</span>
+    executors <span class="kw">map</span>[<span class="tp">EngineType</span>]<span class="tp">Executor</span>  <span class="cm">// SQLServer or PostgreSQL</span>
+    sems      *<span class="tp">serverSems</span>         <span class="cm">// per-server semaphores</span>
+    jobs      <span class="kw">chan</span> *<span class="tp">ScheduledJob</span>   <span class="cm">// the main work queue</span>
+}
+
+<span class="cm">// Executor interface — each engine implements this one method.</span>
+<span class="kw">type</span> <span class="tp">Executor</span> <span class="kw">interface</span> {
+    <span class="fn">Execute</span>(ctx <span class="tp">context.Context</span>, job *<span class="tp">ScheduledJob</span>) (<span class="tp">Result</span>, <span class="tp">error</span>)
+}
+
+<span class="cm">// ExecutionStore interface — abstracts Redis / SQLite / Postgres backing store.</span>
+<span class="kw">type</span> <span class="tp">ExecutionStore</span> <span class="kw">interface</span> {
+    <span class="fn">HasConflict</span>(dbID <span class="tp">string</span>, op <span class="tp">OperationType</span>) <span class="tp">bool</span>
+    <span class="fn">MarkRunning</span>(job *<span class="tp">ScheduledJob</span>)
+    <span class="fn">RecordResult</span>(job *<span class="tp">ScheduledJob</span>, r <span class="tp">Result</span>, err <span class="tp">error</span>)
+}
+
+<span class="cm">// executor() routes to the correct engine executor.</span>
+<span class="kw">func</span> (o *<span class="tp">Orchestrator</span>) <span class="fn">executor</span>(engine <span class="tp">EngineType</span>) <span class="tp">Executor</span> {
+    <span class="kw">if</span> ex, ok := o.executors[engine]; ok {
+        <span class="kw">return</span> ex
+    }
+    <span class="kw">panic</span>(<span class="st">"unknown engine: "</span> + <span class="tp">string</span>(engine))
+}</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="callout info">
+    <div class="label">ASK YOUR TEACHER</div>
+    <p>
+      Something unclear? Ask me directly. Common questions at this point:
+      <em>"Why is the drain context created from <code>Background()</code> and not the parent?"</em>
+      <em>"How do I size the worker count and channel buffer for 5,000 servers?"</em>
+      <em>"What happens if a worker panics — does it take down the whole pool?"</em>
+      Type your question and I'll explain it in the context of your real fleet.
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory. Each question has four options of equal length.</p>
+
+    <div class="quiz"
+         data-question="Why does the orchestrator use a fixed worker pool instead of launching a goroutine for every job?"
+         data-correct="A"
+         data-feedback-correct="Correct. Spawning a goroutine per job at fleet scale means hundreds of thousands of goroutines. Each starts with at least 2 KB of stack. At 300,000 goroutines that's 600 MB before any work happens — and long-running jobs (backups, CHECKDB) keep growing those stacks for hours."
+         data-feedback-wrong="Think about what happens when 50,000 databases all generate backup jobs at the same tick. Each goroutine needs a minimum stack allocation, and long jobs keep theirs for hours.">
+      <div class="quiz-option" data-key="A">Unbounded goroutines exhaust memory when all jobs queue up simultaneously</div>
+      <div class="quiz-option" data-key="B">Go's scheduler cannot multiplex more than one hundred goroutines safely</div>
+      <div class="quiz-option" data-key="C">Each database connection requires its own dedicated long-lived goroutine</div>
+      <div class="quiz-option" data-key="D">The robfig/cron library only supports one goroutine per scheduled entry</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You acquire a permit from a buffered semaphore channel (sem <- struct{}{}). What releases the permit after the job is done?"
+         data-correct="C"
+         data-feedback-correct="Correct. Receiving from the channel (<-sem) removes one value, freeing one slot, which allows the next send to unblock. Using defer ensures this release happens whether the job succeeds, fails, or panics — it runs when the function returns."
+         data-feedback-wrong="Releasing a semaphore permit is the reverse of acquiring it. Acquiring adds a value to the buffered channel; releasing must remove one.">
+      <div class="quiz-option" data-key="A">Calling close(sem) removes the value and signals waiting goroutines</div>
+      <div class="quiz-option" data-key="B">Calling wg.Done() decrements the semaphore and frees the held slot</div>
+      <div class="quiz-option" data-key="C">Receiving from the channel (defer func() { &lt;-sem }()) frees the slot</div>
+      <div class="quiz-option" data-key="D">The Go runtime clears the semaphore automatically when the job ends</div>
+    </div>
+
+    <div class="quiz"
+         data-question="When a job's operation type conflicts with one already running on the same database, the orchestrator should:"
+         data-correct="B"
+         data-feedback-correct="Correct. A conflict is not a failure — it means the timing was wrong, not that the job is broken. Marking StatusConflict and letting the next tick try again is the correct retry strategy. The stagger algorithm reduces how often this happens in practice."
+         data-feedback-wrong="Think about what a conflict means: two valid operations cannot safely run simultaneously. The job itself is fine — only the timing is wrong. What's the safest way to handle a timing problem?">
+      <div class="quiz-option" data-key="A">Cancel the running job and start this newer higher-priority one</div>
+      <div class="quiz-option" data-key="B">Mark the job as StatusConflict and retry it on the next tick</div>
+      <div class="quiz-option" data-key="C">Wait in a goroutine until the conflicting operation completes first</div>
+      <div class="quiz-option" data-key="D">Drop the job permanently and log a warning about the missed operation</div>
+    </div>
+
+    <div class="quiz"
+         data-question="signal.NotifyContext(ctx, syscall.SIGTERM) returns two values. What is the second value (stop) used for?"
+         data-correct="D"
+         data-feedback-correct="Correct. stop() deregisters the signal handler. Without calling it, the OS signal remains diverted to the context and the second SIGTERM would not trigger the default exit behaviour. Always defer stop() immediately after calling NotifyContext."
+         data-feedback-wrong="Consider what happens if SIGTERM arrives a second time after your shutdown begins. signal.NotifyContext is intercepting OS signals — what does the second return value let you do with that interception?">
+      <div class="quiz-option" data-key="A">To send a SIGTERM to child processes when the parent context cancels</div>
+      <div class="quiz-option" data-key="B">To re-arm the signal handler for the next SIGTERM that arrives later</div>
+      <div class="quiz-option" data-key="C">To set a timeout after which the context cancels even without a signal</div>
+      <div class="quiz-option" data-key="D">To deregister the handler so a second SIGTERM triggers the default exit</div>
+    </div>
+
+    <div class="quiz"
+         data-question="After SIGTERM, you need a 5-minute drain timeout. Why must you use context.Background() and NOT the signal context?"
+         data-correct="A"
+         data-feedback-correct="Correct. The signal context was cancelled by SIGTERM — that's the whole point. Passing an already-cancelled context as the parent to WithTimeout creates a timeout that fires immediately. A fresh context.Background() is the correct parent because it is never cancelled externally."
+         data-feedback-wrong="What is the state of the original context when SIGTERM arrives? If you pass that context as the parent to WithTimeout, what does the derived context look like?">
+      <div class="quiz-option" data-key="A">The signal context is already cancelled — a child would expire immediately too</div>
+      <div class="quiz-option" data-key="B">Background context has a higher priority in the Go scheduler than signal context</div>
+      <div class="quiz-option" data-key="C">signal.NotifyContext does not support being used as a parent for WithTimeout</div>
+      <div class="quiz-option" data-key="D">WithTimeout panics when given a cancelled context as its parent argument</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="lesson-nav">
+    <a href="0004-coordination.html">← Lesson 4: Coordination</a>
+    <a href="0006-executors-and-ops.html">Lesson 6: Executors and Observability →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources for This Lesson</div>
+    <ul>
+      <li><a href="https://go.dev/doc/effective_go#concurrency" target="_blank">Effective Go — Concurrency</a>
+        — The canonical Go reference for goroutines, channels, and the buffered-channel-as-semaphore pattern.</li>
+      <li><a href="https://go.dev/blog/pipelines" target="_blank">Go Blog: Pipelines and Cancellation</a>
+        — Official deep-dive on channel fan-in, done channels, and draining goroutines safely.</li>
+      <li><a href="https://pkg.go.dev/os/signal#NotifyContext" target="_blank">pkg.go.dev — signal.NotifyContext</a>
+        — API reference for graceful shutdown signal handling (Go 1.16+).</li>
+      <li><a href="https://victoriametrics.com/blog/go-graceful-shutdown/" target="_blank">VictoriaMetrics — Graceful Shutdown in Go</a>
+        — Production patterns: two-phase shutdown, drain contexts, second Ctrl+C behaviour.</li>
+    </ul>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

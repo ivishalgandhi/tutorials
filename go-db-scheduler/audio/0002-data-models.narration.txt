@@ -1,0 +1,86 @@
+Welcome to Lesson 2: Data Models — Servers, Databases, and Operations.
+
+This is part of the Concurrent Database Job Scheduler in Go course.
+
+Let's start.
+
+
+The scheduler's power comes from rich metadata. Every decision — which jobs to generate, which servers are overloaded, which operations conflict, how long a timeout should be — is derived from three core types: DBServer, Database, and OperationType. This lesson walks through those types and the conflict matrix that sits at the heart of the scheduler.
+
+Picture a relationship diagram with two groups. On the left are the core domain models: DBServer, Database, and OperationType. On the right are the runtime artifacts: Policy, ScheduledJob, and Executor. A DBServer hosts many Database records. Policies match databases and generate ScheduledJob instances. Jobs are dispatched to the correct executor based on the server's engine. This is the complete data flow.
+
+
+DBServer — The Fleet Registry
+
+Every physical or virtual database server in the fleet is represented by a DBServer struct. It carries everything the scheduler needs to know about the host: what engine it runs, how many concurrent operations it can tolerate, when its maintenance windows are, and which region and tier it belongs to.
+
+For the complete struct definition with all fields, see the lesson text.
+
+The most important field is MaxConcurrentOps. This is the single most important throttle in the system. It prevents the scheduler from running twenty simultaneous backups on a server with four disk spindles. A busy SQL Server production instance might have MaxConcurrentOps set to three. A dedicated backup server might allow eight. The worker pool tracks in-flight jobs per server ID and will not dispatch a new job when the count is at capacity.
+
+One important security note: the connection string field is intentionally excluded from all JSON serialisation. Credentials must never appear in API responses, logs, or Prometheus labels.
+
+Watch out: MaxConcurrentOps must be set conservatively. For OLTP SQL Server boxes, start at two or three. Index rebuilds and integrity checks are I/O-intensive — running three simultaneously on the same disk spindles will saturate them. If you are unsure, start at one for production servers and raise it after observing real I/O utilisation during maintenance windows.
+
+
+Database — The Maintenance Subject
+
+The Database struct represents a single logical database on a server. It carries the metadata that the policy generator, conflict checker, and executor all need to make decisions.
+
+For the complete struct definition, see the lesson text.
+
+The recovery model field is crucial for log backup policies. Log backups only make sense for databases in FULL recovery model. The policy generator checks this field — a database in SIMPLE recovery model is automatically excluded from log backup policies. No job is generated, so there is no runtime failure to handle.
+
+The last full backup, last integrity check, and last vacuum fields are pointer fields — they are nil when the operation has never run on this database. Helper methods use this to make scheduling decisions. For example, the NeedsBackup method returns true if the database has never been backed up, or if the last full backup is older than a specified maximum age.
+
+Important note about system databases: system databases are excluded from most policies by default. The tempdb database cannot be backed up at all. Master and msdb need special handling — they are small but critical, and must be backed up after any schema-level change. Set include-system-dbs only on policies designed specifically for them, not on general maintenance policies.
+
+
+OperationType — What Jobs Actually Do
+
+OperationType is a typed string constant that identifies the kind of work a job performs. The full catalogue spans both engines and several maintenance categories.
+
+For SQL Server backups: full backup runs a BACKUP DATABASE statement to disk with compression and checksum. Differential backup is incremental since the last full, enabling faster restores. Log backup captures the transaction log and requires FULL recovery model to enable point-in-time restore.
+
+For SQL Server maintenance: index rebuild rewrites all index pages entirely, used when fragmentation exceeds thirty percent. Index reorganize is a lighter online operation for ten to thirty percent fragmentation. Update statistics refreshes query planner statistics. Integrity check runs DBCC CHECKDB, which verifies every data and index page and detects corruption.
+
+For PostgreSQL backups: pg_basebackup streams a physical cluster backup. pg_dump produces a logical backup at the database level, in SQL or custom format.
+
+For PostgreSQL maintenance: vacuum analyze reclaims dead tuple space and updates planner statistics. Vacuum full reclaims table bloat but requires an exclusive lock on each table. Reindex concurrently rebuilds indexes in PostgreSQL 14 and later without blocking reads.
+
+Cross-platform operations include health check — a quick connectivity and state verification — and cleanup of old backup files.
+
+
+Operation Weights — Understanding Resource Impact
+
+Every operation carries four weight scores on a scale of one to ten, covering I/O, CPU, lock contention, and network impact.
+
+The heaviest operations are integrity check and vacuum full, both scoring ten for I/O. Full backup and pg_basebackup score nine for I/O and eight for network, because they stream data off the server. Index rebuild scores nine for I/O and eight for lock contention — it rewrites all index pages and holds schema locks.
+
+On the lighter end, vacuum analyze scores four for I/O and is safe to run during business hours for most workloads. Log backup is very lightweight and designed to run every fifteen to thirty minutes. Health check is near-zero impact across all dimensions.
+
+The primary throttle is always MaxConcurrentOps. Weight scores help operators understand why a given combination of operations is dangerous, and they can drive future enhancements like weighted concurrency limits.
+
+
+The Conflict Matrix — Who Blocks Whom
+
+Key insight: the conflict matrix is the heart of safe scheduling. It answers: "Can I start operation X on a database while operation Y is already running on it?" If there is a conflict, the new job is deferred and retried on the next scheduling tick. No data is put at risk, and no jobs are silently dropped.
+
+For the complete conflict matrix code, see the lesson text. Here is the verbal summary.
+
+Full backup conflicts with: differential backup, integrity check, index rebuild, and vacuum full. Running any of those simultaneously risks corrupting the backup stream or saturating I/O.
+
+Integrity check conflicts with: full backup, differential backup, index rebuild, and vacuum full. DBCC CHECKDB reads every page — any concurrent write-heavy operation causes false positives or excessive I/O contention.
+
+Index rebuild conflicts with: full backup, integrity check, vacuum full, and reindex. Index rebuild holds schema locks, so backup and integrity check cannot proceed cleanly while pages are being rewritten.
+
+Vacuum full conflicts with: full backup, index rebuild, reindex, and pg_basebackup. It holds an exclusive lock on every table it touches.
+
+Lightweight operations — vacuum analyze, log backup, health check, update statistics — have no conflicts. They are safe to schedule at any time alongside other operations.
+
+For the HasConflict helper function that implements this matrix, see the lesson text.
+
+
+That is the end of Lesson 2: Data Models — Servers, Databases, and Operations.
+
+Return to the lesson page for the complete Go struct definitions, code examples, and the interactive quiz.

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Maintenance Operations Reference — SQL Server &amp; PostgreSQL</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .ref-page { max-width: 820px; margin: 0 auto; }
+    .engine-header {
+      display: flex; align-items: center; gap: 0.8rem;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-weight: 700; font-size: 1.15rem; margin: 2.5rem 0 0.8rem;
+    }
+    .badge-ss  { background: #cc2927; color:#fff; padding: 0.2em 0.7em; border-radius: 4px; font-size:0.72rem; font-weight:700; }
+    .badge-pg  { background: #336791; color:#fff; padding: 0.2em 0.7em; border-radius: 4px; font-size:0.72rem; font-weight:700; }
+    .section-rule { border: none; border-top: 2px solid var(--border); margin: 2.5rem 0 1.5rem; }
+    .op-name { font-family: monospace; font-size: 0.88rem; color: var(--accent); font-weight: 700; }
+    .when-tag { font-size: 0.75rem; color: var(--muted); font-family: sans-serif; text-transform:uppercase; letter-spacing:.04em; }
+    h2 { font-size: 1.15rem; }
+    h3 { font-size: 1rem; }
+    @media print { body { padding: 1rem; } }
+  </style>
+</head>
+<body>
+<div class="page ref-page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span>Maintenance Operations</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="go-concurrency-patterns.html">← Go Concurrency Patterns</a></span>
+  </div>
+
+  <h1>Maintenance Operations Reference</h1>
+  <p>The authoritative T-SQL and PostgreSQL commands run by the scheduler executors.
+     Sourced from
+     <a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql?view=sql-server-ver16" target="_blank">Microsoft Learn</a>
+     and
+     <a href="https://www.postgresql.org/docs/current/sql-vacuum.html" target="_blank">PostgreSQL Documentation</a>.</p>
+
+  <!-- ═══════════════════════ SQL SERVER ═══════════════════════ -->
+  <div class="engine-header"><span class="badge-ss">SQL SERVER</span> T-SQL Operations</div>
+
+  <!-- FULL BACKUP -->
+  <h3>Full Database Backup</h3>
+  <div class="when-tag">Operation type: <code>full_backup</code> · Requires maintenance window</div>
+  <pre><code>BACKUP DATABASE [$(db)]
+  TO DISK = N'$(path)\$(db)_$(date).bak'
+  WITH
+    COMPRESSION,           <span class="cm">-- reduces backup size 50–80%</span>
+    CHECKSUM,              <span class="cm">-- validates pages during backup</span>
+    STATS = 10,            <span class="cm">-- progress every 10%</span>
+    NAME = N'$(db) Full Backup $(date)',
+    DESCRIPTION = N'Scheduled by db-scheduler';</code></pre>
+
+  <table>
+    <thead><tr><th>Option</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><code>COMPRESSION</code></td><td>Reduces backup file size and I/O; default off pre-2008 Enterprise</td></tr>
+      <tr><td><code>CHECKSUM</code></td><td>Detects page corruption during backup; required for later restore verification</td></tr>
+      <tr><td><code>STATS = 10</code></td><td>Emits progress rows parseable by the executor for long-running backups</td></tr>
+    </tbody>
+  </table>
+
+  <hr class="section-rule">
+
+  <!-- LOG BACKUP -->
+  <h3>Transaction Log Backup</h3>
+  <div class="when-tag">Operation type: <code>log_backup</code> · Every 15–60 min on FULL recovery model</div>
+  <pre><code>BACKUP LOG [$(db)]
+  TO DISK = N'$(path)\$(db)_$(date).trn'
+  WITH COMPRESSION, CHECKSUM, STATS = 10;</code></pre>
+
+  <div class="callout warning">
+    <div class="label">SKIP CONDITION</div>
+    <p>Only execute on databases in <strong>FULL</strong> or <strong>BULK_LOGGED</strong> recovery model. A database in <strong>SIMPLE</strong> recovery model does not have a transaction log to back up — attempting this raises error 4214.</p>
+  </div>
+
+  <hr class="section-rule">
+
+  <!-- CHECKDB -->
+  <h3>Integrity Check (DBCC CHECKDB)</h3>
+  <div class="when-tag">Operation type: <code>integrity_check</code> · Requires maintenance window · Dynamic timeout</div>
+  <pre><code><span class="cm">-- Full check (weekly or monthly, large databases):</span>
+DBCC CHECKDB ([$(db)])
+  WITH NO_INFOMSGS, ALL_ERRORMSGS;
+
+<span class="cm">-- Physical-only check (nightly, large databases):</span>
+DBCC CHECKDB ([$(db)])
+  WITH PHYSICAL_ONLY, NO_INFOMSGS;
+
+<span class="cm">-- Estimate only — no actual I/O (pre-flight check):</span>
+DBCC CHECKDB ([$(db)])
+  WITH ESTIMATEONLY;</code></pre>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Duration</th><th>What it checks</th></tr></thead>
+    <tbody>
+      <tr><td><code>default</code></td><td>Hours on TB databases</td><td>Logical + physical consistency, all indexes</td></tr>
+      <tr><td><code>PHYSICAL_ONLY</code></td><td>~10× faster</td><td>Physical page structure only — misses logical errors</td></tr>
+      <tr><td><code>ESTIMATEONLY</code></td><td>Seconds</td><td>Returns estimated temp space needed, no actual checks</td></tr>
+    </tbody>
+  </table>
+
+  <hr class="section-rule">
+
+  <!-- INDEX REBUILD -->
+  <h3>Index Rebuild</h3>
+  <div class="when-tag">Operation type: <code>index_rebuild</code> · Requires maintenance window</div>
+  <pre><code><span class="cm">-- Rebuild all indexes on all tables (online, Enterprise only):</span>
+ALTER INDEX ALL ON [$(schema)].[$(table)]
+  REBUILD WITH (ONLINE = ON, SORT_IN_TEMPDB = ON);
+
+<span class="cm">-- Single index (for targeted rebuild):</span>
+ALTER INDEX [$(idx)] ON [$(schema)].[$(table)]
+  REBUILD WITH (ONLINE = ON);
+
+<span class="cm">-- Reorganize (lighter, no table lock, fragmentation 10–30%):</span>
+ALTER INDEX ALL ON [$(schema)].[$(table)]
+  REORGANIZE;</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHEN TO USE EACH</div>
+    <p><strong>REBUILD:</strong> fragmentation > 30% or heap tables. Takes exclusive lock (Standard) or online lock (Enterprise, <code>ONLINE=ON</code>).<br>
+    <strong>REORGANIZE:</strong> fragmentation 10–30%. Always online. Suitable during production hours.</p>
+  </div>
+
+  <hr class="section-rule">
+
+  <!-- UPDATE STATISTICS -->
+  <h3>Update Statistics</h3>
+  <div class="when-tag">Operation type: <code>update_stats</code> · Lightweight, safe during production</div>
+  <pre><code><span class="cm">-- Full scan of all statistics on all tables:</span>
+EXEC sp_updatestats;   <span class="cm">-- skips unchanged tables</span>
+
+<span class="cm">-- Full scan of a specific table (accurate, slow):</span>
+UPDATE STATISTICS [$(schema)].[$(table)] WITH FULLSCAN;
+
+<span class="cm">-- Sampled (faster, less accurate):</span>
+UPDATE STATISTICS [$(schema)].[$(table)] WITH SAMPLE 30 PERCENT;</code></pre>
+
+  <!-- ═══════════════════════ POSTGRESQL ═══════════════════════ -->
+  <div class="engine-header" style="margin-top:3rem;"><span class="badge-pg">POSTGRESQL</span> SQL Operations</div>
+
+  <!-- VACUUM -->
+  <h3>VACUUM</h3>
+  <div class="when-tag">Operation type: <code>vacuum</code> · Safe during production · Skips locked tables</div>
+  <pre><code><span class="cm">-- Routine vacuum + stats update (does NOT reclaim disk space):</span>
+VACUUM ANALYZE;            <span class="cm">-- entire database</span>
+VACUUM ANALYZE $(table);   <span class="cm">-- single table</span>
+
+<span class="cm">-- Full vacuum — reclaims disk space, acquires exclusive lock:</span>
+VACUUM FULL ANALYZE $(table);  <span class="cm">-- requires maintenance window</span>
+
+<span class="cm">-- Skip locked tables (safe for background scheduling):</span>
+VACUUM (SKIP_LOCKED) $(table);</code></pre>
+
+  <table>
+    <thead><tr><th>Command</th><th>Reclaims disk?</th><th>Lock?</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>VACUUM ANALYZE</code></td><td>No (marks dead rows)</td><td>ShareUpdateExclusiveLock</td><td>Routine — nightly on high-churn tables</td></tr>
+      <tr><td><code>VACUUM FULL</code></td><td>Yes (rewrites table)</td><td>AccessExclusiveLock</td><td>Table bloat > 30% — maintenance window only</td></tr>
+      <tr><td><code>VACUUM (SKIP_LOCKED)</code></td><td>No</td><td>None if locked</td><td>Production hours — skip busy tables silently</td></tr>
+    </tbody>
+  </table>
+
+  <hr class="section-rule">
+
+  <!-- REINDEX -->
+  <h3>REINDEX</h3>
+  <div class="when-tag">Operation type: <code>index_rebuild</code> · Requires maintenance window (CONCURRENTLY is safer)</div>
+  <pre><code><span class="cm">-- Rebuild all indexes in a database (locks each table in turn):</span>
+REINDEX DATABASE $(db);
+
+<span class="cm">-- Rebuild all indexes on one table:</span>
+REINDEX TABLE $(schema).$(table);
+
+<span class="cm">-- Rebuild concurrently — no exclusive lock (PostgreSQL 12+):</span>
+REINDEX TABLE CONCURRENTLY $(schema).$(table);
+
+<span class="cm">-- Single index concurrently:</span>
+REINDEX INDEX CONCURRENTLY $(schema).$(idx);</code></pre>
+
+  <div class="callout warning">
+    <div class="label">GOTCHA — REINDEX DATABASE</div>
+    <p><code>REINDEX DATABASE</code> cannot use <code>CONCURRENTLY</code>. For production fleets, iterate over tables and call <code>REINDEX TABLE CONCURRENTLY</code> per table instead. The executor should fetch the table list first and loop.</p>
+  </div>
+
+  <hr class="section-rule">
+
+  <!-- ANALYZE -->
+  <h3>ANALYZE</h3>
+  <div class="when-tag">Operation type: <code>update_stats</code> · Very lightweight · Safe during production</div>
+  <pre><code><span class="cm">-- Update statistics for all tables in current database:</span>
+ANALYZE VERBOSE;
+
+<span class="cm">-- Single table:</span>
+ANALYZE $(schema).$(table);
+
+<span class="cm">-- Specific columns (targeted after a bulk insert):</span>
+ANALYZE $(schema).$(table) (col1, col2);</code></pre>
+
+  <hr class="section-rule">
+
+  <!-- PG_DUMP -->
+  <h3>Logical Backup (pg_dump)</h3>
+  <div class="when-tag">Operation type: <code>full_backup</code> · Shell command, not SQL · Dynamic timeout by size</div>
+  <pre><code><span class="cm">// Go executor runs pg_dump as an os/exec command:</span>
+cmd := exec.<span class="fn">CommandContext</span>(ctx,
+    <span class="st">"pg_dump"</span>,
+    <span class="st">"--host"</span>, server.Hostname,
+    <span class="st">"--port"</span>, strconv.<span class="fn">Itoa</span>(server.Port),
+    <span class="st">"--username"</span>, creds.User,
+    <span class="st">"--dbname"</span>, db.Name,
+    <span class="st">"--format=custom"</span>,         <span class="cm">// compressed, parallel-restore capable</span>
+    <span class="st">"--compress=6"</span>,            <span class="cm">// gzip level 6</span>
+    <span class="st">"--file"</span>, backupPath,
+    <span class="st">"--verbose"</span>,               <span class="cm">// enables progress parsing</span>
+)
+cmd.Env = append(os.Environ(), <span class="st">"PGPASSWORD="</span>+creds.Password)</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY NOT EXECUTE pg_dump OVER SQL?</div>
+    <p>Unlike SQL Server's <code>BACKUP DATABASE</code>, PostgreSQL does not have a built-in SQL backup command. <code>pg_dump</code> is a client-side binary that reads data over a normal connection. The executor must shell out — <code>os/exec.CommandContext</code> — so the dynamic context timeout also kills the shell process.</p>
+  </div>
+
+  <hr class="section-rule">
+
+  <!-- CONFLICT MATRIX -->
+  <h2>Conflict Matrix — Both Engines</h2>
+  <p>Two operations conflict if running them simultaneously on the same database is unsafe or counterproductive.</p>
+
+  <table>
+    <thead>
+      <tr><th>Operation A</th><th>Operation B</th><th>Conflict?</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>full_backup</code></td><td><code>integrity_check</code></td><td>Yes</td><td>Both are I/O-intensive; combined load can timeout both</td></tr>
+      <tr><td><code>full_backup</code></td><td><code>index_rebuild</code></td><td>Yes</td><td>Index rebuild invalidates pages mid-backup on some engines</td></tr>
+      <tr><td><code>integrity_check</code></td><td><code>index_rebuild</code></td><td>Yes</td><td>Rebuild changes structures that CHECKDB is validating</td></tr>
+      <tr><td><code>full_backup</code></td><td><code>log_backup</code></td><td>No</td><td>Log backups are designed to run alongside full backups</td></tr>
+      <tr><td><code>vacuum</code></td><td><code>update_stats</code></td><td>No</td><td><code>VACUUM ANALYZE</code> already includes stats update</td></tr>
+      <tr><td><code>index_rebuild</code></td><td><code>update_stats</code></td><td>Yes</td><td>Rebuild rebuilds stats anyway; running both is redundant and I/O-heavy</td></tr>
+    </tbody>
+  </table>
+
+  <p style="font-size:0.8rem; color: var(--muted); font-family: sans-serif; margin-top:2rem;">
+    Sources:
+    <a href="https://learn.microsoft.com/en-us/sql/t-sql/statements/backup-transact-sql?view=sql-server-ver16">Microsoft Learn — BACKUP</a> ·
+    <a href="https://learn.microsoft.com/en-us/sql/t-sql/database-console-commands/dbcc-checkdb-transact-sql">Microsoft Learn — DBCC CHECKDB</a> ·
+    <a href="https://www.postgresql.org/docs/current/sql-vacuum.html">PostgreSQL — VACUUM</a> ·
+    <a href="https://www.postgresql.org/docs/current/sql-reindex.html">PostgreSQL — REINDEX</a>
+  </p>
+
+</div>
+</body>
+</html>
