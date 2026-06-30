@@ -19,8 +19,8 @@
   // ── Configuration ──────────────────────────────────────────────
   // Local dev:
   // const AUDIO_BASE = '../audio/';
-  // Production: audio served by Dokploy audio-http container from NAS
-  const AUDIO_BASE = 'http://100.83.220.97:8765/tutorials/go-db-scheduler/audio/';
+  // Production: audio served via Dokploy HTTPS on /audio path
+  const AUDIO_BASE = 'https://dokploy.tail48fe8.ts.net/audio/tutorials/go-db-scheduler/audio/';
   // ───────────────────────────────────────────────────────────────
 
   const STYLES = `
