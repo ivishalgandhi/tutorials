@@ -1,5 +1,5 @@
 .devin/
 .DS_Store
 # Audio files — generated locally and stored on NAS, not committed to git
-tutorials/go-db-scheduler/audio/*.mp3
-tutorials/go-db-scheduler/audio/*.aiff
+go-db-scheduler/audio/*.mp3
+go-db-scheduler/audio/*.aiff
