@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostgreSQL Security — End to End</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .course-index { max-width: 760px; margin: 0 auto; }
+
+    .lesson-list { list-style: none; padding: 0; display: grid; gap: 0.8rem; margin-top: 1.5rem; }
+    .lesson-list li a {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      padding: 1rem 1.2rem;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      color: inherit;
+      transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .lesson-list li a:hover {
+      box-shadow: 0 3px 12px rgba(0,0,0,0.07);
+      border-color: var(--accent);
+    }
+    .lesson-num {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: #fff;
+      background: var(--security);
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .lesson-title  { font-weight: 600; font-size: 0.95rem; }
+    .lesson-topics { font-size: 0.82rem; color: var(--muted); margin-top: 0.15rem; }
+
+    .back-link {
+      display: inline-block;
+      margin-bottom: 1.5rem;
+      font-size: 0.85rem;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    .ref-section { margin-top: 2.5rem; }
+    .ref-section h2 { font-size: 1.05rem; margin-bottom: 0.8rem; }
+    .ref-list { list-style: none; padding: 0; display: grid; gap: 0.6rem; }
+    .ref-list li a {
+      display: flex;
+      align-items: center;
+      gap: 0.9rem;
+      padding: 0.85rem 1.2rem;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      color: inherit;
+      transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .ref-list li a:hover {
+      box-shadow: 0 3px 12px rgba(0,0,0,0.07);
+      border-color: var(--accent);
+    }
+    .ref-badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: #fff;
+      background: var(--elephant);
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .ref-title  { font-weight: 600; font-size: 0.93rem; }
+    .ref-topics { font-size: 0.82rem; color: var(--muted); margin-top: 0.12rem; }
+  </style>
+</head>
+<body>
+<div class="page course-index">
+
+  <a class="back-link" href="../index.html">← All Courses</a>
+
+  <div class="lesson-meta">
+    <span class="tag">Course</span>
+    <span>PostgreSQL Security — End to End</span>
+    <span>11 lessons · ~4.5 hours</span>
+    <span><a href="reference/glossary.html">Glossary</a></span>
+    <span><a href="reference/quick-reference.html">Quick Reference</a></span>
+  </div>
+
+  <h1>PostgreSQL Security — End to End</h1>
+
+  <p style="margin: 1rem 0 0.5rem">
+    Master PostgreSQL security from a SQL Server DBA's perspective. Every lesson maps PostgreSQL
+    concepts to their SQL Server equivalents and flags where the two diverge. Work through the
+    lessons in order — authentication first, then roles, then hardening.
+  </p>
+
+  <ul class="lesson-list">
+
+    <li>
+      <a href="lessons/0001-pg-hba-conf.html">
+        <div>
+          <span class="lesson-num">01</span>
+          <span class="lesson-title">pg_hba.conf — Authentication Configuration</span>
+          <div class="lesson-topics">Rule structure · auth methods · first-match semantics · reload without restart · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0002-ldap-authentication.html">
+        <div>
+          <span class="lesson-num">02</span>
+          <span class="lesson-title">LDAP Authentication &amp; Active Directory Integration</span>
+          <div class="lesson-topics">Simple bind vs search+bind · ldapbinddn · sAMAccountName · AD integration · ~20 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0003-postgresql-conf-security.html">
+        <div>
+          <span class="lesson-num">03</span>
+          <span class="lesson-title">postgresql.conf Security Parameters</span>
+          <div class="lesson-topics">SSL GUCs · listen_addresses · password_encryption · log parameters · ~20 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0004-roles-and-privileges.html">
+        <div>
+          <span class="lesson-num">04</span>
+          <span class="lesson-title">Roles and Privileges</span>
+          <div class="lesson-topics">LOGIN vs NOLOGIN · GRANT/REVOKE · ALTER DEFAULT PRIVILEGES · public schema fix · ~30 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0005-custom-role-composition.html">
+        <div>
+          <span class="lesson-num">05</span>
+          <span class="lesson-title">Custom Roles and Role Composition</span>
+          <div class="lesson-topics">Role hierarchy · INHERIT / NOINHERIT · SET ROLE · auditing membership · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0006-cicd-service-accounts.html">
+        <div>
+          <span class="lesson-num">06</span>
+          <span class="lesson-title">CI/CD Service Account Patterns</span>
+          <div class="lesson-topics">migration_role · app_role · readonly_role · password rotation · REVOKE CONNECT · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0007-row-level-security.html">
+        <div>
+          <span class="lesson-num">07</span>
+          <span class="lesson-title">Row-Level Security</span>
+          <div class="lesson-topics">CREATE POLICY · USING vs WITH CHECK · BYPASSRLS · PERMISSIVE vs RESTRICTIVE · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0008-schema-security.html">
+        <div>
+          <span class="lesson-num">08</span>
+          <span class="lesson-title">Schema Security</span>
+          <div class="lesson-topics">search_path hijacking · SECURITY DEFINER risks · pg_temp attack · hardening · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0009-ssl-tls.html">
+        <div>
+          <span class="lesson-num">09</span>
+          <span class="lesson-title">SSL/TLS — Encrypting Data in Transit</span>
+          <div class="lesson-topics">hostssl · sslmode · mTLS · pg_stat_ssl · client certificates · ~20 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0010-auditing-pgaudit.html">
+        <div>
+          <span class="lesson-num">10</span>
+          <span class="lesson-title">Auditing and Logging — pgaudit</span>
+          <div class="lesson-topics">Session vs object audit · pgaudit.log · log parameters · SQL Server Audit mapping · ~25 min</div>
+        </div>
+      </a>
+    </li>
+
+    <li>
+      <a href="lessons/0011-hardening-checklist.html">
+        <div>
+          <span class="lesson-num">11</span>
+          <span class="lesson-title">The Hardening Checklist</span>
+          <div class="lesson-topics">7 categories · verification queries · 5 things SQL Server DBAs always miss · ~30 min</div>
+        </div>
+      </a>
+    </li>
+
+  </ul>
+
+  <div class="ref-section">
+    <h2>Reference Documents</h2>
+    <ul class="ref-list">
+      <li>
+        <a href="reference/glossary.html">
+          <div>
+            <span class="ref-badge">Ref</span>
+            <span class="ref-title">PostgreSQL Security Glossary</span>
+            <div class="ref-topics">25 terms — definitions, syntax examples, SQL Server equivalents</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="reference/quick-reference.html">
+          <div>
+            <span class="ref-badge">Ref</span>
+            <span class="ref-title">15 Commands Every DBA Must Memorise</span>
+            <div class="ref-topics">One-page cheat sheet — printable two-column card layout</div>
+          </div>
+        </a>
+      </li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>

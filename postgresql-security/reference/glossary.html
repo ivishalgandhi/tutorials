@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostgreSQL Security Glossary</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    dl { margin: 0; }
+
+    dt {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-weight: 700;
+      font-size: 1.05rem;
+      margin-top: 2rem;
+      padding-top: 1rem;
+      border-top: 1px solid #d8d4cc;
+      color: #1e3a5f;
+      display: flex;
+      align-items: baseline;
+      gap: 0.6em;
+      flex-wrap: wrap;
+    }
+
+    dt:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+
+    dt .term-anchor {
+      font-size: 0.68rem;
+      color: #aaa;
+      font-weight: 400;
+      text-decoration: none;
+      border-bottom: none;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    dt:hover .term-anchor { opacity: 1; }
+
+    dd {
+      margin: 0.5em 0 0 1.5em;
+      font-size: 0.95rem;
+    }
+    dd p { margin: 0.4em 0; }
+    dd pre { margin: 0.7em 0; }
+
+    .jump-links {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.85rem;
+      display: flex;
+      gap: 0.5em;
+      flex-wrap: wrap;
+      margin: 1.5em 0 2.5em;
+    }
+
+    .jump-links a {
+      display: inline-block;
+      padding: 0.2em 0.6em;
+      background: #f3f2ee;
+      border: 1px solid #d8d4cc;
+      border-radius: 4px;
+      color: #1a56db;
+      font-weight: 600;
+      text-decoration: none;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .jump-links a:hover {
+      background: #e8e6e0;
+      border-color: #b8b4ac;
+    }
+
+    .alpha-section {
+      margin-top: 3rem;
+    }
+
+    .alpha-heading {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      color: #888;
+      padding: 0.3em 0.7em;
+      background: #f3f2ee;
+      border: 1px solid #d8d4cc;
+      border-radius: 4px;
+      display: inline-block;
+      margin-bottom: 0.5rem;
+    }
+
+    .back-to-top {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.82rem;
+      margin-top: 3.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid #d8d4cc;
+      color: #888;
+    }
+    .back-to-top a { color: #1a56db; }
+
+    .term-count {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.8rem;
+      color: #888;
+      margin-bottom: 0.5rem;
+    }
+
+    @media print {
+      .jump-links { display: none; }
+      .back-to-top { display: none; }
+      dt { break-after: avoid; }
+      dd { break-inside: avoid; }
+      .alpha-section { break-before: auto; }
+    }
+  </style>
+</head>
+<body>
+<div class="page" id="top">
+
+  <!-- ── Header ── -->
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span>PostgreSQL Security</span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>PostgreSQL Security Glossary</h1>
+  <p class="term-count">25 terms &mdash; alphabetical &mdash; each with PostgreSQL syntax and SQL Server equivalent</p>
+
+  <!-- ── Jump links ── -->
+  <nav class="jump-links" aria-label="Jump to letter">
+    <a href="#section-b">B</a>
+    <a href="#section-g">G</a>
+    <a href="#section-i">I</a>
+    <a href="#section-l">L</a>
+    <a href="#section-m">M</a>
+    <a href="#section-n">N</a>
+    <a href="#section-p">P</a>
+    <a href="#section-r">R</a>
+    <a href="#section-s">S</a>
+    <a href="#section-t">T</a>
+    <a href="#section-w">W</a>
+  </nav>
+
+  <!-- ══════════════════════════════════════════════════════════
+       B
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-b">
+    <span class="alpha-heading">B</span>
+    <dl>
+
+      <dt id="bypassrls">
+        BYPASSRLS
+        <a class="term-anchor" href="#bypassrls">#</a>
+      </dt>
+      <dd>
+        <p>Role attribute that skips all row-level security policies. Even with RLS enabled on a table, a role with <code>BYPASSRLS</code> sees all rows unconditionally. Superusers have this implicitly and cannot lose it via <code>NOBYPASSRLS</code>.</p>
+        <pre><code><span class="cm">-- Grant the bypass attribute to a role:</span>
+<span class="kw">ALTER ROLE</span> dba_auditor <span class="kw">BYPASSRLS</span>;
+
+<span class="cm">-- Confirm:</span>
+<span class="kw">SELECT</span> rolname, rolbypassrls
+<span class="kw">FROM</span> pg_roles
+<span class="kw">WHERE</span> rolbypassrls = <span class="kw">true</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>No exact equivalent. The <code>sysadmin</code> fixed server role implicitly bypasses all security predicates, but there is no fine-grained, per-role bypass attribute you can grant. You cannot give a non-sysadmin the ability to skip RLS while leaving other restrictions in place.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       G
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-g">
+    <span class="alpha-heading">G</span>
+    <dl>
+
+      <dt id="guc">
+        GUC <em style="font-weight:400; font-size:0.88rem; color:#555;">(Grand Unified Configuration)</em>
+        <a class="term-anchor" href="#guc">#</a>
+      </dt>
+      <dd>
+        <p>PostgreSQL term for any server configuration parameter settable via <code>postgresql.conf</code>, <code>ALTER SYSTEM SET</code>, or <code>SET</code>. Each GUC has a <strong>context</strong> that determines the minimum action required to apply a change:</p>
+        <ul>
+          <li><strong>postmaster</strong> — server restart required</li>
+          <li><strong>sighup</strong> — <code>SELECT pg_reload_conf()</code> sufficient</li>
+          <li><strong>user</strong> — session-level, effective immediately via <code>SET</code></li>
+        </ul>
+        <pre><code><span class="cm">-- Browse all GUCs and their current values:</span>
+<span class="kw">SHOW</span> all;
+<span class="kw">SELECT</span> name, setting, context, short_desc
+<span class="kw">FROM</span> pg_settings
+<span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">'%ssl%'</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>sp_configure</code> options + <code>RECONFIGURE</code>. SQL Server also distinguishes advanced options (requiring <code>show advanced options = 1</code>) but has no equivalent to session-level GUC overrides per role or per database.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       I
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-i">
+    <span class="alpha-heading">I</span>
+    <dl>
+
+      <dt id="inherit">
+        INHERIT / NOINHERIT
+        <a class="term-anchor" href="#inherit">#</a>
+      </dt>
+      <dd>
+        <p>Role attribute controlling whether privileges granted to a role flow automatically to member roles. <strong>INHERIT</strong> is the default: if <code>alice</code> is a member of <code>readonly_role</code>, she immediately has all of <code>readonly_role</code>'s privileges without any extra step. <strong>NOINHERIT</strong> breaks that automatic flow — <code>alice</code> must issue <code>SET ROLE readonly_role</code> explicitly to activate the privileges. Useful for high-privilege roles that should require conscious activation.</p>
+        <pre><code><span class="cm">-- Create a group role with privileges:</span>
+<span class="kw">CREATE ROLE</span> readonly_role <span class="kw">NOLOGIN</span>;
+<span class="kw">GRANT</span> <span class="kw">SELECT ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- alice inherits automatically (default INHERIT):</span>
+<span class="kw">GRANT</span> readonly_role <span class="kw">TO</span> alice;
+
+<span class="cm">-- bob must SET ROLE first (NOINHERIT on bob):</span>
+<span class="kw">ALTER ROLE</span> bob <span class="kw">NOINHERIT</span>;
+<span class="kw">GRANT</span> readonly_role <span class="kw">TO</span> bob;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>No equivalent — SQL Server fixed and user-defined database roles always inherit automatically. There is no mechanism to require a user to explicitly activate a role's permissions within a session.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       L
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-l">
+    <span class="alpha-heading">L</span>
+    <dl>
+
+      <dt id="listen-addresses">
+        listen_addresses
+        <a class="term-anchor" href="#listen-addresses">#</a>
+      </dt>
+      <dd>
+        <p>GUC controlling which IP interfaces PostgreSQL binds to when accepting connections. Set in <code>postgresql.conf</code>. Requires a server restart (postmaster context). The most secure setting is <code>'localhost'</code> — the instance is only reachable from the host itself. Setting <code>'*'</code> opens every network interface and should be combined with strict <code>pg_hba.conf</code> rules.</p>
+        <pre><code><span class="cm">-- In postgresql.conf — safest for internal-only instances:</span>
+listen_addresses = <span class="st">'localhost'</span>
+
+<span class="cm">-- All interfaces (requires tight pg_hba.conf rules):</span>
+listen_addresses = <span class="st">'*'</span>
+
+<span class="cm">-- Check current value:</span>
+<span class="kw">SHOW</span> listen_addresses;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>TCP/IP protocol binding configured in <strong>SQL Server Configuration Manager &rarr; SQL Server Network Configuration &rarr; Protocols for [instance] &rarr; TCP/IP &rarr; IP Addresses</strong>. SQL Server DBAs typically manage this via SSCM rather than a text file.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       M
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-m">
+    <span class="alpha-heading">M</span>
+    <dl>
+
+      <dt id="md5-auth">
+        md5 auth
+        <a class="term-anchor" href="#md5-auth">#</a>
+      </dt>
+      <dd>
+        <p><code>pg_hba.conf</code> authentication method that stores passwords as an unsalted MD5 hash of <code>password + username</code>. Deprecated since PostgreSQL 14. Because the hash is deterministic and unsalted, it is vulnerable to offline dictionary attacks and rainbow table lookups. Any captured hash can be cracked independently of the server. Replace with <a href="#scram-sha-256"><code>scram-sha-256</code></a>.</p>
+        <pre><code><span class="cm">-- Identify remaining md5-hashed passwords:</span>
+<span class="kw">SELECT</span> rolname, rolpassword
+<span class="kw">FROM</span> pg_authid
+<span class="kw">WHERE</span> rolpassword <span class="kw">LIKE</span> <span class="st">'md5%'</span>;
+
+<span class="cm">-- Force new passwords to use scram-sha-256:</span>
+<span class="kw">ALTER SYSTEM SET</span> password_encryption = <span class="st">'scram-sha-256'</span>;
+<span class="kw">SELECT</span> pg_reload_conf();</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>SQL Authentication with older compatibility levels — SQL Server's internal hashing has evolved across versions but is opaque to the DBA. Microsoft's parallel recommendation is to prefer Windows Authentication (Kerberos/NTLM) over SQL Auth for the same reasons: password-based hashes are inherently weaker than ticket-based auth.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       N
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-n">
+    <span class="alpha-heading">N</span>
+    <dl>
+
+      <dt id="nologin-role">
+        NOLOGIN role
+        <a class="term-anchor" href="#nologin-role">#</a>
+      </dt>
+      <dd>
+        <p>A role without the <code>LOGIN</code> attribute. Cannot connect to the database directly — attempting to do so returns an error. The canonical pattern for a <strong>permission group</strong>: grant the group role a set of privileges, then grant membership in that group to one or more login roles. Members inherit permissions without the group role ever needing to authenticate.</p>
+        <pre><code><span class="cm">-- Create a permission group:</span>
+<span class="kw">CREATE ROLE</span> readonly_group <span class="kw">NOLOGIN</span>;
+<span class="kw">GRANT</span> <span class="kw">SELECT ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_group;
+
+<span class="cm">-- Grant the group to a login role:</span>
+<span class="kw">CREATE ROLE</span> reporting_user <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span>;
+<span class="kw">GRANT</span> readonly_group <span class="kw">TO</span> reporting_user;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>CREATE ROLE role_name</code> in SQL Server creates a database role with no password that cannot log in — the direct equivalent. Assigning a user to the role (<code>ALTER ROLE role_name ADD MEMBER user_name</code>) mirrors the PostgreSQL <code>GRANT group TO user</code> pattern.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       P
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-p">
+    <span class="alpha-heading">P</span>
+    <dl>
+
+      <dt id="peer-auth">
+        peer auth
+        <a class="term-anchor" href="#peer-auth">#</a>
+      </dt>
+      <dd>
+        <p><code>pg_hba.conf</code> auth method available only for local Unix socket connections. PostgreSQL asks the operating system which user owns the connecting process (via <code>SO_PEERCRED</code> or equivalent). If the OS username matches the PostgreSQL role name, the connection is accepted with no password. Commonly used for the <code>postgres</code> superuser on the database server itself.</p>
+        <pre><code><span class="cm">-- Typical pg_hba.conf entry for peer auth:</span>
+local   all   postgres   peer
+
+<span class="cm">-- Verify how postgres OS user connects:</span>
+<span class="cm">-- (from the server shell as OS user 'postgres')</span>
+psql -U postgres   <span class="cm">-- succeeds via peer, no password needed</span></code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>Windows Integrated Authentication on local connections — but SQL Server uses a Kerberos or NTLM ticket rather than directly checking OS process ownership. The result is similar (no explicit password), but the mechanism differs: Windows Authentication validates a domain identity, while peer validates local OS process ownership.</p>
+        </div>
+      </dd>
+
+      <dt id="pg-auth-members">
+        pg_auth_members
+        <a class="term-anchor" href="#pg-auth-members">#</a>
+      </dt>
+      <dd>
+        <p>System catalog table (not a view) recording every role-membership relationship: which role is granted to which member, whether the grant includes <code>ADMIN OPTION</code> (ability to re-grant), and who granted it. The authoritative source for the PostgreSQL role hierarchy.</p>
+        <pre><code><span class="cm">-- Human-readable role membership tree:</span>
+<span class="kw">SELECT</span>
+  r.rolname  <span class="kw">AS</span> role,
+  m.rolname  <span class="kw">AS</span> member,
+  a.admin_option
+<span class="kw">FROM</span>  pg_auth_members a
+<span class="kw">JOIN</span>  pg_roles r  <span class="kw">ON</span> r.oid = a.roleid
+<span class="kw">JOIN</span>  pg_roles m  <span class="kw">ON</span> m.oid = a.member
+<span class="kw">ORDER BY</span> r.rolname, m.rolname;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>sys.database_role_members</code> (database-scoped role memberships) + <code>sys.server_role_members</code> (server-scoped role memberships). Unlike PostgreSQL, SQL Server separates server-level and database-level role membership into different catalogs.</p>
+        </div>
+      </dd>
+
+      <dt id="pg-hba-conf">
+        pg_hba.conf
+        <a class="term-anchor" href="#pg-hba-conf">#</a>
+      </dt>
+      <dd>
+        <p>The <strong>host-based authentication file</strong> — the complete authentication decision engine for PostgreSQL. Every incoming connection is matched against its rules top-to-bottom; the <em>first matching rule wins</em> and its auth method is applied. No subsequent rules are evaluated. Rules specify connection type (<code>local</code>, <code>host</code>, <code>hostssl</code>, <code>hostnossl</code>), database name, role name, client IP/CIDR, and auth method (<code>scram-sha-256</code>, <code>md5</code>, <code>peer</code>, <code>trust</code>, <code>reject</code>, <code>ldap</code>, etc.).</p>
+        <pre><code><span class="cm">-- Find the file location:</span>
+<span class="kw">SHOW</span> hba_file;
+
+<span class="cm">-- Inspect loaded rules without opening the file:</span>
+<span class="kw">SELECT</span> type, database, user_name, address, auth_method
+<span class="kw">FROM</span>  pg_hba_file_rules;
+
+<span class="cm">-- Reload after editing (no restart needed):</span>
+<span class="kw">SELECT</span> pg_reload_conf();</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>No single equivalent file. SQL Server authentication mode (Windows-only vs. Mixed Mode) is set in <strong>Server Properties &rarr; Security</strong> and applies globally. Individual login rules are properties of each login object, not entries in a routing file. There is no equivalent to per-database, per-IP, per-method routing in a single config file.</p>
+        </div>
+      </dd>
+
+      <dt id="pgaudit">
+        pgaudit
+        <a class="term-anchor" href="#pgaudit">#</a>
+      </dt>
+      <dd>
+        <p>PostgreSQL extension providing structured, object-level audit logging suitable for compliance requirements (PCI-DSS, HIPAA, SOC 2). Produces <code>AUDIT:</code> log lines that include the audit class, object type, object name, and full statement text. Operates in two modes:</p>
+        <ul>
+          <li><strong>SESSION</strong> — logs all statements matching a class (READ, WRITE, DDL, ROLE, FUNCTION, MISC) for the session</li>
+          <li><strong>OBJECT</strong> — logs statements that access objects visible to a designated audit role</li>
+        </ul>
+        <pre><code><span class="cm">-- postgresql.conf (restart required):</span>
+shared_preload_libraries = <span class="st">'pgaudit'</span>
+pgaudit.log = <span class="st">'write, ddl'</span>
+pgaudit.log_catalog = off   <span class="cm">-- reduce noise from system catalogs</span>
+
+<span class="cm">-- Per-role override (effective after reconnect):</span>
+<span class="kw">ALTER ROLE</span> sensitive_user <span class="kw">SET</span> pgaudit.log = <span class="st">'all'</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>SQL Server Audit (introduced in SQL Server 2008) with <code>CREATE SERVER AUDIT</code>, <code>CREATE DATABASE AUDIT SPECIFICATION</code>, and <code>CREATE SERVER AUDIT SPECIFICATION</code>. Extended Events also covers many audit scenarios. SQL Server Audit is built into the engine; pgaudit requires explicit installation and preloading.</p>
+        </div>
+      </dd>
+
+      <dt id="pg-roles">
+        pg_roles
+        <a class="term-anchor" href="#pg-roles">#</a>
+      </dt>
+      <dd>
+        <p>System catalog view of all roles and their attributes. A safe, redacted view of <code>pg_authid</code> (the underlying catalog) — password hashes are masked. Key columns: <code>rolsuper</code>, <code>rolcreatedb</code>, <code>rolcreaterole</code>, <code>rolcanlogin</code>, <code>rolbypassrls</code>, <code>rolinherit</code>, <code>rolconnlimit</code>, <code>rolvaliduntil</code>.</p>
+        <pre><code><span class="cm">-- All roles with their key security attributes:</span>
+<span class="kw">SELECT</span> rolname, rolsuper, rolcreaterole, rolcreatedb,
+       rolcanlogin, rolbypassrls, rolconnlimit,
+       rolvaliduntil
+<span class="kw">FROM</span>  pg_roles
+<span class="kw">ORDER BY</span> rolsuper <span class="kw">DESC</span>, rolname;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>sys.server_principals</code> (server-level logins and server roles) + <code>sys.database_principals</code> (database users and database roles). Unlike PostgreSQL's unified role model, SQL Server maintains a strict server/database hierarchy with separate catalogs at each level.</p>
+        </div>
+      </dd>
+
+      <dt id="pg-stat-ssl">
+        pg_stat_ssl
+        <a class="term-anchor" href="#pg-stat-ssl">#</a>
+      </dt>
+      <dd>
+        <p>System view showing the SSL/TLS status of every currently active connection. One row per connection. Critical columns: <code>ssl</code> (bool — is this connection encrypted?), <code>version</code> (TLS version string), <code>cipher</code>, <code>bits</code> (key length), <code>client_dn</code> (client certificate DN if mutual TLS is used). Any row with <code>ssl = false</code> is a cleartext connection in production — treat it as a finding.</p>
+        <pre><code><span class="cm">-- Audit all active connections for encryption status:</span>
+<span class="kw">SELECT</span> pid, ssl, version, cipher, bits, client_dn
+<span class="kw">FROM</span>  pg_stat_ssl
+<span class="kw">ORDER BY</span> ssl <span class="kw">DESC</span>, pid;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>sys.dm_exec_connections</code> — the <code>encrypt_option</code> column shows whether encryption is active for each connection (<code>TRUE</code>, <code>FALSE</code>, or <code>NOT SUPPORTED</code>). Equivalent in purpose; SQL Server uses the DMV (Dynamic Management View) pattern rather than a static system view.</p>
+        </div>
+      </dd>
+
+      <dt id="permissive-policy">
+        PERMISSIVE policy
+        <a class="term-anchor" href="#permissive-policy">#</a>
+      </dt>
+      <dd>
+        <p>An RLS policy type where PostgreSQL applies <strong>OR logic</strong> across all matching permissive policies on a table: if <em>any</em> permissive policy's <code>USING</code> expression evaluates to true for a row, that row is visible. This is the default policy type when <code>AS PERMISSIVE</code> (or nothing) is specified. Multiple permissive policies effectively expand access — the row only needs to pass one of them.</p>
+        <pre><code><span class="cm">-- Two permissive policies: OR logic applies</span>
+<span class="cm">-- Rows visible if owned by current user OR public</span>
+<span class="kw">CREATE POLICY</span> own_rows <span class="kw">ON</span> documents
+  <span class="kw">AS PERMISSIVE FOR SELECT TO</span> app_role
+  <span class="kw">USING</span> (owner_id = current_user_id());
+
+<span class="kw">CREATE POLICY</span> public_rows <span class="kw">ON</span> documents
+  <span class="kw">AS PERMISSIVE FOR SELECT TO</span> app_role
+  <span class="kw">USING</span> (is_public = <span class="kw">true</span>);</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>FILTER PREDICATE in a SQL Server security policy always uses union/OR logic across rows — all rows passing <em>any</em> predicate evaluation are included. SQL Server does not distinguish between permissive and restrictive predicates for FILTER operations.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       R
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-r">
+    <span class="alpha-heading">R</span>
+    <dl>
+
+      <dt id="restrictive-policy">
+        RESTRICTIVE policy
+        <a class="term-anchor" href="#restrictive-policy">#</a>
+      </dt>
+      <dd>
+        <p>An RLS policy type where <strong>ALL</strong> restrictive policies must pass (AND logic), in addition to at least one permissive policy passing. A restrictive policy can only reduce access, never expand it. Use restrictive policies to enforce hard constraints — such as a time window, a tenant boundary, or a data classification — that no permissive policy can override.</p>
+        <pre><code><span class="cm">-- Hard constraint: only active tenants, regardless of</span>
+<span class="cm">-- what permissive policies allow</span>
+<span class="kw">CREATE POLICY</span> active_tenant_only <span class="kw">ON</span> orders
+  <span class="kw">AS RESTRICTIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (
+    <span class="kw">EXISTS</span> (
+      <span class="kw">SELECT</span> 1 <span class="kw">FROM</span> tenants
+      <span class="kw">WHERE</span> id = tenant_id <span class="kw">AND</span> active = <span class="kw">true</span>
+    )
+  );</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>BLOCK PREDICATE with <code>AFTER INSERT</code> / <code>AFTER UPDATE</code> is partially equivalent — it blocks writes regardless of other predicates. SQL Server has no direct equivalent to a restrictive filter on SELECT/DELETE. The AND-across-all-policies semantic is unique to PostgreSQL.</p>
+        </div>
+      </dd>
+
+      <dt id="row-security-guc">
+        row_security GUC
+        <a class="term-anchor" href="#row-security-guc">#</a>
+      </dt>
+      <dd>
+        <p>Session-level GUC that must be <code>on</code> for RLS policies to be enforced. If set to <code>off</code>, all RLS policies on all tables are bypassed — effectively making every user a BYPASSRLS role for the duration of the session. Should always be <code>on</code> in production. Can be set per-role with <code>ALTER ROLE</code> to ensure RLS is never accidentally bypassed.</p>
+        <pre><code><span class="cm">-- Should always be on; verify the server default:</span>
+<span class="kw">SHOW</span> row_security;
+
+<span class="cm">-- Lock it on for a specific role:</span>
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">SET</span> row_security = <span class="kw">on</span>;
+
+<span class="cm">-- (Deliberately dangerous — never in production):</span>
+<span class="kw">SET</span> row_security = <span class="kw">off</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>No equivalent. SQL Server security predicates are always active once bound to a table via <code>ALTER SECURITY POLICY ... WITH (STATE = ON)</code>. There is no session-level toggle that bypasses all policies simultaneously.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       S
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-s">
+    <span class="alpha-heading">S</span>
+    <dl>
+
+      <dt id="scram-sha-256">
+        scram-sha-256
+        <a class="term-anchor" href="#scram-sha-256">#</a>
+      </dt>
+      <dd>
+        <p>The recommended <code>pg_hba.conf</code> password authentication method. Uses SCRAM (Salted Challenge Response Authentication Mechanism) with SHA-256. Key properties: the server never transmits the password or its hash in cleartext; each stored hash uses a unique salt; the protocol is immune to replay attacks because it is challenge-response based. Introduced in PostgreSQL 10, made the default in PostgreSQL 14.</p>
+        <pre><code><span class="cm">-- Set as the default for new passwords:</span>
+<span class="kw">ALTER SYSTEM SET</span> password_encryption = <span class="st">'scram-sha-256'</span>;
+<span class="kw">SELECT</span> pg_reload_conf();
+
+<span class="cm">-- pg_hba.conf entry:</span>
+hostssl  all  all  0.0.0.0/0  scram-sha-256
+
+<span class="cm">-- Verify hashed passwords use SCRAM (not md5):</span>
+<span class="kw">SELECT</span> rolname, <span class="kw">LEFT</span>(rolpassword, 10) <span class="kw">AS</span> hash_prefix
+<span class="kw">FROM</span>  pg_authid
+<span class="kw">WHERE</span> rolpassword <span class="kw">IS NOT NULL</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>Windows Authentication (Kerberos) is the preferred SQL Server equivalent — also challenge-response, also immune to replay attacks. SQL Authentication with modern SQL Server versions uses strong internal hashing, but Microsoft still recommends Windows Auth for the same reasons PostgreSQL recommends SCRAM over md5.</p>
+        </div>
+      </dd>
+
+      <dt id="security-definer">
+        SECURITY DEFINER
+        <a class="term-anchor" href="#security-definer">#</a>
+      </dt>
+      <dd>
+        <p>Function attribute causing the function to execute with the privileges of the function's <strong>owner</strong>, not the caller. Equivalent to <code>sudo</code> for SQL — any user who can call the function gains the owner's access for the duration of the call. Critical risk: if <code>SET search_path</code> is not specified in the function definition, an attacker who can create objects in any schema can shadow functions called by the SECURITY DEFINER function, escalating to the owner's privileges.</p>
+        <pre><code><span class="cm">-- Safe pattern: always pin search_path</span>
+<span class="kw">CREATE OR REPLACE FUNCTION</span> app.get_balance(p_account_id <span class="nm">int</span>)
+<span class="kw">RETURNS</span> <span class="nm">numeric</span>
+<span class="kw">LANGUAGE</span> sql
+<span class="kw">SECURITY DEFINER</span>
+<span class="kw">SET</span> search_path = app, pg_temp   <span class="cm">-- critical</span>
+<span class="kw">AS</span> $$
+  <span class="kw">SELECT</span> balance <span class="kw">FROM</span> app.accounts <span class="kw">WHERE</span> id = p_account_id;
+$$;
+
+<span class="cm">-- Find SECURITY DEFINER functions WITHOUT pinned search_path:</span>
+<span class="kw">SELECT</span> n.nspname, p.proname, p.proconfig
+<span class="kw">FROM</span>  pg_proc p
+<span class="kw">JOIN</span>  pg_namespace n <span class="kw">ON</span> n.oid = p.pronamespace
+<span class="kw">WHERE</span> p.prosecdef = <span class="kw">true</span>
+  <span class="kw">AND</span> p.proconfig <span class="kw">IS NULL</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>EXECUTE AS OWNER</code> on stored procedures — the procedure runs with the owner's permissions. SQL Server's schema resolution is less flexible (one default schema per user), so the search_path hijacking attack vector doesn't apply in the same way.</p>
+        </div>
+      </dd>
+
+      <dt id="security-invoker">
+        SECURITY INVOKER
+        <a class="term-anchor" href="#security-invoker">#</a>
+      </dt>
+      <dd>
+        <p>Function attribute (the default) causing the function to execute with the privileges of the <strong>caller</strong>. The safest option for most use cases — the function cannot do anything the caller cannot already do. No privilege escalation is possible. In PostgreSQL 15+, views also support <code>SECURITY INVOKER</code> as an option.</p>
+        <pre><code><span class="cm">-- Explicit declaration (same as default):</span>
+<span class="kw">CREATE FUNCTION</span> utils.sanitize_input(s <span class="nm">text</span>)
+<span class="kw">RETURNS</span> <span class="nm">text</span>
+<span class="kw">LANGUAGE</span> sql
+<span class="kw">SECURITY INVOKER</span>  <span class="cm">-- default, but explicit is clearer</span>
+<span class="kw">AS</span> $$ <span class="kw">SELECT</span> regexp_replace(s, <span class="st">'[^\w\s]'</span>, <span class="st">''</span>, <span class="st">'g'</span>); $$;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>EXECUTE AS CALLER</code> — the default for SQL Server stored procedures and functions. The execution context is the calling user's identity, exactly as in PostgreSQL's SECURITY INVOKER.</p>
+        </div>
+      </dd>
+
+      <dt id="search-path">
+        search_path
+        <a class="term-anchor" href="#search-path">#</a>
+      </dt>
+      <dd>
+        <p>Session-level GUC listing the schemas to search for unqualified object names, in priority order. When you write <code>SELECT * FROM orders</code>, PostgreSQL looks for <code>orders</code> in each schema in <code>search_path</code> left to right, using the first match. Default is <code>"$user", public</code> — the role's own schema first, then public. An attacker who can create objects in any schema that appears earlier in the path than the real object can <strong>shadow</strong> the real object (search_path hijacking).</p>
+        <pre><code><span class="cm">-- Check current search_path:</span>
+<span class="kw">SHOW</span> search_path;
+
+<span class="cm">-- Set safe path for a session:</span>
+<span class="kw">SET</span> search_path = app, pg_temp;
+
+<span class="cm">-- Pin it permanently for a role (survives reconnect):</span>
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">SET</span> search_path = app, pg_temp;
+
+<span class="cm">-- Pin it for a specific database:</span>
+<span class="kw">ALTER DATABASE</span> mydb <span class="kw">SET</span> search_path = app, pg_temp;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>DEFAULT_SCHEMA</code> per user (<code>ALTER USER u WITH DEFAULT_SCHEMA = dbo</code>). SQL Server resolves only one schema by default, making it far less flexible — but also far less exploitable. The multi-schema search order that enables PostgreSQL's search_path hijacking does not exist in SQL Server.</p>
+        </div>
+      </dd>
+
+      <dt id="set-role">
+        SET ROLE
+        <a class="term-anchor" href="#set-role">#</a>
+      </dt>
+      <dd>
+        <p>SQL command that switches the current session's active role to a role that has been granted to the session user. All privilege checks use the new role's privileges for the remainder of the session or until <code>RESET ROLE</code>. Combined with <a href="#inherit">NOINHERIT</a>, this pattern requires explicit activation before using elevated privileges — similar to <code>sudo</code> requiring a deliberate invocation.</p>
+        <pre><code><span class="cm">-- Switch to a granted role:</span>
+<span class="kw">SET ROLE</span> migration_role;
+
+<span class="cm">-- Run privileged DDL here...</span>
+
+<span class="cm">-- Return to original session user:</span>
+<span class="kw">RESET ROLE</span>;
+
+<span class="cm">-- Confirm current role:</span>
+<span class="kw">SELECT</span> current_role, session_user;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>EXECUTE AS USER = 'username'</code> to switch context, <code>REVERT</code> to return. SQL Server's <code>EXECUTE AS</code> is more commonly used in stored procedure definitions than as a session-level command, whereas PostgreSQL's <code>SET ROLE</code> is a first-class session operation.</p>
+        </div>
+      </dd>
+
+      <dt id="superuser">
+        superuser
+        <a class="term-anchor" href="#superuser">#</a>
+      </dt>
+      <dd>
+        <p>PostgreSQL role attribute that bypasses <em>all</em> privilege checks — object ownership, GRANTs, RLS policies, BYPASSRLS, and CREATEDB/CREATEROLE restrictions. A superuser can do anything to any database object. Should never be used for application connections, CI/CD service accounts, or monitoring agents. The principle of least privilege requires superuser to be reserved for break-glass administrative access only.</p>
+        <pre><code><span class="cm">-- Find all superusers — run on every new instance:</span>
+<span class="kw">SELECT</span> rolname, rolcanlogin, rolconnlimit
+<span class="kw">FROM</span>  pg_roles
+<span class="kw">WHERE</span> rolsuper = <span class="kw">true</span>
+<span class="kw">ORDER BY</span> rolname;
+
+<span class="cm">-- Remove superuser from a role:</span>
+<span class="kw">ALTER ROLE</span> legacy_admin <span class="kw">NOSUPERUSER</span>;</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p><code>sysadmin</code> fixed server role. Members of <code>sysadmin</code> bypass all permission checks at the server level. The key difference: in SQL Server, sysadmin is a role you join; in PostgreSQL, superuser is an attribute directly on the role — a more granular but equally dangerous privilege.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       T
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-t">
+    <span class="alpha-heading">T</span>
+    <dl>
+
+      <dt id="trust-auth">
+        TRUST auth
+        <a class="term-anchor" href="#trust-auth">#</a>
+      </dt>
+      <dd>
+        <p><code>pg_hba.conf</code> auth method that accepts any connection for the specified role without any authentication at all. No password. No ticket. No certificate. The operating system itself is the only barrier. Legitimate only for <code>local</code> (Unix socket) entries in tightly controlled, single-tenant environments where the OS access controls are the security boundary. <strong>Never</strong> use <code>trust</code> on <code>host</code> or <code>hostssl</code> entries — it would allow any network client to connect as any role.</p>
+        <pre><code><span class="cm">-- The only defensible TRUST usage (local socket, specific DB):</span>
+local   myapp   monitoring_agent   trust
+
+<span class="cm">-- This is catastrophically dangerous — never do this:</span>
+host    all     all     0.0.0.0/0   trust   <span class="cm">-- DO NOT USE</span></code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>No equivalent. All SQL Server logins require either a password (SQL Authentication) or a valid Windows/Kerberos ticket (Windows Authentication). There is no mechanism to tell SQL Server to accept a connection with zero verification, even for local connections.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       W
+  ══════════════════════════════════════════════════════════ -->
+  <div class="alpha-section" id="section-w">
+    <span class="alpha-heading">W</span>
+    <dl>
+
+      <dt id="using">
+        USING
+        <a class="term-anchor" href="#using">#</a>
+      </dt>
+      <dd>
+        <p>RLS policy clause that filters which <em>existing</em> rows are visible for <code>SELECT</code>, <code>UPDATE</code>, and <code>DELETE</code> operations. PostgreSQL appends the <code>USING</code> expression to the query's <code>WHERE</code> clause automatically. Only rows where the expression evaluates to <code>true</code> are returned or modifiable. Rows that fail the expression are <em>silently hidden</em> — not an error — which is the safe default for multi-tenant applications.</p>
+        <pre><code><span class="cm">-- USING filters read access; tenant only sees own rows:</span>
+<span class="kw">CREATE POLICY</span> tenant_select <span class="kw">ON</span> orders
+  <span class="kw">AS PERMISSIVE FOR SELECT TO</span> app_role
+  <span class="kw">USING</span> (
+    tenant_id = current_setting(<span class="st">'app.tenant_id'</span>, true)::<span class="nm">int</span>
+  );</code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>FILTER PREDICATE in a SQL Server Row-Level Security policy — applied to <code>SELECT</code>, <code>UPDATE</code>, and <code>DELETE</code> operations, with the same silent-hide behaviour. Syntax: <code>ADD FILTER PREDICATE fn(col) ON table</code>.</p>
+        </div>
+      </dd>
+
+      <dt id="with-check">
+        WITH CHECK
+        <a class="term-anchor" href="#with-check">#</a>
+      </dt>
+      <dd>
+        <p>RLS policy clause that validates rows being <strong>inserted or updated</strong>. While <a href="#using"><code>USING</code></a> controls visibility of existing rows, <code>WITH CHECK</code> controls what rows can be written. If omitted on an <code>INSERT</code> or <code>UPDATE</code> policy, users can write rows they would not be able to read — enabling silent cross-tenant data injection. Always specify <code>WITH CHECK</code> to match the <code>USING</code> condition on write policies.</p>
+        <pre><code><span class="cm">-- Both USING (read filter) and WITH CHECK (write guard):</span>
+<span class="kw">CREATE POLICY</span> tenant_isolation <span class="kw">ON</span> orders
+  <span class="kw">AS PERMISSIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (
+    tenant_id = current_setting(<span class="st">'app.tenant_id'</span>, true)::<span class="nm">int</span>
+  )
+  <span class="kw">WITH CHECK</span> (
+    tenant_id = current_setting(<span class="st">'app.tenant_id'</span>, true)::<span class="nm">int</span>
+  );
+
+<span class="cm">-- If WITH CHECK is omitted for INSERT/UPDATE, a user</span>
+<span class="cm">-- can insert rows for other tenants even though they</span>
+<span class="cm">-- cannot SELECT them back.</span></code></pre>
+        <div class="callout mssql">
+          <div class="label"><span class="mssql-badge">SQL Server</span> Equivalent</div>
+          <p>BLOCK PREDICATE with <code>AFTER INSERT</code> and <code>AFTER UPDATE</code> — blocks write operations after the row is about to be written, if the predicate fails. SQL Server separates read filtering (FILTER PREDICATE) and write blocking (BLOCK PREDICATE) into distinct predicate types; PostgreSQL unifies both into a single policy's <code>USING</code> + <code>WITH CHECK</code> clauses.</p>
+        </div>
+      </dd>
+
+    </dl>
+  </div>
+
+  <!-- ── Footer ── -->
+  <div class="back-to-top">
+    <a href="#top">&uarr; Back to top</a>
+    &ensp;&middot;&ensp;
+    <a href="../index.html">Course Index</a>
+    &ensp;&middot;&ensp;
+    <a href="quick-reference.html">Quick Reference &rarr;</a>
+  </div>
+
+</div><!-- /.page -->
+</body>
+</html>

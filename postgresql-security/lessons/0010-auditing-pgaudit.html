@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 10: Auditing and Logging — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 10</span>
+    <span>PostgreSQL Security</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Auditing and Logging &mdash; pgaudit, Log Parameters, and SQL Server Audit Mapping</h1>
+
+  <p>A database without structured auditing is a database you cannot investigate. When a security incident occurs &mdash; a data exfiltration, an unexpected schema change, an unauthorized SELECT on a sensitive table &mdash; your logs determine whether you can reconstruct what happened, who did it, and when. PostgreSQL ships with flexible logging infrastructure. Getting it right requires understanding the boundary between general-purpose logging and structured audit, and that is exactly where <strong>pgaudit</strong> lives.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. The Gap: Built-in Logging vs. Structured Audit</h2>
+
+  <p>PostgreSQL's built-in <code>log_statement</code> parameter can log SQL text. Set it to <code>'all'</code> and every statement appears in the server log. That sounds sufficient. It is not, for three reasons:</p>
+
+  <ul>
+    <li><strong>No object-level granularity.</strong> You cannot say "log all SELECTs on the <code>payroll</code> table but not on <code>product_catalog</code>." It is all or nothing.</li>
+    <li><strong>No structured context.</strong> The log entry is raw SQL text with a timestamp and PID. There is no reliable separation of: which object was accessed, what type of operation it was, whether it succeeded, and what role's privileges were used.</li>
+    <li><strong>Compliance tools cannot parse it.</strong> SIEM systems, compliance platforms, and log aggregators expect structured fields. Free-form SQL text in log lines requires fragile regex parsing that breaks on multi-line statements and quoted literals.</li>
+  </ul>
+
+  <p><strong>pgaudit</strong> (PostgreSQL Audit Extension) was built to fill this gap. It hooks into the PostgreSQL executor and emits structured log records with consistent, named fields for every audited operation. The pgaudit documentation is at <a href="https://www.pgaudit.org/">pgaudit.org</a> and the source is maintained at <a href="https://github.com/pgaudit/pgaudit">github.com/pgaudit/pgaudit</a>.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>In SQL Server, structured auditing is provided by <strong>SQL Server Audit</strong> (available since SQL Server 2008). You create a Server Audit object pointing to a file, Windows Event Log, or Application Log destination, then create Server Audit Specifications (for server-level events) and Database Audit Specifications (for database-level events) that define which action groups to capture. pgaudit maps to this model closely: session audit is analogous to a database audit spec covering all objects, and object audit is analogous to a database audit spec scoped to specific tables or schemas.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. Installing pgaudit</h2>
+
+  <p>pgaudit is a <strong>shared library extension</strong>. It must be compiled against your specific PostgreSQL version and loaded at server startup via <code>shared_preload_libraries</code>. It cannot be loaded dynamically at runtime &mdash; adding it requires a server restart.</p>
+
+  <pre><code><span class="cm"># Debian / Ubuntu — install the package matching your PostgreSQL major version</span>
+apt-get install postgresql-16-pgaudit
+
+<span class="cm"># RHEL / Rocky Linux / AlmaLinux</span>
+dnf install pgaudit_16
+
+<span class="cm"># macOS via Homebrew (bundled with postgresql formula on recent versions)</span>
+<span class="cm"># brew install pgaudit</span></code></pre>
+
+  <p>Then add it to <code>postgresql.conf</code> and restart:</p>
+
+  <pre><code><span class="cm"># postgresql.conf</span>
+<span class="nm">shared_preload_libraries</span> = <span class="st">'pgaudit'</span>
+
+<span class="cm"># If you already have other libraries loaded, append pgaudit:</span>
+<span class="cm"># shared_preload_libraries = 'pg_stat_statements, pgaudit'</span></code></pre>
+
+  <pre><code><span class="cm"># OS shell: restart the PostgreSQL service (Debian/Ubuntu package layout)</span>
+systemctl restart postgresql@16-main
+
+<span class="cm"># Verify pgaudit is loaded after restart:</span>
+<span class="cm">-- psql</span>
+<span class="kw">SELECT</span> name, default_version, installed_version
+<span class="kw">FROM</span>   pg_available_extensions
+<span class="kw">WHERE</span>  name = <span class="st">'pgaudit'</span>;
+
+<span class="cm">-- pgaudit does NOT need CREATE EXTENSION — it is a library, not a schema extension</span>
+<span class="cm">-- The GUCs (pgaudit.log etc.) are available once the library is loaded</span></code></pre>
+
+  <div class="callout warning">
+    <div class="label">Warning</div>
+    <p>Unlike most PostgreSQL extensions, pgaudit does not require <code>CREATE EXTENSION pgaudit</code>. Loading it in <code>shared_preload_libraries</code> is sufficient. Running <code>CREATE EXTENSION pgaudit</code> is optional and only needed if you want the object audit role feature. Attempting to use pgaudit GUCs without the library loaded will produce a "unrecognized configuration parameter" error.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. Two Audit Modes</h2>
+
+  <p>pgaudit provides two complementary audit modes that can be used independently or together:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Controlled by</th>
+        <th>Granularity</th>
+        <th>Best for</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Session audit</strong></td>
+        <td><code>pgaudit.log</code> GUC</td>
+        <td>By statement class (read, write, ddl, etc.) across all objects</td>
+        <td>Broad compliance coverage: "audit all DDL" or "audit all writes"</td>
+      </tr>
+      <tr>
+        <td><strong>Object audit</strong></td>
+        <td><code>pgaudit.role</code> GUC + role grants</td>
+        <td>Specific tables, views, or sequences, regardless of which role accesses them</td>
+        <td>Targeted surveillance: "audit every read on the payroll table"</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>When both modes are active, pgaudit emits a log record for each mode that triggers independently. A statement that matches both session and object audit rules produces two log entries: one tagged <code>SESSION</code> and one tagged <code>OBJECT</code>.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. Session Audit Configuration</h2>
+
+  <p>Session audit is controlled by the <code>pgaudit.log</code> GUC. It accepts a comma-separated list of statement class keywords. Every statement matching the specified classes is logged for every session, server-wide.</p>
+
+  <pre><code><span class="cm"># postgresql.conf — session audit settings</span>
+
+<span class="cm"># Log all data-modification and schema-change statements</span>
+<span class="nm">pgaudit.log</span> = <span class="st">'write, ddl'</span>
+
+<span class="cm"># Reduce noise: do not audit system catalog reads (pg_catalog schema)</span>
+<span class="nm">pgaudit.log_catalog</span> = <span class="kw">off</span>
+
+<span class="cm"># Log each relation (table/view) accessed separately per statement</span>
+<span class="cm"># A JOIN touching 3 tables produces 3 log entries — one per table</span>
+<span class="nm">pgaudit.log_relation</span> = <span class="kw">on</span>
+
+<span class="cm"># Log the full statement text only once even if multiple substatements fire</span>
+<span class="nm">pgaudit.log_statement_once</span> = <span class="kw">off</span>   <span class="cm"># off = log statement with each record</span></code></pre>
+
+  <p>The available class keywords and what they cover:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Class</th>
+        <th>Statements covered</th>
+        <th>SQL Server audit spec equivalent</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>read</code></td>
+        <td>SELECT, COPY FROM</td>
+        <td>SELECT action group in database audit spec</td>
+      </tr>
+      <tr>
+        <td><code>write</code></td>
+        <td>INSERT, UPDATE, DELETE, TRUNCATE, COPY TO</td>
+        <td>INSERT, UPDATE, DELETE action groups</td>
+      </tr>
+      <tr>
+        <td><code>function</code></td>
+        <td>Function calls via DO and function execution</td>
+        <td>EXECUTE action group</td>
+      </tr>
+      <tr>
+        <td><code>role</code></td>
+        <td>GRANT, REVOKE, CREATE/ALTER/DROP ROLE</td>
+        <td>DATABASE_ROLE_MEMBER_CHANGE_GROUP (server spec)</td>
+      </tr>
+      <tr>
+        <td><code>ddl</code></td>
+        <td>All CREATE, ALTER, DROP statements</td>
+        <td>SCHEMA_OBJECT_CHANGE_GROUP (database spec)</td>
+      </tr>
+      <tr>
+        <td><code>misc</code></td>
+        <td>DISCARD, FETCH, CHECKPOINT, VACUUM, SET</td>
+        <td>No direct equivalent</td>
+      </tr>
+      <tr>
+        <td><code>misc_set</code></td>
+        <td>SET statements specifically (subset of misc)</td>
+        <td>No direct equivalent</td>
+      </tr>
+      <tr>
+        <td><code>all</code></td>
+        <td>Every statement class</td>
+        <td>All action groups combined</td>
+      </tr>
+      <tr>
+        <td><code>none</code></td>
+        <td>Disable session audit</td>
+        <td>Disabling the audit spec</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>A sensible minimum for most production environments is <code>pgaudit.log = 'write, ddl'</code>. This captures all data modifications and all schema changes without the log volume overhead of auditing every SELECT. Add <code>role</code> to capture privilege changes. Use <code>all</code> only for short-term investigation or when regulatory requirements explicitly demand SELECT-level audit (PCI-DSS Requirement 10.2 mandates read access to cardholder data).</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Object Audit Configuration</h2>
+
+  <p>Object audit uses a <strong>dedicated audit role</strong> as an indirection mechanism. Instead of specifying which tables to audit directly to pgaudit, you grant object privileges to a special <code>NOLOGIN</code> role, then tell pgaudit to watch that role. Any access to an object that the audit role has been granted access to will be logged, regardless of which actual user runs the statement.</p>
+
+  <pre><code><span class="cm">-- Step 1: create a dedicated audit role (cannot login — it is a sentinel)</span>
+<span class="kw">CREATE ROLE</span> rds_pgaudit <span class="nm">NOLOGIN</span>;
+
+<span class="cm">-- Step 2: grant privileges to the audit role for objects you want to audit</span>
+<span class="cm">--   Here: audit all reads on the sensitive_data table</span>
+<span class="kw">GRANT</span> <span class="nm">SELECT</span> <span class="kw">ON</span> sensitive_data <span class="kw">TO</span> rds_pgaudit;
+
+<span class="cm">--   Audit writes on the payroll table</span>
+<span class="kw">GRANT</span> <span class="nm">INSERT</span>, <span class="nm">UPDATE</span>, <span class="nm">DELETE</span> <span class="kw">ON</span> payroll <span class="kw">TO</span> rds_pgaudit;
+
+<span class="cm">-- Step 3: in postgresql.conf, point pgaudit at the audit role</span>
+<span class="cm">-- pgaudit.role = 'rds_pgaudit'</span>
+
+<span class="cm">-- Reload (no restart needed for pgaudit.role change)</span>
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();</code></pre>
+
+  <p>Now every time any user executes a SELECT on <code>sensitive_data</code> or a write on <code>payroll</code>, pgaudit emits an <code>OBJECT</code> audit log entry. The user running the query does not need to know they are being audited, and there is no way to circumvent it by connecting as a different role.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>This maps to <code>SCHEMA_OBJECT_ACCESS_GROUP</code> scoped to specific objects in a SQL Server Database Audit Specification. The difference: SQL Server lets you name the object directly in the audit spec (<code>ON OBJECT::dbo.sensitive_data BY PUBLIC</code>). PostgreSQL uses the indirect role-grant mechanism. The role-based approach is more flexible &mdash; you can audit a new table by simply granting to the audit role without restarting or modifying configuration files.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. Reading a pgaudit Log Entry</h2>
+
+  <p>pgaudit writes to the standard PostgreSQL log (controlled by <code>log_destination</code>, <code>logging_collector</code>, etc.). Audit entries are prefixed with <code>AUDIT:</code> and contain structured comma-separated fields. Understanding the field layout is essential for writing parsers or SIEM rules.</p>
+
+  <pre><code><span class="cm"># A pgaudit SESSION log entry (reformatted for readability)</span>
+<span class="st">2024-01-15 14:23:01 UTC</span> [<span class="nm">12345</span>] app_user@mydb LOG:
+  AUDIT: SESSION,<span class="nm">1</span>,<span class="nm">1</span>,WRITE,INSERT,TABLE,app.orders,
+  "INSERT INTO orders VALUES (42, 'data')",<none></code></pre>
+
+  <p>Field-by-field breakdown:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Position</th>
+        <th>Field name</th>
+        <th>Value in example</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Audit type</td>
+        <td><code>SESSION</code></td>
+        <td>SESSION (session audit) or OBJECT (object audit)</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>Statement ID</td>
+        <td><code>1</code></td>
+        <td>Sequential number for statements in this session; resets each session</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>Substatement ID</td>
+        <td><code>1</code></td>
+        <td>For statements containing multiple sub-operations (e.g., rules, triggers)</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>Class</td>
+        <td><code>WRITE</code></td>
+        <td>The pgaudit class that triggered this entry (READ, WRITE, DDL, etc.)</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>Command</td>
+        <td><code>INSERT</code></td>
+        <td>The specific SQL command</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>Object type</td>
+        <td><code>TABLE</code></td>
+        <td>TABLE, INDEX, VIEW, FUNCTION, SCHEMA, etc.</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td>Object name</td>
+        <td><code>app.orders</code></td>
+        <td>Fully qualified object name (schema.object)</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td>Statement</td>
+        <td><code>INSERT INTO ...</code></td>
+        <td>The full SQL statement text</td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td>Parameter</td>
+        <td><code>&lt;none&gt;</code></td>
+        <td>Bind parameters when <code>pgaudit.log_parameter = on</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Who ran the statement? The role name and database appear in the standard log prefix (controlled by <code>log_line_prefix</code>), not inside the AUDIT record itself. This is why setting <code>log_line_prefix</code> correctly is critical &mdash; see Section 7.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. Essential log_ Parameters to Set Alongside pgaudit</h2>
+
+  <p>pgaudit generates the structured audit records; the surrounding log infrastructure determines whether those records are useful. These parameters should be set in <code>postgresql.conf</code> for any production instance:</p>
+
+  <pre><code><span class="cm"># postgresql.conf — logging parameters for a production audit setup</span>
+
+<span class="cm"># Prefix format: timestamp [pid] user@database space
+# %m = timestamp with milliseconds
+# %p = process ID
+# %q = empty string if not in a backend session (silent for background workers)
+# %u = user name
+# %d = database name</span>
+<span class="nm">log_line_prefix</span> = <span class="st">'%m [%p] %q%u@%d '</span>
+
+<span class="cm"># Log connections and disconnections (equivalent to SQL Server LOGIN/LOGOUT audit group)</span>
+<span class="nm">log_connections</span>    = <span class="kw">on</span>
+<span class="nm">log_disconnections</span> = <span class="kw">on</span>
+
+<span class="cm"># Log all queries that take more than 1 second (1000ms)</span>
+<span class="nm">log_min_duration_statement</span> = <span class="nm">1000</span>
+
+<span class="cm"># Log checkpoint activity (helps diagnose write workload spikes)</span>
+<span class="nm">log_checkpoints</span> = <span class="kw">on</span>
+
+<span class="cm"># Log lock waits (helps diagnose contention and blocked queries)</span>
+<span class="nm">log_lock_waits</span> = <span class="kw">on</span>
+
+<span class="cm"># Log creation of any temporary file — 0 means log all sizes</span>
+<span class="nm">log_temp_files</span> = <span class="nm">0</span>
+
+<span class="cm"># Destination: write structured CSV logs for easier parsing</span>
+<span class="cm"># log_destination = 'csvlog'   # or 'jsonlog' on PostgreSQL 15+</span>
+<span class="cm"># logging_collector = on</span>
+<span class="cm"># log_directory = 'log'</span>
+<span class="cm"># log_filename = 'postgresql-%Y-%m-%d.log'</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>PostgreSQL 15 introduced <code>jsonlog</code> as a log destination format. JSON-formatted logs are the easiest to ingest into SIEM tools, log aggregation pipelines, and cloud log management services. If you are on PostgreSQL 15 or later, prefer <code>log_destination = 'jsonlog'</code> over <code>csvlog</code> for new deployments.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>8. SQL Server Audit to pgaudit Mapping</h2>
+
+  <p>If you are migrating an audit policy from SQL Server, use this table to find the pgaudit equivalent for each SQL Server audit action group:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>SQL Server Audit</th>
+        <th>pgaudit / PostgreSQL equivalent</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Database Audit Spec: INSERT, UPDATE, DELETE</td>
+        <td><code>pgaudit.log = 'write'</code></td>
+      </tr>
+      <tr>
+        <td>Database Audit Spec: SELECT</td>
+        <td><code>pgaudit.log = 'read'</code></td>
+      </tr>
+      <tr>
+        <td>Database Audit Spec: EXECUTE</td>
+        <td><code>pgaudit.log = 'function'</code></td>
+      </tr>
+      <tr>
+        <td>Server Audit Spec: CREATE/ALTER/DROP (SCHEMA_OBJECT_CHANGE_GROUP)</td>
+        <td><code>pgaudit.log = 'ddl'</code></td>
+      </tr>
+      <tr>
+        <td>Server Audit Spec: GRANT/REVOKE (DATABASE_ROLE_MEMBER_CHANGE_GROUP)</td>
+        <td><code>pgaudit.log = 'role'</code></td>
+      </tr>
+      <tr>
+        <td>Server Audit Spec: SUCCESSFUL_LOGIN_GROUP</td>
+        <td><code>log_connections = on</code></td>
+      </tr>
+      <tr>
+        <td>Server Audit Spec: LOGOUT_GROUP</td>
+        <td><code>log_disconnections = on</code></td>
+      </tr>
+      <tr>
+        <td>Server Audit Spec: FAILED_LOGIN_GROUP</td>
+        <td><code>log_connections = on</code> (auth failures appear in connection log)</td>
+      </tr>
+      <tr>
+        <td>Specific table access (SCHEMA_OBJECT_ACCESS_GROUP scoped)</td>
+        <td>pgaudit object audit: GRANT on <code>pgaudit.role</code> sentinel role</td>
+      </tr>
+      <tr>
+        <td>Audit file destination</td>
+        <td><code>log_destination = 'csvlog'</code> or <code>'jsonlog'</code> (PG 15+)</td>
+      </tr>
+      <tr>
+        <td>Windows Event Log destination</td>
+        <td><code>log_destination = 'syslog'</code> (Linux) or <code>'eventlog'</code> (Windows)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>9. Per-Role Audit Levels</h2>
+
+  <p>pgaudit settings can be applied at the role level using <code>ALTER ROLE ... SET</code>. A role-level setting overrides the server-level <code>pgaudit.log</code> for sessions authenticated as that role. This is useful for escalating audit coverage for privileged accounts or accounts with access to sensitive data, without imposing the log volume on everyone.</p>
+
+  <pre><code><span class="cm">-- Give a sensitive user full audit coverage regardless of server-level setting</span>
+<span class="kw">ALTER ROLE</span> sensitive_user <span class="kw">SET</span> pgaudit.log = <span class="st">'all'</span>;
+
+<span class="cm">-- Verify what is set for a role</span>
+<span class="kw">SELECT</span> rolname, rolconfig
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolname = <span class="st">'sensitive_user'</span>;
+
+<span class="cm">-- Remove the role-level override and revert to server default</span>
+<span class="kw">ALTER ROLE</span> sensitive_user <span class="kw">RESET</span> pgaudit.log;</code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server does not have a direct equivalent to per-login audit granularity within the audit spec engine. To audit a specific login more heavily in SQL Server you would need a separate database audit spec or an Extended Events session filtered by login name. PostgreSQL's <code>ALTER ROLE ... SET</code> mechanism is cleaner &mdash; the audit configuration follows the role identity regardless of which database they connect to.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>10. Common Mistakes</h2>
+
+  <h3>Mistake 1: Using log_statement = 'all' as a compliance substitute</h3>
+
+  <p><code>log_statement = 'all'</code> writes every SQL statement to the log as unstructured text. It appears to be comprehensive. It has three serious problems:</p>
+
+  <ul>
+    <li>No object-level granularity: you cannot tell from the log which table a multi-table JOIN was auditing for compliance purposes.</li>
+    <li>Unstructured output: the log line is raw SQL text prefixed by a timestamp and PID. SIEM ingestion requires regex parsing that breaks on edge cases (quoted identifiers containing the parser's expected delimiters, multi-line statements).</li>
+    <li>Enormous volume: on a busy system, <code>log_statement = 'all'</code> fills log files faster than almost any workload pattern, consumes I/O bandwidth needed by the database, and makes forensic analysis impractical due to volume.</li>
+  </ul>
+
+  <p>The correct approach for compliance is pgaudit with a targeted log mask (<code>'write, ddl'</code> minimum) combined with <code>log_connections = on</code>.</p>
+
+  <h3>Mistake 2: Not setting pgaudit.log_catalog = off</h3>
+
+  <p>When <code>pgaudit.log</code> includes <code>'read'</code> or <code>'all'</code>, and <code>pgaudit.log_catalog</code> is left at its default (<code>on</code>), pgaudit logs every access to system catalog tables (<code>pg_catalog.pg_class</code>, <code>pg_catalog.pg_attribute</code>, etc.). A single query planner evaluation may read dozens of catalog entries. The result is hundreds of pgaudit log entries per application query, the vast majority irrelevant to any audit requirement.</p>
+
+  <pre><code><span class="cm"># Fix: disable catalog logging in postgresql.conf</span>
+<span class="nm">pgaudit.log_catalog</span> = <span class="kw">off</span>
+
+<span class="cm"># Or set at runtime (takes effect on next session)</span>
+<span class="kw">ALTER SYSTEM SET</span> pgaudit.log_catalog = <span class="kw">off</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>pgaudit Documentation and Source</strong><br>
+    <a href="https://www.pgaudit.org/">pgaudit.org</a> &mdash; <a href="https://github.com/pgaudit/pgaudit">github.com/pgaudit/pgaudit</a><br><br>
+    <strong>PostgreSQL Documentation: Error Reporting and Logging</strong><br>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-logging.html">postgresql.org/docs/current/runtime-config-logging.html</a><br><br>
+    <strong>PostgreSQL Documentation: log_line_prefix format strings</strong><br>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-LINE-PREFIX">postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-LINE-PREFIX</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz &mdash; Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="pgaudit provides two audit modes. What is the key distinction between SESSION audit mode and OBJECT audit mode?"
+         data-correct="C"
+         data-feedback-correct="Correct. Session audit applies a class-based filter (read, write, ddl, etc.) to all statements server-wide. Object audit watches specific database objects by granting access to a sentinel audit role — any access to those objects is logged regardless of which user initiated it."
+         data-feedback-wrong="Not quite. The correct answer is C. SESSION audit is broad and class-based (all writes, all DDL). OBJECT audit is narrow and object-specific — it uses a sentinel role to identify which tables or views to watch.">
+      <div class="quiz-option" data-key="A">Session audit works only for superusers while object audit applies to all regular roles</div>
+      <div class="quiz-option" data-key="B">Session audit captures failed statements by class and object audit captures only successful statements</div>
+      <div class="quiz-option" data-key="C">Session audit covers statements by class server-wide while object audit watches specific objects only</div>
+      <div class="quiz-option" data-key="D">Session audit uses CSV log format and object audit writes to a separate table</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which pgaudit.log value should you set to audit all INSERT, UPDATE, DELETE, and TRUNCATE statements without auditing SELECT queries?"
+         data-correct="B"
+         data-feedback-correct="Correct. The 'write' class covers INSERT, UPDATE, DELETE, TRUNCATE, and COPY TO. Setting pgaudit.log = 'write' captures all data modification statements while excluding SELECT (which is the 'read' class)."
+         data-feedback-wrong="Not quite. The correct answer is B: 'write'. The 'all' value would also capture SELECT statements, which is usually unnecessary and produces much higher log volume. The 'ddl' class covers schema changes, not data changes.">
+      <div class="quiz-option" data-key="A">pgaudit.log = 'ddl' captures all data definition and schema manipulation operations</div>
+      <div class="quiz-option" data-key="B">pgaudit.log = 'write' captures all INSERT, UPDATE, DELETE, and TRUNCATE statements</div>
+      <div class="quiz-option" data-key="C">pgaudit.log = 'all' is required to capture any modification statement reliably</div>
+      <div class="quiz-option" data-key="D">pgaudit.log = 'dml' is the correct class for data manipulation language</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In SQL Server, FAILED_LOGIN_GROUP audits failed authentication attempts. What is the PostgreSQL equivalent for capturing failed login attempts in the log?"
+         data-correct="A"
+         data-feedback-correct="Correct. Setting log_connections = on causes PostgreSQL to log every connection attempt, including those that fail authentication. Failed attempts appear as LOG or FATAL entries showing the connection was rejected, with the role name, client IP, and reason."
+         data-feedback-wrong="Not quite. The correct answer is A: log_connections = on. pgaudit does not capture authentication events — it hooks into the query executor which is reached only after successful authentication. Connection-level events (including failures) are captured by log_connections.">
+      <div class="quiz-option" data-key="A">log_connections = on logs all connection attempts including those failing authentication</div>
+      <div class="quiz-option" data-key="B">pgaudit.log = 'role' captures failed role-based authentication attempts in session logs</div>
+      <div class="quiz-option" data-key="C">pgaudit.log = 'misc' includes connection failures in the miscellaneous event class</div>
+      <div class="quiz-option" data-key="D">log_min_messages = DEBUG1 exposes all authentication failures at debug level verbosity</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the purpose of setting pgaudit.log_catalog = off, and what problem does it solve?"
+         data-correct="D"
+         data-feedback-correct="Correct. System catalog tables (pg_catalog schema) are read extensively during query planning and execution. With log_catalog = on, every catalog lookup generates a pgaudit entry, potentially producing hundreds of audit records per application query — nearly all of them irrelevant to any audit requirement. Setting it off suppresses catalog reads from the audit log."
+         data-feedback-wrong="Not quite. The correct answer is D. The pg_catalog schema is accessed constantly by the planner for schema metadata. Auditing those reads produces enormous log noise with no compliance value. pgaudit.log_catalog = off suppresses that noise.">
+      <div class="quiz-option" data-key="A">It disables auditing of CREATE CATALOG and DROP CATALOG schema management statements entirely</div>
+      <div class="quiz-option" data-key="B">It prevents pgaudit from logging all SELECT statements that perform full table scans</div>
+      <div class="quiz-option" data-key="C">It stops pgaudit from recording audit entries when the pg_catalog schema is modified</div>
+      <div class="quiz-option" data-key="D">It suppresses system catalog read log entries generated per query by the planner</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Good prompts for this lesson: "How do I ship pgaudit logs to a SIEM like Splunk or Elasticsearch?", "Can I use pgaudit on Amazon RDS or Aurora PostgreSQL?", "How do I audit only specific columns, not whole tables?", or "What is the performance overhead of pgaudit.log = 'all' on a high-throughput system?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0009-ssl-tls.html">&larr; Lesson 9: SSL/TLS</a>
+    <a href="0011-hardening-checklist.html">Lesson 11: Hardening Checklist &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

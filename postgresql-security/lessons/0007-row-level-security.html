@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 7: Row-Level Security — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 7</span>
+    <span>PostgreSQL Security</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Row-Level Security</h1>
+  <p style="color: var(--muted); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.95rem; margin-top: -0.2em; margin-bottom: 2rem;">Filtering Rows by Who Is Asking</p>
+
+  <!-- ── 1. What RLS does ── -->
+  <h2>1. What Row-Level Security Does</h2>
+
+  <p>Standard <code>GRANT</code>/<code>REVOKE</code> controls whether a role can access a table at all. Row-Level Security (RLS) goes one layer deeper: it controls which <em>rows</em> within that table a role can see or modify. The filter is attached to the table itself and runs invisibly before any query result is returned — the user never sees the rows they are not permitted to see, and they cannot tell whether those rows exist.</p>
+
+  <p>Think of it this way: <code>GRANT SELECT</code> is the doorman checking if you can enter the building. RLS is a partition inside the building that silently routes you to only your floor. You can walk freely on your floor; the other floors simply do not appear to exist.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mapping</div>
+    <p>SQL Server has Row-Level Security (introduced in SQL Server 2016) using inline table-valued <em>security predicate functions</em>. You create a function that returns a filter expression, then bind it to a table using <code>CREATE SECURITY POLICY</code> with a <code>FILTER PREDICATE</code> (for SELECT) and an optional <code>BLOCK PREDICATE</code> (for INSERT/UPDATE/DELETE).</p>
+    <p>PostgreSQL's RLS is structurally similar but the implementation is different in three important ways: (1) the policy is attached directly to the table with <code>CREATE POLICY</code>, not via a separate security policy object; (2) the filter expression is inline in the policy, not in a separate function; (3) PostgreSQL's default when RLS is enabled but no policy exists is <em>deny all rows</em> — SQL Server defaults to <em>allow all rows</em>. That last difference has caused production outages.</p>
+  </div>
+
+  <!-- ── 2. Enabling RLS ── -->
+  <h2>2. Enabling RLS — The Deny-By-Default Behavior</h2>
+
+  <pre><code><span class="cm">-- Enable RLS on the orders table</span>
+<span class="kw">ALTER TABLE</span> orders <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="cm">-- At this point: superusers still see all rows</span>
+<span class="cm">-- All other roles: ZERO rows visible, even with SELECT privilege on the table</span></code></pre>
+
+  <div class="callout danger">
+    <div class="label">Critical Difference from SQL Server</div>
+    <p>In SQL Server, enabling Row-Level Security and adding a <code>FILTER PREDICATE</code> is additive — all rows are visible until a predicate narrows them. In PostgreSQL, <code>ALTER TABLE orders ENABLE ROW LEVEL SECURITY</code> immediately hides <em>all rows</em> from non-superuser roles. There are zero visible rows until you create a policy that explicitly allows access. If you enable RLS on a production table before creating a policy, your application immediately returns empty result sets. Do not enable RLS on a live table without having the policies ready to deploy in the same transaction.</p>
+  </div>
+
+  <pre><code><span class="cm">-- Safe deployment: wrap in a transaction</span>
+<span class="kw">BEGIN</span>;
+<span class="kw">ALTER TABLE</span> orders <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="kw">CREATE POLICY</span> tenant_isolation <span class="kw">ON</span> orders
+  <span class="kw">AS PERMISSIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>)
+  <span class="kw">WITH CHECK</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>);
+<span class="kw">COMMIT</span>;</code></pre>
+
+  <!-- ── 3. CREATE POLICY syntax ── -->
+  <h2>3. CREATE POLICY Syntax — Every Clause Explained</h2>
+
+  <pre><code><span class="kw">CREATE POLICY</span> policy_name
+  <span class="kw">ON</span> table_name
+  [<span class="kw">AS</span> <span class="nm">PERMISSIVE</span> | <span class="nm">RESTRICTIVE</span>]          <span class="cm">-- default: PERMISSIVE</span>
+  [<span class="kw">FOR</span> <span class="nm">ALL</span> | <span class="nm">SELECT</span> | <span class="nm">INSERT</span> | <span class="nm">UPDATE</span> | <span class="nm">DELETE</span>]  <span class="cm">-- default: ALL</span>
+  [<span class="kw">TO</span> role_name]                             <span class="cm">-- default: PUBLIC (all roles)</span>
+  <span class="kw">USING</span> (filter_expression)                 <span class="cm">-- applied to existing rows</span>
+  [<span class="kw">WITH CHECK</span> (check_expression)];          <span class="cm">-- applied to rows being written</span></code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Clause</th><th>What it controls</th><th>SQL Server equivalent</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>AS PERMISSIVE</code></td>
+        <td>Multiple permissive policies combine with OR logic</td>
+        <td>Default behavior of multiple FILTER PREDICATEs</td>
+      </tr>
+      <tr>
+        <td><code>AS RESTRICTIVE</code></td>
+        <td>All restrictive policies must pass (AND logic)</td>
+        <td>No direct equivalent</td>
+      </tr>
+      <tr>
+        <td><code>FOR SELECT</code></td>
+        <td>Controls which rows are visible in SELECT results</td>
+        <td>FILTER PREDICATE</td>
+      </tr>
+      <tr>
+        <td><code>FOR INSERT</code></td>
+        <td>Controls which rows can be inserted (WITH CHECK only)</td>
+        <td>BLOCK PREDICATE with AFTER INSERT</td>
+      </tr>
+      <tr>
+        <td><code>FOR UPDATE</code></td>
+        <td>Controls which rows can be updated and what values are valid</td>
+        <td>BLOCK PREDICATE with AFTER UPDATE</td>
+      </tr>
+      <tr>
+        <td><code>FOR DELETE</code></td>
+        <td>Controls which rows can be deleted</td>
+        <td>BLOCK PREDICATE with AFTER DELETE</td>
+      </tr>
+      <tr>
+        <td><code>TO role_name</code></td>
+        <td>Policy applies only to this role</td>
+        <td>Roles specified in the predicate function</td>
+      </tr>
+      <tr>
+        <td><code>USING (...)</code></td>
+        <td>Filter on existing rows (SELECT, UPDATE target, DELETE target)</td>
+        <td>FILTER PREDICATE</td>
+      </tr>
+      <tr>
+        <td><code>WITH CHECK (...)</code></td>
+        <td>Validate new or modified row values (INSERT, UPDATE new values)</td>
+        <td>BLOCK PREDICATE</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── 4. USING vs WITH CHECK ── -->
+  <h2>4. USING vs WITH CHECK — Reading Rows vs Writing Rows</h2>
+
+  <p>This is the most conceptually important distinction in PostgreSQL RLS. The two clauses guard different operations:</p>
+
+  <ul>
+    <li><strong>USING</strong> is a filter on rows that <em>already exist</em> in the table. When a user runs <code>SELECT</code>, <code>UPDATE</code>, or <code>DELETE</code>, the <code>USING</code> expression is evaluated against each candidate row. Rows where the expression returns false are invisible — they do not appear in <code>SELECT</code> results, and <code>UPDATE</code>/<code>DELETE</code> silently skip them.</li>
+    <li><strong>WITH CHECK</strong> is a constraint on rows the user is <em>trying to write</em>. It is evaluated against the new row values in <code>INSERT</code> and <code>UPDATE</code> operations. If the expression returns false, the write is rejected with an error.</li>
+  </ul>
+
+  <pre><code><span class="cm">-- Example: tenant user can only read their own rows AND only write rows for their tenant</span>
+<span class="kw">CREATE POLICY</span> tenant_isolation <span class="kw">ON</span> orders
+  <span class="kw">FOR ALL TO</span> app_role
+  <span class="kw">USING</span>      (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>)
+  <span class="kw">WITH CHECK</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>);</code></pre>
+
+  <p>Consider what happens without <code>WITH CHECK</code> but with only <code>USING</code>:</p>
+  <ul>
+    <li>Tenant 42 cannot <em>see</em> tenant 99's orders — the <code>USING</code> filter hides them.</li>
+    <li>But tenant 42 <em>can insert</em> a row with <code>tenant_id = 99</code> — the insert is not filtered because <code>USING</code> only applies to existing rows.</li>
+    <li>Tenant 42 now has a row in the database attributed to tenant 99 that they cannot read back.</li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="label">Common Error</div>
+    <p>If you specify only <code>USING</code> on a policy that covers <code>FOR ALL</code> or <code>FOR INSERT</code>, PostgreSQL uses the <code>USING</code> expression as the <code>WITH CHECK</code> expression automatically — but <em>only for UPDATE</em>, not for INSERT. For <code>INSERT</code>, if there is no <code>WITH CHECK</code>, the insert is not constrained by the policy. Always specify both clauses explicitly for multi-tenant insert protection.</p>
+  </div>
+
+  <!-- ── 5. Multi-tenant example ── -->
+  <h2>5. Real-World Multi-Tenant Example</h2>
+
+  <p>The canonical use case: a SaaS application where each tenant should see only their own data, even though all tenants share the same table.</p>
+
+  <pre><code><span class="cm">-- Schema</span>
+<span class="kw">CREATE TABLE</span> app.orders (
+  id         <span class="nm">serial</span>  <span class="nm">PRIMARY KEY</span>,
+  tenant_id  <span class="nm">int</span>     <span class="nm">NOT NULL</span>,
+  product    <span class="nm">text</span>    <span class="nm">NOT NULL</span>,
+  quantity   <span class="nm">int</span>     <span class="nm">NOT NULL</span>,
+  created_at <span class="nm">timestamptz</span> <span class="kw">DEFAULT</span> <span class="fn">now</span>()
+);
+
+<span class="cm">-- Enable RLS (no rows visible until policy is created)</span>
+<span class="kw">ALTER TABLE</span> app.orders <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="cm">-- Policy: each tenant sees and writes only their own rows</span>
+<span class="kw">CREATE POLICY</span> tenant_isolation <span class="kw">ON</span> app.orders
+  <span class="kw">AS PERMISSIVE</span>
+  <span class="kw">FOR ALL</span>
+  <span class="kw">TO</span> app_role
+  <span class="kw">USING</span>      (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>)
+  <span class="kw">WITH CHECK</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>);</code></pre>
+
+  <p>The application sets the tenant context at the start of each connection or transaction:</p>
+
+  <pre><code><span class="cm">-- At session/transaction start, before any query:</span>
+<span class="kw">SET</span> app.current_tenant = <span class="st">'42'</span>;
+
+<span class="cm">-- Now all queries against orders automatically filter to tenant 42:</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> app.orders;         <span class="cm">-- returns only tenant 42 rows</span>
+<span class="kw">INSERT INTO</span> app.orders (tenant_id, product, quantity)
+  <span class="kw">VALUES</span> (<span class="nm">42</span>, <span class="st">'widget'</span>, <span class="nm">5</span>);          <span class="cm">-- allowed</span>
+<span class="kw">INSERT INTO</span> app.orders (tenant_id, product, quantity)
+  <span class="kw">VALUES</span> (<span class="nm">99</span>, <span class="st">'widget'</span>, <span class="nm">5</span>);          <span class="cm">-- ERROR: fails WITH CHECK</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">current_setting second argument</div>
+    <p><code>current_setting('app.current_tenant', true)</code> — the second argument <code>true</code> means "return NULL if the setting is not set" rather than raising an error. This is important for maintenance sessions (e.g., DBA queries, pg_dump) that do not set the tenant context. Without <code>true</code>, any query by a role without that setting would throw a runtime error rather than safely returning no rows.</p>
+  </div>
+
+  <!-- ── 6. BYPASSRLS ── -->
+  <h2>6. The BYPASSRLS Attribute</h2>
+
+  <p>Some roles legitimately need to see all rows regardless of RLS policies — backup tools, cross-tenant reporting roles, DBA maintenance scripts.</p>
+
+  <pre><code><span class="cm">-- Superusers bypass RLS by default (no change needed)</span>
+
+<span class="cm">-- Grant BYPASSRLS to a non-superuser role that needs all-row access</span>
+<span class="kw">ALTER ROLE</span> reporting_admin <span class="nm">BYPASSRLS</span>;
+
+<span class="cm">-- Revoke it when no longer needed</span>
+<span class="kw">ALTER ROLE</span> reporting_admin <span class="nm">NOBYPASSRLS</span>;
+
+<span class="cm">-- Check which roles have BYPASSRLS:</span>
+<span class="kw">SELECT</span> rolname, rolbypassrls
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolbypassrls = <span class="nm">true</span>;</code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p><code>BYPASSRLS</code> is equivalent to superuser access <em>for data visibility</em>. A role with <code>BYPASSRLS</code> can read every row in every table that has RLS enabled, across all tenants. Treat it with the same caution as <code>SUPERUSER</code>. Audit it regularly. Do not grant it to service accounts or interactive user logins.</p>
+  </div>
+
+  <!-- ── 7. PERMISSIVE vs RESTRICTIVE ── -->
+  <h2>7. PERMISSIVE vs RESTRICTIVE Policies</h2>
+
+  <p>When multiple policies apply to the same table and role, PostgreSQL combines them using logic that depends on the policy type:</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+graph TD
+  Q["Query on protected table"]
+  P["Pass any PERMISSIVE policy?"]
+  R["Pass ALL RESTRICTIVE policies?"]
+  A["Row is visible / write is allowed"]
+  D1["Row is hidden / write is blocked\n(no permissive match)"]
+  D2["Row is hidden / write is blocked\n(restrictive failed)"]
+  Q --> P
+  P -->|Yes| R
+  P -->|No| D1
+  R -->|Yes| A
+  R -->|No| D2
+    </div>
+    <p class="diagram-caption">A row is accessible only when it passes at least one PERMISSIVE policy AND all RESTRICTIVE policies. Either failure alone blocks the row.</p>
+  </div>
+
+  <pre><code><span class="cm">-- PERMISSIVE: tenant sees their own rows (OR logic across permissive policies)</span>
+<span class="kw">CREATE POLICY</span> tenant_access <span class="kw">ON</span> app.orders
+  <span class="kw">AS PERMISSIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>);
+
+<span class="cm">-- RESTRICTIVE: never show soft-deleted rows, regardless of tenant (AND logic)</span>
+<span class="kw">CREATE POLICY</span> hide_deleted <span class="kw">ON</span> app.orders
+  <span class="kw">AS RESTRICTIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (deleted_at <span class="kw">IS NULL</span>);
+
+<span class="cm">-- Result: a row is visible only if tenant_id matches (permissive) AND deleted_at IS NULL (restrictive)</span>
+<span class="cm">-- Even if there is a second permissive policy that grants wider access,</span>
+<span class="cm">-- the RESTRICTIVE policy still blocks soft-deleted rows absolutely.</span></code></pre>
+
+  <p>Use <strong>PERMISSIVE</strong> for the primary access rule (who owns this row). Use <strong>RESTRICTIVE</strong> for absolute constraints that must hold for all users regardless of other policies (e.g., never show deleted rows, never show rows from a suspended tenant).</p>
+
+  <!-- ── 8. SQL Server deep comparison ── -->
+  <h2>8. SQL Server RLS vs PostgreSQL RLS — Side-by-Side</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Concept</th>
+        <th>SQL Server</th>
+        <th>PostgreSQL</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Enable RLS on a table</td>
+        <td><code>CREATE SECURITY POLICY</code> (schema object)</td>
+        <td><code>ALTER TABLE t ENABLE ROW LEVEL SECURITY</code></td>
+      </tr>
+      <tr>
+        <td>Filter visible rows</td>
+        <td><code>FILTER PREDICATE</code> on a function</td>
+        <td><code>USING (expression)</code> in CREATE POLICY</td>
+      </tr>
+      <tr>
+        <td>Block invalid inserts</td>
+        <td><code>BLOCK PREDICATE WITH (STATE = AFTER_INSERT)</code></td>
+        <td><code>WITH CHECK (expression)</code> in CREATE POLICY</td>
+      </tr>
+      <tr>
+        <td>Block invalid updates</td>
+        <td><code>BLOCK PREDICATE WITH (STATE = AFTER_UPDATE)</code></td>
+        <td><code>WITH CHECK</code> + <code>USING</code> on UPDATE policy</td>
+      </tr>
+      <tr>
+        <td>Default with no policy</td>
+        <td>All rows visible (opt-in filtering)</td>
+        <td>Zero rows visible (deny-by-default)</td>
+      </tr>
+      <tr>
+        <td>Bypass RLS</td>
+        <td>Members of <code>sysadmin</code> fixed server role</td>
+        <td>Superusers + roles with <code>BYPASSRLS</code> attribute</td>
+      </tr>
+      <tr>
+        <td>Policy logic combination</td>
+        <td>Multiple predicates ANDed together</td>
+        <td>PERMISSIVE (OR) and RESTRICTIVE (AND) separately</td>
+      </tr>
+      <tr>
+        <td>Session context for filter</td>
+        <td><code>SESSION_CONTEXT()</code> function</td>
+        <td><code>current_setting('app.key')</code> function</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── 9. Mistake 1 ── -->
+  <h2>9. Common Mistake 1 — Omitting WITH CHECK</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Writing a USING clause but no WITH CHECK clause for policies that cover INSERT.</strong> In SQL Server, the <code>FILTER PREDICATE</code> controls reads and the <code>BLOCK PREDICATE</code> controls writes — they are visually distinct in the DDL, making it obvious when you have only a read filter. In PostgreSQL, <code>USING</code> looks complete and self-sufficient. It is easy to think "I have a policy, inserts are covered."</p>
+    <p>They are not. A <code>USING</code>-only policy on a <code>FOR ALL</code> or <code>FOR INSERT</code> policy does not restrict <code>INSERT</code>. Tenant A can insert rows with <code>tenant_id = tenant_B</code> and those rows will silently be written to the database. Tenant A cannot read them back, but they are there, attributed to Tenant B.</p>
+    <p>Rule: for any multi-tenant table, always include both clauses:</p>
+    <pre style="margin-top:0.6em;"><code><span class="kw">USING</span>      (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>)
+<span class="kw">WITH CHECK</span> (tenant_id = <span class="fn">current_setting</span>(<span class="st">'app.current_tenant'</span>, <span class="nm">true</span>)::<span class="nm">int</span>)</code></pre>
+  </div>
+
+  <!-- ── 10. Mistake 2 ── -->
+  <h2>10. Common Mistake 2 — Relying on RLS Without Revoking Direct Grants</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Treating RLS as a replacement for GRANT/REVOKE rather than a complement to it.</strong> RLS policies filter rows — they do not prevent a role from accessing the table at all. If a role has been granted <code>SELECT</code> on a table, RLS will filter which rows it sees. But if you forget to remove a broad grant from an earlier migration, the role will still reach the table (seeing only its filtered rows, or all rows if it has BYPASSRLS).</p>
+    <p>RLS and privilege grants work at different layers:</p>
+    <ul>
+      <li>Privileges (<code>GRANT</code>/<code>REVOKE</code>): controls whether the role can <em>touch</em> the table</li>
+      <li>RLS policies: controls which <em>rows</em> the role can see or modify within that table</li>
+    </ul>
+    <p>Both layers must be correct. A properly scoped RLS policy on a table that has been accidentally granted <code>SELECT</code> to <code>PUBLIC</code> is not truly secure — any authenticated role can see its permitted rows.</p>
+  </div>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources — PostgreSQL Official Documentation</div>
+    <ul>
+      <li><a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html" target="_blank">PostgreSQL Docs: Row Security Policies</a> — the definitive reference for RLS</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-createpolicy.html" target="_blank">PostgreSQL Docs: CREATE POLICY</a> — full syntax and clause semantics</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-altertable.html" target="_blank">PostgreSQL Docs: ALTER TABLE</a> — ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY</li>
+      <li><a href="https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET" target="_blank">PostgreSQL Docs: current_setting()</a> — session context function used in policy expressions</li>
+    </ul>
+  </div>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A policy clause USING (tenant_id = current_setting('app.current_tenant')::int) controls which rows for which operations?"
+         data-correct="C"
+         data-feedback-correct="Correct. USING filters rows that already exist in the table. It applies to SELECT (which rows are visible), UPDATE (which rows can be the target of an update), and DELETE (which rows can be deleted). It does not constrain what values are written by INSERT — that is WITH CHECK's job."
+         data-feedback-wrong="Not quite. USING applies to existing rows — SELECT visibility, UPDATE targets, and DELETE targets. It does not apply to INSERT operations. To restrict what values can be inserted, you need WITH CHECK.">
+      <div class="quiz-option" data-key="A">Rows being inserted into the table by the current active session</div>
+      <div class="quiz-option" data-key="B">Rows being inserted or updated but not any rows being deleted</div>
+      <div class="quiz-option" data-key="C">Existing rows visible to SELECT and targetable by UPDATE and DELETE</div>
+      <div class="quiz-option" data-key="D">All rows in all schemas accessible to the current database role</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You run ALTER TABLE orders ENABLE ROW LEVEL SECURITY but create no policies. What does app_role see when it queries the table?"
+         data-correct="B"
+         data-feedback-correct="Correct. PostgreSQL's RLS is deny-by-default. With no policies, non-superuser roles see zero rows. This is the opposite of SQL Server's behavior, where RLS is additive and all rows are visible until a predicate narrows them."
+         data-feedback-wrong="Not quite. PostgreSQL RLS is deny-by-default. Enabling RLS with no policy means non-superuser roles see zero rows — not all rows, not an error. This is one of the most important behavioral differences from SQL Server's RLS implementation.">
+      <div class="quiz-option" data-key="A">All rows in the table, because no active policy restricts them</div>
+      <div class="quiz-option" data-key="B">Zero rows, because no policy permits access to any table row</div>
+      <div class="quiz-option" data-key="C">A permission denied error, because RLS blocks the table access entirely</div>
+      <div class="quiz-option" data-key="D">Only rows that app_role owns, based on the table owner attribute</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the security implication of granting BYPASSRLS to a role?"
+         data-correct="D"
+         data-feedback-correct="Correct. BYPASSRLS allows a role to see all rows in all RLS-protected tables, regardless of any policy. In a multi-tenant database, this means the role can read data for every tenant. Treat it with superuser-level caution."
+         data-feedback-wrong="Not quite. BYPASSRLS is not a table-specific or schema-specific grant. It is a role attribute. A role with BYPASSRLS bypasses all RLS policies on all tables it has SELECT access to, across all tenants. It is equivalent to superuser from a data visibility standpoint.">
+      <div class="quiz-option" data-key="A">The role can modify existing RLS policies on any tables it owns</div>
+      <div class="quiz-option" data-key="B">The role can create new RLS policies without needing ALTER TABLE privilege</div>
+      <div class="quiz-option" data-key="C">The role bypasses RLS only on tables within its own application schema</div>
+      <div class="quiz-option" data-key="D">The role sees all rows in all RLS-protected tables across all tenants</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You have two policies on the same table: a PERMISSIVE policy for tenant isolation and a RESTRICTIVE policy to hide soft-deleted rows. A row passes the tenant isolation check but has deleted_at set. What happens?"
+         data-correct="A"
+         data-feedback-correct="Correct. RESTRICTIVE policies must all pass for a row to be accessible. Even though the permissive policy grants access (the tenant owns the row), the restrictive policy's failure (deleted_at is not null) overrides it. The row is hidden."
+         data-feedback-wrong="Not quite. In PostgreSQL, a row is visible only when it passes at least one PERMISSIVE policy AND ALL RESTRICTIVE policies. Since the RESTRICTIVE policy fails (deleted_at is set), the row is hidden — regardless of whether the permissive policy would have allowed it.">
+      <div class="quiz-option" data-key="A">The row is hidden because all restrictive policies must pass for access</div>
+      <div class="quiz-option" data-key="B">The row is visible because the permissive policy matched the tenant successfully</div>
+      <div class="quiz-option" data-key="C">PostgreSQL raises an error because two conflicting policies exist on the table</div>
+      <div class="quiz-option" data-key="D">The row is visible only to superusers but hidden from other roles</div>
+    </div>
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Good questions for this lesson:
+    <ul style="margin-top:0.6em;">
+      <li>If I use connection pooling (PgBouncer), how do I safely pass the tenant context per query without a persistent session?</li>
+      <li>Can RLS policies reference other tables (e.g., a tenant_permissions lookup table), and what are the performance implications?</li>
+      <li>How does FORCE ROW LEVEL SECURITY differ from ENABLE ROW LEVEL SECURITY, and when would I use it?</li>
+    </ul>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0006-cicd-service-accounts.html">← Lesson 6: CI/CD Service Accounts</a>
+    <a href="0008-schema-security.html">Lesson 8: Schema Security →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

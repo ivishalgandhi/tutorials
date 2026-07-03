@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 9: SSL/TLS — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 9</span>
+    <span>PostgreSQL Security</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>SSL/TLS &mdash; Encrypting Data in Transit</h1>
+
+  <p>Every query you run, every password challenge exchanged, every row returned travels across a network socket. On a fully isolated single-machine deployment that socket never leaves the kernel. In every other case &mdash; application server to database, DBA laptop to database, replica to primary &mdash; unencrypted traffic is readable by anything sitting on the path. This lesson covers how PostgreSQL implements TLS, how to configure it correctly, and the precise difference between <em>encrypting</em> a connection and <em>verifying</em> it.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. Why TLS Matters Even on Internal Networks</h2>
+
+  <p>The most common objection to TLS on internal connections is: "we're inside the VPC / private subnet, nobody is sniffing." That reasoning has three flaws.</p>
+
+  <p><strong>Lateral movement.</strong> Once an attacker compromises any host on your internal network &mdash; a build server, a monitoring agent, a misconfigured container &mdash; they are inside the trust boundary. Without TLS, a compromised host adjacent to the database path can passively capture credentials and query results in cleartext.</p>
+
+  <p><strong>Compliance mandates encryption in transit regardless of network topology.</strong> PCI-DSS Requirement 4.2.1 requires strong cryptography for all transmission of cardholder data over open <em>and</em> internal networks. HIPAA Security Rule (45 CFR § 164.312(e)(1)) requires transmission security for ePHI. "Internal network" is not an exemption category in either standard.</p>
+
+  <p><strong>Cloud and container infrastructure is not equivalent to physical isolation.</strong> Multi-tenant cloud networks, software-defined overlays, and shared hypervisors all present threat surfaces that a private VLAN in a dedicated rack does not. Assume the wire is observable.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server enables TLS through two mechanisms: the certificate is bound in <strong>SQL Server Configuration Manager &rarr; Protocols &rarr; Certificate</strong>, and the <code>Force Encryption</code> flag forces all client connections to use TLS. PostgreSQL takes a file-based approach: certificate paths are declared in <code>postgresql.conf</code>, and whether TLS is required or optional is controlled per connection-type entry in <code>pg_hba.conf</code>. There is no GUI equivalent &mdash; everything is text configuration.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. Server-Side Configuration: postgresql.conf</h2>
+
+  <p>Four parameters in <code>postgresql.conf</code> control the TLS stack. Find your config file with <code>SHOW config_file;</code>. All file paths are relative to the data directory (<code>SHOW data_directory;</code>) unless you supply an absolute path.</p>
+
+  <pre><code><span class="cm"># postgresql.conf — TLS parameters</span>
+
+<span class="nm">ssl</span> = <span class="kw">on</span>                          <span class="cm"># master switch; default off on some builds</span>
+<span class="nm">ssl_cert_file</span>  = <span class="st">'server.crt'</span>    <span class="cm"># server's public certificate (PEM)</span>
+<span class="nm">ssl_key_file</span>   = <span class="st">'server.key'</span>    <span class="cm"># server's private key (PEM, must be mode 0600)</span>
+<span class="nm">ssl_ca_file</span>    = <span class="st">'root.crt'</span>      <span class="cm"># optional: CA cert for verifying client certs</span>
+                                  <span class="cm">#   required only when using cert auth (mTLS)</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>Changing <code>ssl</code>, <code>ssl_cert_file</code>, or <code>ssl_key_file</code> requires a <strong>server restart</strong>, not just a reload. PostgreSQL reads the certificate and key once at startup and holds them in memory. A <code>pg_reload_conf()</code> will not pick up new certificate files.</p>
+  </div>
+
+  <p>Two additional parameters worth knowing for production hardening:</p>
+
+  <pre><code><span class="nm">ssl_min_protocol_version</span> = <span class="st">'TLSv1.2'</span>   <span class="cm"># reject TLS 1.0 and 1.1 clients</span>
+<span class="nm">ssl_ciphers</span> = <span class="st">'HIGH:!aNULL:!MD5'</span>         <span class="cm"># OpenSSL cipher string; restricts weak suites</span></code></pre>
+
+  <p>The documentation for all SSL GUCs is at <a href="https://www.postgresql.org/docs/current/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SSL">postgresql.org/docs/current/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SSL</a>.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. Generating a Server Certificate</h2>
+
+  <h3>Self-signed (development and test only)</h3>
+
+  <p>A self-signed certificate gets TLS working immediately. It encrypts the connection. It does <em>not</em> provide any server identity verification &mdash; a client cannot distinguish your server from an impostor without a trusted CA chain. Use self-signed only for local development or throwaway test instances.</p>
+
+  <pre><code><span class="cm"># Generate a self-signed certificate valid for 365 days</span>
+openssl req -new -x509 -days <span class="nm">365</span> -nodes \
+  -out server.crt -keyout server.key \
+  -subj <span class="st">"/CN=my-postgres-server"</span>
+
+<span class="cm"># Lock down key permissions — PostgreSQL refuses to start if the key</span>
+<span class="cm"># is world-readable (modes 0644 or 0777 will cause startup failure)</span>
+chmod <span class="nm">600</span> server.key
+
+<span class="cm"># Set ownership to the postgres OS user</span>
+chown postgres:postgres server.key server.crt
+
+<span class="cm"># Copy both files into the PostgreSQL data directory</span>
+PGDATA=$(psql -U postgres -c <span class="st">"SHOW data_directory;"</span> -t | tr -d <span class="st">' '</span>)
+cp server.crt server.key <span class="st">"${PGDATA}"</span></code></pre>
+
+  <div class="callout danger">
+    <div class="label">Danger</div>
+    <p>Never use a self-signed certificate in a production environment. A self-signed cert encrypts traffic but provides no protection against a man-in-the-middle attack: an attacker can present their own self-signed cert during the TLS handshake and the client has no way to detect the substitution unless the client was pre-loaded with the exact expected certificate. For production, use a certificate signed by your internal CA or a public CA such as Let's Encrypt.</p>
+  </div>
+
+  <h3>Production: CA-signed certificate</h3>
+
+  <p>For production deployments, generate a CSR and have it signed by your organisation's internal CA, or use ACME automation (Let's Encrypt, HashiCorp Vault PKI):</p>
+
+  <pre><code><span class="cm"># Step 1: generate a key and CSR</span>
+openssl req -new -nodes \
+  -out server.csr -keyout server.key \
+  -subj <span class="st">"/CN=db01.internal.example.com"</span>
+
+<span class="cm"># Step 2: submit server.csr to your CA; receive server.crt back</span>
+<span class="cm"># Step 3: copy both files into PGDATA with correct ownership and mode</span>
+chmod <span class="nm">600</span> server.key
+chown postgres:postgres server.key server.crt</code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>In SQL Server, certificate binding is done through the <strong>SQL Server Configuration Manager</strong> GUI &mdash; you select a certificate from the Windows Certificate Store and SQL Server reads it from there. PostgreSQL has no certificate store integration; files are referenced directly by path in <code>postgresql.conf</code>. The operational implication: certificate rotation means replacing the files on disk and restarting PostgreSQL, not clicking through Configuration Manager.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. Requiring TLS in pg_hba.conf</h2>
+
+  <p>Enabling <code>ssl = on</code> in <code>postgresql.conf</code> makes TLS <em>available</em>. Whether it is <em>required</em> for a given connection is controlled by the connection type field in <code>pg_hba.conf</code>. Three type values are relevant:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Type field</th>
+        <th>What it means</th>
+        <th>When to use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>host</code></td>
+        <td>TCP connection, TLS optional. Accepts both encrypted and unencrypted connections.</td>
+        <td>Legacy clients that cannot support TLS. Should not appear in a new production deployment.</td>
+      </tr>
+      <tr>
+        <td><code>hostssl</code></td>
+        <td>TCP connection, TLS <strong>required</strong>. Connection is refused if the client does not negotiate TLS.</td>
+        <td>All production application and DBA connections. Use this exclusively for host-based rules.</td>
+      </tr>
+      <tr>
+        <td><code>hostnossl</code></td>
+        <td>TCP connection, TLS <strong>forbidden</strong>. Connection is refused if the client offers TLS.</td>
+        <td>Explicitly blocking TLS-capable clients from a specific path. Rarely useful; documents intent rather than adds security.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>A production <code>pg_hba.conf</code> combining these correctly:</p>
+
+  <pre><code><span class="cm"># pg_hba.conf — enforce TLS for all network connections</span>
+
+<span class="cm"># Application connections: TLS required, SCRAM password auth</span>
+<span class="nm">hostssl</span>  <span class="fn">mydb</span>  <span class="fn">app_user</span>   <span class="st">10.0.2.0/24</span>   <span class="kw">scram-sha-256</span>
+
+<span class="cm"># Admin access via local Unix socket: no TLS (sockets are in-kernel)</span>
+<span class="nm">local</span>    <span class="kw">all</span>   postgres              <span class="fn">peer</span>
+
+<span class="cm"># Catch-all: reject anything not explicitly permitted above</span>
+<span class="nm">host</span>     <span class="kw">all</span>   <span class="kw">all</span>        <span class="st">0.0.0.0/0</span>     <span class="fn">reject</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security-Critical</div>
+    <p>The single most common TLS misconfiguration in PostgreSQL is using <code>host</code> instead of <code>hostssl</code> in <code>pg_hba.conf</code>. With <code>host</code>, the server <em>offers</em> TLS but does not enforce it. A misconfigured client &mdash; or an attacker performing a downgrade attack &mdash; can connect in cleartext. The <code>hostssl</code> keyword is the only way to guarantee that no unencrypted network connection ever reaches the authentication phase.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Client Certificate Authentication (Mutual TLS)</h2>
+
+  <p>Standard TLS authenticates the <em>server</em> to the <em>client</em>. Mutual TLS (mTLS) goes further: the client must also present a certificate signed by a trusted CA, and the CN of that certificate is mapped to a PostgreSQL role. This replaces password authentication entirely for the highest-assurance service connections.</p>
+
+  <p>Server-side setup:</p>
+
+  <pre><code><span class="cm"># postgresql.conf: point to the CA that signed client certificates</span>
+<span class="nm">ssl_ca_file</span> = <span class="st">'root.crt'</span>   <span class="cm"># your internal CA's root certificate</span>
+
+<span class="cm"># pg_hba.conf: use cert method (no password — certificate IS the credential)</span>
+<span class="nm">hostssl</span>  <span class="fn">mydb</span>  <span class="fn">app_user</span>  <span class="st">10.0.2.0/24</span>  <span class="kw">cert</span></code></pre>
+
+  <p>The client (application) connection string parameters:</p>
+
+  <pre><code><span class="cm">-- psql connection string with client certificate</span>
+psql <span class="st">"host=db.internal.example.com \
+      dbname=mydb \
+      sslcert=client.crt \
+      sslkey=client.key \
+      sslrootcert=root.crt \
+      sslmode=verify-full"</span>
+
+<span class="cm">-- libpq environment variable equivalents (useful for application config)</span>
+<span class="cm">-- PGSSLCERT=client.crt</span>
+<span class="cm">-- PGSSLKEY=client.key</span>
+<span class="cm">-- PGSSLROOTCERT=root.crt</span>
+<span class="cm">-- PGSSLMODE=verify-full</span></code></pre>
+
+  <p>The CN of the client certificate must exactly match the PostgreSQL role name unless you configure a <code>pg_ident.conf</code> mapping. If the role is <code>app_user</code>, the certificate CN must be <code>app_user</code>.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server supports certificate-based authentication for logins, but it is rarely deployed in practice outside of Always Encrypted scenarios. PostgreSQL <code>cert</code> authentication is more commonly used &mdash; it is a clean way to authenticate service accounts (CI/CD pipelines, microservices) without storing passwords anywhere. Think of it as the PostgreSQL equivalent of Azure Managed Identity or certificate-based service principal authentication.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. The sslmode Connection Parameter</h2>
+
+  <p><code>sslmode</code> is a client-side parameter that controls <em>how much</em> the client validates the server's TLS certificate. There are six levels. Most developers default to <code>prefer</code> or <code>require</code>, neither of which actually validates the server's identity.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>sslmode</th>
+        <th>Encrypts?</th>
+        <th>Verifies CA?</th>
+        <th>Verifies hostname?</th>
+        <th>MITM protection</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>disable</code></td>
+        <td>No</td>
+        <td>No</td>
+        <td>No</td>
+        <td>None</td>
+      </tr>
+      <tr>
+        <td><code>allow</code></td>
+        <td>Only if server insists</td>
+        <td>No</td>
+        <td>No</td>
+        <td>None</td>
+      </tr>
+      <tr>
+        <td><code>prefer</code></td>
+        <td>If available (default libpq)</td>
+        <td>No</td>
+        <td>No</td>
+        <td>None</td>
+      </tr>
+      <tr>
+        <td><code>require</code></td>
+        <td>Yes</td>
+        <td>No</td>
+        <td>No</td>
+        <td>None &mdash; encrypts but does not verify</td>
+      </tr>
+      <tr>
+        <td><code>verify-ca</code></td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>No</td>
+        <td>Partial &mdash; blocks unknown CAs but not CN substitution</td>
+      </tr>
+      <tr>
+        <td><code>verify-full</code></td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td><strong>Full</strong> &mdash; the only mode that prevents MITM</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout security">
+    <div class="label">Security-Critical</div>
+    <p><code>sslmode=require</code> is <strong>not</strong> secure against man-in-the-middle attacks. It enforces encryption but performs zero certificate validation. An attacker with the ability to intercept your network traffic can present any certificate &mdash; including a self-signed one &mdash; and your client will complete the TLS handshake, encrypting traffic to the attacker's key rather than your server's key. <code>sslmode=verify-full</code> is the only setting that actually prevents this. It requires that <code>sslrootcert</code> is also set to the CA certificate that signed the server's certificate.</p>
+  </div>
+
+  <p>The documentation for all client SSL parameters is at <a href="https://www.postgresql.org/docs/current/libpq-ssl.html">postgresql.org/docs/current/libpq-ssl.html</a>.</p>
+
+  <h3>Connection string examples</h3>
+
+  <pre><code><span class="cm">-- Wrong: encrypts but does not verify; MITM is possible</span>
+postgresql://app_user:password@db.example.com/mydb?sslmode=require
+
+<span class="cm">-- Correct: encrypts AND verifies server identity</span>
+postgresql://app_user:password@db.example.com/mydb?sslmode=verify-full&amp;sslrootcert=/etc/ssl/certs/internal-ca.crt
+
+<span class="cm">-- For JDBC (Java applications): equivalent settings</span>
+<span class="cm">-- jdbc:postgresql://db.example.com/mydb?ssl=true&amp;sslmode=verify-full&amp;sslrootcert=/etc/ssl/certs/internal-ca.crt</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. Verifying TLS Is Active</h2>
+
+  <p>PostgreSQL provides the <code>pg_stat_ssl</code> view to inspect the TLS status of every current connection. Run this from any connected session:</p>
+
+  <pre><code><span class="cm">-- Check TLS status of your own current connection</span>
+<span class="kw">SELECT</span> ssl, version, cipher, bits, client_dn
+<span class="kw">FROM</span>   pg_stat_ssl
+<span class="kw">WHERE</span>  pid = <span class="fn">pg_backend_pid</span>();
+
+<span class="cm">-- Example output when TLS is active:</span>
+<span class="cm">--  ssl  | version |         cipher          | bits | client_dn</span>
+<span class="cm">-- ------+---------+-------------------------+------+----------</span>
+<span class="cm">--  t    | TLSv1.3 | TLS_AES_256_GCM_SHA384  |  256 |</span>
+
+<span class="cm">-- If ssl = f, the connection is unencrypted</span>
+
+<span class="cm">-- See all current connections and their TLS status (superuser or</span>
+<span class="cm">-- pg_monitor role required to see other backends)</span>
+<span class="kw">SELECT</span> pid, ssl, version, cipher, bits, client_dn, compression
+<span class="kw">FROM</span>   pg_stat_ssl
+<span class="kw">ORDER BY</span> ssl <span class="kw">DESC</span>;
+
+<span class="cm">-- client_dn is non-null only when client certificate auth (cert method) is used</span>
+<span class="cm">-- compression is almost always f — TLS compression has been deprecated</span></code></pre>
+
+  <p>The view documentation is at <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SSL-VIEW">postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SSL-VIEW</a>.</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant P as PostgreSQL
+    Note over C,P: TLS Handshake (before any auth)
+    C->>P: ClientHello (TLS version, cipher list)
+    P->>C: ServerHello + server.crt
+    Note over C: sslmode=verify-full:<br/>validate CA chain + hostname
+    C->>P: ClientKeyExchange (encrypted)
+    Note over C,P: Encrypted channel established
+    C->>P: scram-sha-256 auth exchange
+    P->>C: AuthenticationOk
+    C->>P: Queries (all encrypted)
+    </div>
+    <p class="diagram-caption">Figure 1. TLS handshake precedes PostgreSQL authentication. Credentials never travel over an unencrypted channel when hostssl and verify-full are both in use.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>8. Common Mistakes</h2>
+
+  <h3>Mistake 1: sslmode=require in application connection strings</h3>
+
+  <p>As shown in the table above, <code>sslmode=require</code> enforces <em>encryption</em> but does not validate <em>server identity</em>. It is better than plaintext, but it is not actually secure against a network-level attacker. The fix is always <code>sslmode=verify-full</code> combined with a valid <code>sslrootcert</code> pointing to the CA that signed the server's certificate.</p>
+
+  <p>This is a pervasive mistake because many tutorials, ORMs, and cloud provider documentation examples show <code>sslmode=require</code> as "enabling SSL." It does enable the protocol; it does not enable trust verification.</p>
+
+  <h3>Mistake 2: World-readable server.key causes cryptic startup failure</h3>
+
+  <p>PostgreSQL refuses to start if <code>ssl_key_file</code> is readable by anyone other than the owner. The startup error in the PostgreSQL log is:</p>
+
+  <pre><code><span class="cm">FATAL:  private key file "server.key" has group or world access
+DETAIL: File must have permissions u=rw (0600) or less to be used as</span>
+<span class="cm">        the server's private key file.</span></code></pre>
+
+  <p>This is correct security behaviour &mdash; a world-readable private key is compromised &mdash; but the error confuses DBAs who do not immediately connect the startup failure to a file permissions issue. The fix:</p>
+
+  <pre><code>chmod <span class="nm">600</span> /var/lib/postgresql/data/server.key
+chown postgres:postgres /var/lib/postgresql/data/server.key</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>PostgreSQL Documentation: SSL Support</strong><br>
+    <a href="https://www.postgresql.org/docs/current/ssl-tcp.html">postgresql.org/docs/current/ssl-tcp.html</a><br><br>
+    <strong>Client SSL Connection Parameters (libpq)</strong><br>
+    <a href="https://www.postgresql.org/docs/current/libpq-ssl.html">postgresql.org/docs/current/libpq-ssl.html</a><br><br>
+    <strong>SSL Configuration Parameters (postgresql.conf)</strong><br>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SSL">postgresql.org/docs/current/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SSL</a><br><br>
+    <strong>pg_stat_ssl view</strong><br>
+    <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SSL-VIEW">postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SSL-VIEW</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz &mdash; Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="In pg_hba.conf, which connection type field guarantees that the client must use TLS — the connection is refused if TLS is not negotiated?"
+         data-correct="B"
+         data-feedback-correct="Correct. hostssl requires TLS; the connection is rejected at the protocol level if the client does not initiate a TLS handshake. The plain host type accepts both encrypted and unencrypted connections."
+         data-feedback-wrong="Not quite. The correct answer is B: hostssl. The host type permits TLS but does not require it, leaving open the possibility of plaintext connections from misconfigured clients.">
+      <div class="quiz-option" data-key="A">host, because it accepts all valid TCP connections including encrypted ones</div>
+      <div class="quiz-option" data-key="B">hostssl, because it enforces TLS and rejects connections not negotiating it</div>
+      <div class="quiz-option" data-key="C">hostnossl, because it explicitly blocks connections that do not enforce SSL</div>
+      <div class="quiz-option" data-key="D">local, because Unix socket connections rely on kernel-level encryption by default</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which sslmode value is the only one that fully prevents a man-in-the-middle attack by both encrypting the connection and verifying the server's hostname against its certificate?"
+         data-correct="D"
+         data-feedback-correct="Correct. verify-full validates the full certificate chain against the CA and also verifies that the server's certificate CN or SAN matches the hostname in the connection string. This is the only mode that prevents MITM attacks."
+         data-feedback-wrong="Not quite. The correct answer is D: verify-full. sslmode=require encrypts traffic but performs no certificate validation, leaving the connection vulnerable to a MITM attacker who substitutes their own certificate.">
+      <div class="quiz-option" data-key="A">require, because it mandates an encrypted channel for every single connection attempt</div>
+      <div class="quiz-option" data-key="B">prefer, because it uses TLS when available and falls back gracefully otherwise</div>
+      <div class="quiz-option" data-key="C">verify-ca, because it confirms the certificate was signed by a trusted authority</div>
+      <div class="quiz-option" data-key="D">verify-full, because it checks both the CA chain and server hostname match</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You have connected to a PostgreSQL instance and want to confirm that your current session is using TLS. Which query shows you the SSL status, TLS version, and cipher for your own connection?"
+         data-correct="C"
+         data-feedback-correct="Correct. pg_stat_ssl joined on pid = pg_backend_pid() returns TLS metadata for the current backend. The ssl column is true when TLS is active, false when the connection is unencrypted."
+         data-feedback-wrong="Not quite. The correct answer is C. SHOW ssl shows whether the server has TLS enabled globally; it does not tell you whether your specific connection is actually encrypted. pg_stat_ssl is the right view.">
+      <div class="quiz-option" data-key="A">SHOW ssl returns whether your session is currently using TLS encryption</div>
+      <div class="quiz-option" data-key="B">SELECT * FROM pg_settings WHERE name = 'ssl' shows server TLS</div>
+      <div class="quiz-option" data-key="C">SELECT ssl, version, cipher, bits FROM pg_stat_ssl WHERE pid = pg_backend_pid()</div>
+      <div class="quiz-option" data-key="D">SELECT pg_is_in_recovery() returns the TLS state of the current primary connection</div>
+    </div>
+
+    <div class="quiz"
+         data-question="After generating a self-signed server certificate, PostgreSQL refuses to start and logs a permissions error about server.key. What is the required file mode for the private key file?"
+         data-correct="A"
+         data-feedback-correct="Correct. The private key must be mode 0600 (owner read/write only) or more restrictive. PostgreSQL will not start with a key that has group or world read permissions, which is the correct security behaviour."
+         data-feedback-wrong="Not quite. The correct answer is A: 0600. PostgreSQL enforces that the key is readable only by its owner. Mode 0644 (world-readable) or 0640 (group-readable) will both cause the startup failure described in the error message.">
+      <div class="quiz-option" data-key="A">0600, owner read and write only, no permissions for group or other users</div>
+      <div class="quiz-option" data-key="B">0640, owner read and write with read access granted to the postgres group</div>
+      <div class="quiz-option" data-key="C">0644, standard file mode that lets any system user read the private key</div>
+      <div class="quiz-option" data-key="D">0755, executable permission is too permissive and prevents PostgreSQL from loading the key</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Some good prompts for this lesson: "How do I rotate a PostgreSQL SSL certificate without downtime?", "What is the difference between ssl_ca_file and ssl_cert_file?", "How do I configure sslmode=verify-full in a SQLAlchemy or Node.js connection string?", or "Can I use Let's Encrypt certificates with PostgreSQL?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0008-schema-security.html">&larr; Lesson 8: Schema Security</a>
+    <a href="0010-auditing-pgaudit.html">Lesson 10: Auditing and Logging &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

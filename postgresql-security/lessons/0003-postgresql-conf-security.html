@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: postgresql.conf Security Parameters — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 3</span>
+    <span>PostgreSQL Security</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>postgresql.conf Security Parameters — The 12 GUCs Every DBA Must Know</h1>
+
+  <p>pg_hba.conf controls <em>who</em> can connect. <code>postgresql.conf</code> controls <em>how</em> the server behaves once they are connected — and several of its parameters are directly security-critical. This lesson covers the twelve Grand Unified Configuration parameters that every security-conscious DBA must understand and actively manage.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. What a GUC Is</h2>
+
+  <p>PostgreSQL calls every configuration parameter a <strong>GUC</strong> — Grand Unified Configuration. The name reflects that a single system governs parameters across a wide range of categories: memory, connections, WAL, query planning, and security. Every GUC has a name, a value, a data type, a default, and a <em>context</em> that determines when a change to that parameter takes effect.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>GUCs are PostgreSQL's equivalent of <code>sp_configure</code> options in SQL Server. Just as <code>sp_configure 'max degree of parallelism', 4</code> sets a server-level behaviour, <code>ALTER SYSTEM SET max_parallel_workers = 4</code> sets a GUC at the instance level. The key difference: in SQL Server, most <code>sp_configure</code> changes require <code>RECONFIGURE</code> (and some require <code>RECONFIGURE WITH OVERRIDE</code>). In PostgreSQL, some GUC changes require only a reload, while others require a full server restart — and the system is explicit about which is which.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. How to Inspect Current Values</h2>
+
+  <pre><code><span class="cm">-- Show one parameter</span>
+<span class="kw">SHOW</span> ssl;
+<span class="kw">SHOW</span> listen_addresses;
+
+<span class="cm">-- Show all parameters at once</span>
+<span class="kw">SHOW</span> <span class="kw">all</span>;
+
+<span class="cm">-- The pg_settings view is more powerful — includes source file, context, and units</span>
+<span class="kw">SELECT</span> name, setting, unit, context, source, sourcefile, sourceline
+<span class="kw">FROM</span>   pg_settings
+<span class="kw">WHERE</span>  name <span class="kw">IN</span> (<span class="st">'ssl'</span>, <span class="st">'listen_addresses'</span>, <span class="st">'password_encryption'</span>,
+               <span class="st">'log_connections'</span>, <span class="st">'log_statement'</span>)
+<span class="kw">ORDER BY</span> name;
+
+<span class="cm">-- 'context' column tells you how to apply a change:
+--   postmaster  → requires full server restart
+--   sighup      → reload only (SELECT pg_reload_conf())
+--   superuser   → can be changed per-session by a superuser
+--   user        → can be changed per-session by any user</span>
+
+<span class="cm">-- Show only security-relevant parameters that are not at their default</span>
+<span class="kw">SELECT</span> name, setting, boot_val <span class="kw">AS</span> default_val, source
+<span class="kw">FROM</span>   pg_settings
+<span class="kw">WHERE</span>  setting != boot_val
+<span class="kw">AND</span>    name <span class="kw">LIKE ANY</span>(<span class="kw">ARRAY</span>[<span class="st">'%ssl%'</span>, <span class="st">'%log%'</span>, <span class="st">'%auth%'</span>, <span class="st">'%encrypt%'</span>])
+<span class="kw">ORDER BY</span> name;</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. The 12 Security GUCs</h2>
+
+  <h3>Category A — SSL/TLS (4 Parameters)</h3>
+
+  <p>These four parameters govern encrypted transport between clients and the PostgreSQL server. Without SSL, all query text, result data, and credentials travel in cleartext — including passwords even when using <code>scram-sha-256</code>, because the password exchange itself is the plaintext that gets encrypted by the TLS layer. The official documentation is at <a href="https://www.postgresql.org/docs/current/ssl-tcp.html">postgresql.org/docs/current/ssl-tcp.html</a>.</p>
+
+  <h4>ssl</h4>
+
+  <pre><code><span class="cm">-- Enable TLS support
+-- Default: on in PostgreSQL 14+ (was off in earlier versions)
+-- Context: postmaster (requires restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> ssl = <span class="st">'on'</span>;
+
+<span class="cm">-- Verify:</span>
+<span class="kw">SHOW</span> ssl;  <span class="cm">-- should return 'on'</span></code></pre>
+
+  <p>Setting <code>ssl = on</code> enables the server to accept TLS connections. It does not <em>require</em> TLS — that enforcement happens in pg_hba.conf using <code>hostssl</code> entries. Think of <code>ssl = on</code> as "TLS is available" and <code>hostssl</code> as "TLS is mandatory for this rule."</p>
+
+  <h4>ssl_cert_file and ssl_key_file</h4>
+
+  <pre><code><span class="cm">-- Paths to the server certificate and private key
+-- Context: postmaster (requires restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> ssl_cert_file = <span class="st">'/etc/ssl/certs/pg-server.crt'</span>;
+<span class="kw">ALTER SYSTEM SET</span> ssl_key_file  = <span class="st">'/etc/ssl/private/pg-server.key'</span>;
+
+<span class="cm">-- Quick self-signed certificate for testing (run as postgres OS user):
+-- openssl req -new -x509 -days 365 -nodes \
+--   -subj "/CN=db.example.com" \
+--   -out /etc/ssl/certs/pg-server.crt \
+--   -keyout /etc/ssl/private/pg-server.key
+-- chmod 600 /etc/ssl/private/pg-server.key
+-- chown postgres:postgres /etc/ssl/private/pg-server.key</span></code></pre>
+
+  <h4>ssl_ca_file</h4>
+
+  <pre><code><span class="cm">-- Path to the CA certificate used to verify CLIENT certificates
+-- Only needed if you are using cert-based client authentication
+-- Context: postmaster (requires restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> ssl_ca_file = <span class="st">'/etc/ssl/certs/internal-ca.crt'</span>;</code></pre>
+
+  <h4>password_encryption</h4>
+
+  <pre><code><span class="cm">-- Controls how passwords are hashed when stored in pg_authid
+-- Default in PG14+: scram-sha-256
+-- Default in PG13 and earlier: md5
+-- Context: sighup (reload only — no restart needed)</span>
+<span class="kw">ALTER SYSTEM SET</span> password_encryption = <span class="st">'scram-sha-256'</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- IMPORTANT: changing this setting only affects NEW passwords.
+-- Existing users retain their old hash until their password is reset.
+-- To identify users with legacy md5 hashes:</span>
+<span class="kw">SELECT</span> rolname, rolpassword
+<span class="kw">FROM</span>   pg_authid
+<span class="kw">WHERE</span>  rolpassword <span class="kw">LIKE</span> <span class="st">'md5%'</span>
+<span class="kw">AND</span>    rolcanlogin = <span class="kw">true</span>;
+
+<span class="cm">-- Force a password reset for those users:</span>
+<span class="kw">ALTER ROLE</span> legacy_user <span class="kw">PASSWORD</span> <span class="st">'new_strong_password'</span>;
+<span class="cm">-- Their hash is now stored as scram-sha-256.</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>After setting <code>password_encryption = scram-sha-256</code>, you must also update the pg_hba.conf METHOD from <code>md5</code> to <code>scram-sha-256</code> for each relevant entry. The pg_hba.conf METHOD and the stored hash must agree. A mismatch causes authentication failures — md5-hashed credentials cannot satisfy a scram-sha-256 challenge and vice versa.</p>
+  </div>
+
+  <!-- ─────────────────────────────── -->
+  <h3>Category B — Network Exposure (3 Parameters)</h3>
+
+  <h4>listen_addresses</h4>
+
+  <pre><code><span class="cm">-- Which network interfaces PostgreSQL binds to
+-- Default: 'localhost'
+-- Context: postmaster (requires restart)</span>
+
+<span class="cm">-- Safest — only local socket and loopback TCP:</span>
+<span class="kw">ALTER SYSTEM SET</span> listen_addresses = <span class="st">'localhost'</span>;
+
+<span class="cm">-- Bind to a specific interface (recommended for multi-NIC servers):</span>
+<span class="kw">ALTER SYSTEM SET</span> listen_addresses = <span class="st">'10.0.1.20'</span>;
+
+<span class="cm">-- Bind to all interfaces — use only when network-level controls are in place:</span>
+<span class="kw">ALTER SYSTEM SET</span> listen_addresses = <span class="st">'*'</span>;</code></pre>
+
+  <div class="callout danger">
+    <div class="label">Danger — listen_addresses = '*'</div>
+    <p>Setting <code>listen_addresses = '*'</code> means PostgreSQL binds to every network interface on the host, including any interface exposed to the internet. The blast radius: every port-scanning service on the internet immediately sees a PostgreSQL service. Even with pg_hba.conf correctly configured, you have increased attack surface — unexpected interfaces, cloud provider management networks, or a misconfigured firewall rule can expose the port. Bind to the minimum set of interfaces required. If the application lives on the same server, <code>localhost</code> is sufficient.</p>
+  </div>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p><code>listen_addresses</code> maps to the TCP/IP protocol binding in SQL Server Configuration Manager (<strong>SQL Server Network Configuration &rarr; Protocols for [instance] &rarr; TCP/IP &rarr; IP Addresses</strong>). In SQL Server, you can enable or disable specific IP addresses individually; in PostgreSQL you specify a comma-separated list of addresses or <code>*</code> for all.</p>
+  </div>
+
+  <h4>port</h4>
+
+  <pre><code><span class="cm">-- TCP port PostgreSQL listens on. Default: 5432
+-- Context: postmaster (requires restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> port = <span class="nm">5432</span>;
+
+<span class="cm">-- Changing the port reduces automated scan noise but provides no
+-- real security barrier. A determined attacker will port-scan all 65535 ports.
+-- Never rely on a non-standard port as a security control.
+-- Document any port change and update your firewall rules accordingly.</span></code></pre>
+
+  <h4>max_connections</h4>
+
+  <pre><code><span class="cm">-- Maximum simultaneous client connections
+-- Default: 100
+-- Context: postmaster (requires restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> max_connections = <span class="nm">200</span>;
+
+<span class="cm">-- Security relevance: a low max_connections cap limits the blast radius
+-- of a connection flood (DoS). When all slots are consumed, new connections
+-- are refused. Set it to the application's realistic peak plus a small
+-- reserve for DBA emergency access (e.g., use pg_hba.conf to reserve
+-- connections via the reserved_connections GUC in PG16+).
+
+-- In PG16+, reserve connections for superusers explicitly:</span>
+<span class="kw">ALTER SYSTEM SET</span> reserved_connections = <span class="nm">3</span>;  <span class="cm">-- PG16+</span>
+<span class="cm">-- superuser_reserved_connections remains available in all versions:</span>
+<span class="kw">ALTER SYSTEM SET</span> superuser_reserved_connections = <span class="nm">3</span>;</code></pre>
+
+  <!-- ─────────────────────────────── -->
+  <h3>Category C — Logging (5 Parameters)</h3>
+
+  <p>PostgreSQL's built-in logging is not a compliance-grade audit trail — that requires the <code>pgaudit</code> extension — but these five parameters provide a meaningful operational security baseline. The logging documentation lives at <a href="https://www.postgresql.org/docs/current/runtime-config-logging.html">postgresql.org/docs/current/runtime-config-logging.html</a>.</p>
+
+  <h4>log_connections and log_disconnections</h4>
+
+  <pre><code><span class="cm">-- Log every successful connection (log_connections)
+-- and every session termination (log_disconnections)
+-- Context: sighup (reload — no restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> log_connections    = <span class="st">'on'</span>;
+<span class="kw">ALTER SYSTEM SET</span> log_disconnections = <span class="st">'on'</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- Sample log output with log_connections = on:
+-- LOG:  connection received: host=10.0.1.50 port=54321
+-- LOG:  connection authorized: user=app_user database=appdb SSL enabled
+--
+-- This is invaluable for spotting unexpected connection sources,
+-- unusual connection counts, and authentication timing patterns.</span></code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server logs successful logins only when the Login Auditing setting (Server Properties &rarr; Security) is set to "Both failed and successful logins." PostgreSQL's <code>log_connections</code> is the equivalent — and like SQL Server, it produces one log line per connection, which can be high volume in connection-pooled environments. Use a connection pooler like PgBouncer in such cases; it will reduce the raw connection count PostgreSQL sees.</p>
+  </div>
+
+  <h4>log_connections and Failed Authentication</h4>
+
+  <pre><code><span class="cm">-- PostgreSQL does not have a standalone GUC named log_failed_authentications.
+-- Failed authentication attempts are logged automatically at LOG severity
+-- regardless of log_connections setting.
+--
+-- You control the minimum message level written to the log file via:
+--   log_min_messages (default: warning)
+--   client_min_messages (default: notice)
+--
+-- To ensure failed auth messages appear in the log:</span>
+<span class="kw">ALTER SYSTEM SET</span> log_min_messages = <span class="st">'info'</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- Sample failed auth log entry:
+-- LOG:  connection received: host=192.168.99.1 port=41234
+-- FATAL: password authentication failed for user "app_user"
+-- DETAIL: Connection matched pg_hba.conf line 5: "hostssl appdb app_user ..."
+--
+-- The DETAIL line is only shown to superusers and to the client.
+-- Non-superuser clients see only the FATAL line without details.</span></code></pre>
+
+  <h4>log_statement</h4>
+
+  <pre><code><span class="cm">-- Controls which SQL statements are written to the log.
+-- Context: sighup (reload — no restart)
+--
+-- Values:
+--   none  — log nothing (default)
+--   ddl   — log CREATE, ALTER, DROP, TRUNCATE (schema changes only)
+--   mod   — log ddl + INSERT, UPDATE, DELETE, COPY (data-modifying statements)
+--   all   — log every statement including SELECT</span>
+
+<span class="cm">-- Recommended starting point for most production systems:</span>
+<span class="kw">ALTER SYSTEM SET</span> log_statement = <span class="st">'ddl'</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- For compliance environments, use pgaudit instead of log_statement = 'all':
+-- pgaudit produces structured, per-object audit records that can be filtered
+-- without the noise of log_statement = 'all' (see the pgaudit warning below).</span></code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p><code>log_statement = 'ddl'</code> approximates SQL Server's Schema Changes audit action group. <code>log_statement = 'mod'</code> approximates the DML audit action groups. <code>log_statement = 'all'</code> is closest to SQL Server Audit at the database level with all statement-level actions enabled. However, SQL Server Audit writes to a structured binary audit log; <code>log_statement</code> writes to the text-based PostgreSQL log file. For structured, queryable audit output in PostgreSQL, use the <code>pgaudit</code> extension.</p>
+  </div>
+
+  <h4>log_line_prefix</h4>
+
+  <pre><code><span class="cm">-- A printf-style format string prepended to every log line.
+-- Context: sighup (reload — no restart)
+--
+-- Format codes:
+--   %m  — timestamp with milliseconds
+--   %p  — process ID
+--   %u  — database user name
+--   %d  — database name
+--   %r  — remote host and port
+--   %a  — application name
+--   %q  — stop here in non-session processes (silences background worker noise)
+--   %i  — command tag (e.g., SELECT, UPDATE)
+--   %e  — SQLSTATE error code</span>
+
+<span class="cm">-- Recommended format: timestamp [pid] user@database — supports log parsing tools</span>
+<span class="kw">ALTER SYSTEM SET</span> log_line_prefix = <span class="st">'%m [%p] %q%u@%d '</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- Sample output with this prefix:
+-- 2024-03-15 14:22:01.823 UTC [18432] app_user@appdb SELECT ...</span>
+
+<span class="cm">-- Extended prefix for environments using log aggregation (Splunk, Datadog, etc.):
+-- ALTER SYSTEM SET log_line_prefix = '%m [%p] %q%u@%d %r %a ';</span></code></pre>
+
+  <!-- ─────────────────────────────── -->
+  <h3>Category D — Row Security Guard</h3>
+
+  <h4>row_security</h4>
+
+  <pre><code><span class="cm">-- Global switch: if 'off', Row Level Security policies are bypassed
+-- for all users (including non-superusers). Default: on.
+-- Context: sighup (reload — no restart)</span>
+<span class="kw">ALTER SYSTEM SET</span> row_security = <span class="st">'on'</span>;
+
+<span class="cm">-- This GUC is a guard, not the policy itself.
+-- RLS policies are defined at the table level with:
+--   ALTER TABLE employees ENABLE ROW LEVEL SECURITY;
+--   CREATE POLICY staff_isolation ON employees
+--     USING (department = current_setting('app.department'));
+--
+-- Even with row_security = on, a SUPERUSER or table owner bypasses all policies
+-- unless the table was created with FORCE ROW LEVEL SECURITY:
+--   ALTER TABLE employees FORCE ROW LEVEL SECURITY;</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. SQL Server Mapping Table</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>PostgreSQL GUC</th>
+        <th>SQL Server Equivalent</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ssl_cert_file</code> / <code>ssl_key_file</code></td>
+        <td>Certificate binding in SQL Server Configuration Manager</td>
+        <td>Both bind a TLS certificate to the database listener; PostgreSQL references files directly, SQL Server uses the Windows certificate store.</td>
+      </tr>
+      <tr>
+        <td><code>listen_addresses</code></td>
+        <td>TCP/IP protocol binding (SQL Server Configuration Manager &rarr; IP Addresses)</td>
+        <td>Both control which network interfaces the database engine listens on.</td>
+      </tr>
+      <tr>
+        <td><code>port</code></td>
+        <td>TCP port in SQL Server Configuration Manager</td>
+        <td>Default 5432 vs. 1433. Dynamic ports vs. static ports in SQL Server have no PostgreSQL equivalent.</td>
+      </tr>
+      <tr>
+        <td><code>password_encryption</code></td>
+        <td>No direct equivalent; SQL Server uses its own algorithm</td>
+        <td>SQL Server does not expose the password hashing algorithm as a configurable parameter.</td>
+      </tr>
+      <tr>
+        <td><code>log_connections</code></td>
+        <td>Login Auditing: Successful logins (Server Properties &rarr; Security)</td>
+        <td>Both produce one log entry per successful connection.</td>
+      </tr>
+      <tr>
+        <td><code>log_statement = 'ddl'</code></td>
+        <td>SQL Server Audit: Schema Changes action group</td>
+        <td>SQL Server Audit writes structured binary records; PostgreSQL writes text log entries.</td>
+      </tr>
+      <tr>
+        <td><code>log_statement = 'all'</code></td>
+        <td>SQL Server Audit: all statement-level action groups</td>
+        <td>Use <code>pgaudit</code> for structured compliance output instead of <code>log_statement = 'all'</code>.</td>
+      </tr>
+      <tr>
+        <td><code>max_connections</code></td>
+        <td>No direct equivalent; SQL Server uses a resource pool and connection limits per workload group</td>
+        <td>SQL Server Resource Governor provides more granular per-pool limits.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Applying Changes: Reload vs. Restart</h2>
+
+  <p>This is where SQL Server DBAs frequently reach for a restart out of habit. In PostgreSQL, many security-critical parameters take effect with a simple reload — no downtime required. Knowing which is which saves production incidents.</p>
+
+  <pre><code><span class="cm">-- RELOAD ONLY (SELECT pg_reload_conf()) — no restart needed:</span>
+<span class="cm">--   password_encryption, log_connections, log_disconnections</span>
+<span class="cm">--   log_statement, log_line_prefix, log_min_messages</span>
+<span class="cm">--   ssl_cert_file*, ssl_key_file*, ssl_ca_file*</span>
+<span class="cm">--   row_security, listen_addresses** (see note)</span>
+
+<span class="cm">-- RESTART REQUIRED (pg_ctl restart / systemctl restart postgresql):</span>
+<span class="cm">--   ssl (on/off toggle itself)</span>
+<span class="cm">--   listen_addresses (changing which interfaces to bind)</span>
+<span class="cm">--   port</span>
+<span class="cm">--   max_connections</span>
+<span class="cm">--   superuser_reserved_connections</span>
+
+<span class="cm">-- * ssl_cert_file and ssl_key_file: PostgreSQL rereads certificate files
+--   on SIGHUP (reload) for NEW connections. Existing TLS sessions are unaffected.
+--   The ssl = on/off toggle itself requires a restart.
+--
+-- ** listen_addresses requires a restart to take effect.</span>
+
+<span class="cm">-- The pg_settings view tells you the context for any GUC:</span>
+<span class="kw">SELECT</span> name, context
+<span class="kw">FROM</span>   pg_settings
+<span class="kw">WHERE</span>  context <span class="kw">IN</span> (<span class="st">'postmaster'</span>, <span class="st">'sighup'</span>)
+<span class="kw">AND</span>    name <span class="kw">IN</span> (<span class="st">'ssl'</span>, <span class="st">'listen_addresses'</span>, <span class="st">'log_connections'</span>,
+               <span class="st">'password_encryption'</span>, <span class="st">'log_statement'</span>)
+<span class="kw">ORDER BY</span> context, name;
+
+<span class="cm">-- Apply a reload after changing sighup-context parameters:</span>
+<span class="kw">ALTER SYSTEM SET</span> log_connections    = <span class="st">'on'</span>;
+<span class="kw">ALTER SYSTEM SET</span> log_disconnections = <span class="st">'on'</span>;
+<span class="kw">ALTER SYSTEM SET</span> log_statement      = <span class="st">'ddl'</span>;
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();  <span class="cm">-- applies all three at once</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Info — ALTER SYSTEM vs. direct file edit</div>
+    <p><code>ALTER SYSTEM SET</code> writes the setting to <code>postgresql.auto.conf</code>, which is read after <code>postgresql.conf</code> and overrides it. This is the preferred approach — it is transactional, logged, and avoids manual file editing mistakes. To revert a setting to its default: <code>ALTER SYSTEM RESET parameter_name</code>. To reset all overrides: <code>ALTER SYSTEM RESET ALL</code>.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. Mistake 1 — Leaving ssl = off Because "It's an Internal Network"</h2>
+
+  <div class="callout danger">
+    <div class="label">Top DBA Mistake — Coming from SQL Server</div>
+    <p>SQL Server environments with Windows Authentication use Kerberos, which provides mutual authentication and session key establishment — effectively encrypting the authentication exchange even on an unencrypted connection. The network traffic between client and server is still cleartext, but the auth tokens are not. This creates a false sense of security: if auth is handled, why encrypt the connection?</p>
+    <p>In PostgreSQL without TLS: query text, result rows, bind parameters, and application data are all transmitted in cleartext. An attacker with network access — a compromised machine on the same VLAN, a misconfigured cloud security group, a rogue switch — can perform a trivial man-in-the-middle attack or passive wiretap. The "internal network" assumption fails the moment any internal host is compromised, which is the foundational premise of modern lateral movement attacks.</p>
+  </div>
+
+  <p>The fix is two lines and a restart:</p>
+
+  <pre><code><span class="kw">ALTER SYSTEM SET</span> ssl          = <span class="st">'on'</span>;
+<span class="kw">ALTER SYSTEM SET</span> ssl_cert_file = <span class="st">'/path/to/server.crt'</span>;
+<span class="kw">ALTER SYSTEM SET</span> ssl_key_file  = <span class="st">'/path/to/server.key'</span>;
+<span class="cm">-- Then restart the PostgreSQL service, and update pg_hba.conf to use hostssl.</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. Mistake 2 — log_statement = 'all' in Production Without pgaudit</h2>
+
+  <div class="callout warning">
+    <div class="label">DBA Migration Warning — Top Mistake</div>
+    <p>SQL Server DBAs who need a complete SQL audit trail instinctively reach for maximum logging. In PostgreSQL, <code>log_statement = 'all'</code> writes every SQL statement to the text-based log file. In a busy OLTP database with thousands of queries per second, this produces gigabytes of unstructured text per hour. The consequences: disk fills up, I/O contention slows the database, and finding any specific event in the flood of SELECT statements becomes practically impossible without significant tooling investment.</p>
+    <p>The correct approach for compliance auditing is the <code>pgaudit</code> extension. pgaudit integrates with PostgreSQL's object access hook infrastructure to produce structured, per-statement audit records that can be filtered by object, by statement class (READ, WRITE, DDL, ROLE), and by role — without logging routine query traffic. <code>log_statement = 'ddl'</code> is the appropriate general-purpose setting; reserve pgaudit for statements where a structured audit trail is a compliance requirement.</p>
+  </div>
+
+  <pre><code><span class="cm">-- Install pgaudit (example: Debian/Ubuntu with PG16)</span>
+<span class="cm">-- sudo apt install postgresql-16-pgaudit</span>
+
+<span class="cm">-- Enable it as a shared preload library (restart required)</span>
+<span class="kw">ALTER SYSTEM SET</span> shared_preload_libraries = <span class="st">'pgaudit'</span>;
+<span class="cm">-- restart server</span>
+
+<span class="cm">-- Then configure which statement classes to audit:</span>
+<span class="kw">ALTER SYSTEM SET</span> pgaudit.log = <span class="st">'ddl, write'</span>;  <span class="cm">-- log schema changes and data modifications</span>
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- pgaudit log entry format (structured, parseable):
+-- AUDIT: SESSION,1,1,DDL,CREATE TABLE,TABLE,public.accounts,
+--        CREATE TABLE public.accounts (id serial PRIMARY KEY, ...),&lt;not logged&gt;</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source</div>
+    <strong>PostgreSQL Documentation — Server Configuration</strong><br>
+    <a href="https://www.postgresql.org/docs/current/runtime-config.html">postgresql.org/docs/current/runtime-config.html</a><br><br>
+    <strong>SSL/TLS configuration in depth:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/ssl-tcp.html">postgresql.org/docs/current/ssl-tcp.html</a><br><br>
+    <strong>Logging configuration reference:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/runtime-config-logging.html">postgresql.org/docs/current/runtime-config-logging.html</a><br><br>
+    <strong>pgaudit extension:</strong><br>
+    <a href="https://www.pgaudit.org/">pgaudit.org</a> &middot; <a href="https://github.com/pgaudit/pgaudit">github.com/pgaudit/pgaudit</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Which GUC controls the algorithm used when PostgreSQL stores a new password in pg_authid?"
+         data-correct="B"
+         data-feedback-correct="Correct. password_encryption controls whether new passwords are hashed with md5 or scram-sha-256. It defaults to scram-sha-256 in PostgreSQL 14 and later. Existing password hashes are not changed retroactively."
+         data-feedback-wrong="Not quite. The correct answer is B: password_encryption. This GUC sets the hash algorithm applied when CREATE ROLE or ALTER ROLE PASSWORD is executed. ssl_cert_file stores the TLS certificate path, not the password algorithm.">
+      <div class="quiz-option" data-key="A">ssl_cert_file, because it governs all the cryptographic material stored on disk</div>
+      <div class="quiz-option" data-key="B">password_encryption, because it sets the hash algorithm for newly stored passwords</div>
+      <div class="quiz-option" data-key="C">log_connections, because it determines exactly how connection credentials are recorded here</div>
+      <div class="quiz-option" data-key="D">ssl, because enabling TLS forces scram-sha-256 for all new password operations</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the security risk of setting listen_addresses = '*' on a PostgreSQL server that has a network interface exposed to the internet?"
+         data-correct="C"
+         data-feedback-correct="Correct. Setting * binds PostgreSQL to every network interface, including any internet-facing one. This makes the PostgreSQL port reachable from the public internet, dramatically increasing attack surface even if pg_hba.conf is configured correctly."
+         data-feedback-wrong="Not quite. The correct answer is C. listen_addresses = '*' binds all interfaces. If any interface is internet-facing, the PostgreSQL port becomes internet-accessible. Bind to specific private interface addresses instead.">
+      <div class="quiz-option" data-key="A">It disables TLS for all connections because wildcard binding conflicts with ssl</div>
+      <div class="quiz-option" data-key="B">It sets max_connections to unlimited which enables a connection flood from anywhere</div>
+      <div class="quiz-option" data-key="C">It exposes the PostgreSQL port on every interface including any internet-facing one</div>
+      <div class="quiz-option" data-key="D">It overrides pg_hba.conf so all users are implicitly granted full trust authentication</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which log_statement value logs only schema-changing statements (CREATE, ALTER, DROP) without logging any SELECT or DML?"
+         data-correct="A"
+         data-feedback-correct="Correct. log_statement = 'ddl' logs only data definition statements: CREATE, ALTER, DROP, and TRUNCATE. It does not log SELECT, INSERT, UPDATE, or DELETE."
+         data-feedback-wrong="Not quite. The correct answer is A: ddl. The value 'mod' includes DML in addition to DDL. The value 'all' logs everything. The value 'none' logs nothing.">
+      <div class="quiz-option" data-key="A">ddl, which logs only CREATE ALTER DROP and TRUNCATE statements exclusively</div>
+      <div class="quiz-option" data-key="B">mod, which logs only INSERT UPDATE DELETE without any schema-change logging</div>
+      <div class="quiz-option" data-key="C">all, which logs every statement type including routine SELECT query traffic</div>
+      <div class="quiz-option" data-key="D">none, which disables all logging to prevent any performance impact overhead</div>
+    </div>
+
+    <div class="quiz"
+         data-question="After running ALTER SYSTEM SET log_connections = 'on', what additional step is required to apply the change without restarting PostgreSQL?"
+         data-correct="D"
+         data-feedback-correct="Correct. log_connections has context 'sighup', meaning it takes effect on reload. SELECT pg_reload_conf() sends the SIGHUP signal to the postmaster, which re-reads the configuration files and applies sighup-context parameters immediately."
+         data-feedback-wrong="Not quite. The correct answer is D: SELECT pg_reload_conf(). log_connections is a sighup-context parameter — it does not require a restart. ALTER SYSTEM writes the value to postgresql.auto.conf but does not apply it until a reload signal is sent.">
+      <div class="quiz-option" data-key="A">Run ALTER SYSTEM APPLY to commit all pending parameter changes to memory</div>
+      <div class="quiz-option" data-key="B">Restart the PostgreSQL service because all log parameters require a full restart</div>
+      <div class="quiz-option" data-key="C">Run VACUUM FULL pg_settings to force the configuration cache to refresh now</div>
+      <div class="quiz-option" data-key="D">Run SELECT pg_reload_conf() to send the reload signal to the postmaster process</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Type a question to your agent — for example: "How do I generate a production-quality TLS certificate for PostgreSQL signed by an internal CA?", "What is the difference between log_statement and pgaudit, and when does each make sense?", or "How do I find out which GUCs were changed from their defaults on an instance I inherited?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0002-ldap-authentication.html">&#8592; Lesson 2: LDAP Authentication</a>
+    <a href="0004-roles-and-privileges.html">Lesson 4: Roles and Privileges &#8594;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

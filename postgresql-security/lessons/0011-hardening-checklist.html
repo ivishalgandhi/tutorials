@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 11: The PostgreSQL Security Hardening Checklist — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 11</span>
+    <span>PostgreSQL Security</span>
+    <span>~30 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>The PostgreSQL Security Hardening Checklist</h1>
+
+  <p>This is the synthesis lesson. No new concepts are introduced here. Everything in this checklist was covered in detail in Lessons 1 through 10. The goal now is to take all of those individual mechanisms &mdash; pg_hba.conf rules, role design, schema security, RLS, SSL/TLS, pgaudit &mdash; and apply them as a coherent, prioritised hardening process against a real PostgreSQL instance.</p>
+
+  <p>Work through each category in order. For every item: run the verification query, record what you find, and address any gaps before moving to the next category. The verification queries in Section 3 will give you a fast snapshot of the current posture of any PostgreSQL instance you administer.</p>
+
+  <div class="callout info">
+    <div class="label">How to Use This Checklist</div>
+    <p>This checklist is based on the <a href="https://www.cisecurity.org/benchmark/postgresql">CIS PostgreSQL Benchmark</a>, adapted and extended with SQL Server migration context. Each item includes: what to check, what command to run, and a note for SQL Server DBAs where the concept differs from SQL Server defaults or mental models.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 1: Authentication (pg_hba.conf)</h2>
+
+  <p>Authentication is the front door. Every other security control is meaningless if the authentication configuration allows unauthorised connections.</p>
+
+  <h3>1.1 &mdash; No trust entries except local Unix socket for postgres</h3>
+  <p><strong>Check:</strong> <code>SHOW hba_file;</code> then inspect the file, or query <code>SELECT * FROM pg_hba_file_rules WHERE auth_method = 'trust';</code></p>
+  <p><strong>Acceptable:</strong> <code>local all postgres peer</code> &mdash; OS identity trust on the local socket only.</p>
+  <p><strong>Not acceptable:</strong> Any <code>host ... trust</code> entry, or <code>local all all trust</code>.</p>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>There is no SQL Server equivalent to <code>trust</code> authentication &mdash; even Windows Authentication requires a valid domain identity. Trust is completely absent from SQL Server's model. Treat any <code>trust</code> entry on a TCP connection as a critical finding requiring immediate remediation.</p>
+  </div>
+
+  <h3>1.2 &mdash; All host connections use scram-sha-256, not md5</h3>
+  <p><strong>Check:</strong> <code>SELECT * FROM pg_hba_file_rules WHERE auth_method = 'md5';</code></p>
+  <p><strong>Fix:</strong> Replace <code>md5</code> with <code>scram-sha-256</code> in pg_hba.conf. Also set <code>password_encryption = 'scram-sha-256'</code> in <code>postgresql.conf</code> and require all users to reset their passwords so stored hashes are re-generated as SCRAM hashes.</p>
+
+  <h3>1.3 &mdash; All host connections use hostssl, not host</h3>
+  <p><strong>Check:</strong> <code>SELECT * FROM pg_hba_file_rules WHERE type = 'host';</code></p>
+  <p><strong>Fix:</strong> Change each <code>host</code> entry to <code>hostssl</code> unless it is a deliberate catch-all <code>reject</code> rule. Plain <code>host</code> allows unencrypted connections from clients that do not negotiate TLS.</p>
+
+  <h3>1.4 &mdash; LDAP or certificate authentication for AD-integrated environments</h3>
+  <p><strong>Check:</strong> If your organisation uses Active Directory for identity, application service accounts should authenticate via <code>ldap</code> (AD bind) or <code>cert</code> (certificate), not password-in-connection-string. Review pg_hba.conf for any <code>scram-sha-256</code> entries that could be replaced with <code>ldap</code> for human users.</p>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>In SQL Server, Windows Authentication is the strongly preferred method precisely because it delegates identity to Active Directory. PostgreSQL does not integrate with Kerberos by default (that is the <code>gss</code> method), but LDAP bind authentication gives you the same AD-backed identity verification for password flows. Covered in depth in Lesson 2.</p>
+  </div>
+
+  <h3>1.5 &mdash; Catch-all reject rule at the bottom</h3>
+  <p><strong>Check:</strong> The last line of pg_hba.conf should be:</p>
+  <pre><code><span class="nm">host</span>  <span class="kw">all</span>  <span class="kw">all</span>  <span class="st">0.0.0.0/0</span>  <span class="fn">reject</span></code></pre>
+  <p>Without this, any connection not matched by earlier rules falls through with no rule matching. PostgreSQL treats no-match as a rejection, but explicit intent is clearer, auditable, and immune to future rule reordering accidents.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 2: Network Exposure</h2>
+
+  <h3>2.1 &mdash; listen_addresses scoped to specific IPs, not wildcard</h3>
+  <p><strong>Check:</strong> <code>SHOW listen_addresses;</code></p>
+  <p><strong>Acceptable:</strong> A specific IP address (<code>'10.0.1.20'</code>) or <code>'localhost'</code> for single-server deployments where all clients are local.</p>
+  <p><strong>Requires justification:</strong> <code>'*'</code> (all interfaces). In cloud environments with a public interface, <code>listen_addresses = '*'</code> combined with security groups is accepted practice &mdash; but document the decision and verify the security group is correctly locked down.</p>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>The SQL Server equivalent is TCP/IP protocol binding in Configuration Manager, where you can enable or disable listening on each network adapter and specify which IP:port combinations are active. PostgreSQL's <code>listen_addresses</code> is less granular (all ports, specific IPs) but serves the same purpose.</p>
+  </div>
+
+  <h3>2.2 &mdash; PostgreSQL port not directly reachable from the internet</h3>
+  <p><strong>Check:</strong> Verify firewall / security group rules. Port 5432 should be reachable only from application server IPs and DBA management hosts. An internet-facing PostgreSQL port is the most common entry point for automated credential-stuffing attacks.</p>
+
+  <h3>2.3 &mdash; SSL on with a CA-signed certificate (not self-signed in production)</h3>
+  <p><strong>Check:</strong> <code>SHOW ssl;</code> and verify the certificate in <code>ssl_cert_file</code> is signed by a trusted CA. Self-signed certificates are acceptable only in development environments.</p>
+
+  <h3>2.4 &mdash; sslmode=verify-full in all application connection strings</h3>
+  <p><strong>Check:</strong> Review application configuration. Connection strings using <code>sslmode=require</code>, <code>sslmode=prefer</code>, or omitting sslmode entirely are not verifying server identity. See Lesson 9, Section 6.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 3: Roles and Privileges</h2>
+
+  <h3>3.1 &mdash; No application connects as a superuser</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> rolname <span class="kw">FROM</span> pg_roles <span class="kw">WHERE</span> rolsuper = <span class="kw">true</span>;</code></pre>
+  <p>Cross-reference with pg_hba.conf. Any superuser listed there with a <code>hostssl</code> rule is a finding: application-tier connections must use dedicated, least-privilege roles.</p>
+
+  <h3>3.2 &mdash; Role hierarchy in place: readonly / app / migration tiers</h3>
+  <p><strong>Check:</strong> <code>SELECT * FROM pg_auth_members;</code> &mdash; verify a group role hierarchy exists and application roles inherit only what they need. Covered in Lessons 3 and 5.</p>
+
+  <h3>3.3 &mdash; REVOKE CONNECT ON DATABASE FROM PUBLIC</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> datacl <span class="kw">FROM</span> pg_database <span class="kw">WHERE</span> datname = <span class="st">'your_database'</span>;
+<span class="cm">-- If datacl is NULL, the PUBLIC grant is still in effect</span></code></pre>
+  <p><strong>Fix:</strong></p>
+  <pre><code><span class="kw">REVOKE CONNECT ON DATABASE</span> your_database <span class="kw">FROM PUBLIC</span>;
+<span class="kw">GRANT CONNECT ON DATABASE</span> your_database <span class="kw">TO</span> app_role, readonly_role, dba_role;</code></pre>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>In SQL Server, a login without an explicit database mapping cannot connect to that database (unless it maps to guest, which should be disabled). PostgreSQL does the opposite: by default, every role has the CONNECT privilege on every database. You must explicitly revoke it and then grant back to only the roles that need it. This is a common shock for SQL Server DBAs who expect to grant access rather than revoke defaults.</p>
+  </div>
+
+  <h3>3.4 &mdash; REVOKE CREATE ON SCHEMA public FROM PUBLIC (pre-PostgreSQL 15)</h3>
+  <p><strong>Check:</strong> <code>SELECT has_schema_privilege('public', 'public', 'create');</code></p>
+  <p>If this returns <code>true</code> and you are on PostgreSQL 14 or earlier, any connected role can create objects in the public schema. PostgreSQL 15 changed the default to revoke this. For pre-15 instances:</p>
+  <pre><code><span class="kw">REVOKE CREATE ON SCHEMA</span> public <span class="kw">FROM PUBLIC</span>;</code></pre>
+
+  <h3>3.5 &mdash; ALTER DEFAULT PRIVILEGES set for new objects in app schemas</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> defaclrole::regrole, defaclobjtype, defaclacl
+<span class="kw">FROM</span>   pg_default_acl;</code></pre>
+  <p>Without default privileges configured, tables created by a migration role are not automatically accessible to the application role. This must be set explicitly per schema per owner role. Covered in Lesson 5.</p>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>SQL Server DBAs are accustomed to schema-level permissions cascading to new objects automatically: granting SELECT on a schema grants SELECT on all current and future tables in that schema. PostgreSQL does not do this. Each new table starts with only the creator's ownership. <code>ALTER DEFAULT PRIVILEGES</code> is the closest equivalent &mdash; it pre-declares the grants that should be applied to each new object as it is created.</p>
+  </div>
+
+  <h3>3.6 &mdash; Column-level privileges for sensitive columns</h3>
+  <p><strong>Check:</strong> Identify tables containing PII (SSN, salary, date of birth, payment card data). Verify that the reporting role cannot SELECT those columns:</p>
+  <pre><code><span class="kw">SELECT</span> col_description(attrelid, attnum), attname
+<span class="kw">FROM</span>   pg_attribute
+<span class="kw">WHERE</span>  attrelid = <span class="st">'employees'</span>::regclass
+<span class="kw">AND</span>    attnum > <span class="nm">0</span>;</code></pre>
+  <p><strong>Fix:</strong> <code>REVOKE SELECT ON employees FROM readonly_role;</code> then <code>GRANT SELECT (id, department, hire_date) ON employees TO readonly_role;</code> &mdash; explicitly omit sensitive columns.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 4: Schema and Search Path</h2>
+
+  <h3>4.1 &mdash; All production objects live in explicit schemas, not public</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> tablename <span class="kw">FROM</span> pg_tables <span class="kw">WHERE</span> schemaname = <span class="st">'public'</span>
+<span class="kw">AND</span> tablename <span class="kw">NOT IN</span> (<span class="kw">SELECT</span> tablename <span class="kw">FROM</span> pg_tables <span class="kw">WHERE</span> schemaname = <span class="st">'information_schema'</span>);</code></pre>
+  <p>Application tables in the <code>public</code> schema cannot be cleanly isolated with schema-level permissions. Create an application schema (<code>app</code>, <code>finance</code>, etc.) and move objects there.</p>
+
+  <h3>4.2 &mdash; search_path locked per role</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> rolname, rolconfig <span class="kw">FROM</span> pg_roles <span class="kw">WHERE</span> rolconfig IS NOT NULL;</code></pre>
+  <p><strong>Fix for application roles:</strong></p>
+  <pre><code><span class="kw">ALTER ROLE</span> app_user <span class="kw">SET</span> search_path = app;
+<span class="cm">-- pg_temp is intentionally excluded to prevent temp-schema hijacking</span></code></pre>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>SQL Server has DEFAULT SCHEMA per user, which controls unqualified name resolution. PostgreSQL's <code>search_path</code> is more powerful but also more dangerous: if it includes <code>public</code> as a writable schema, a low-privilege user could create a function named <code>lower()</code> in public and have it called instead of the built-in. Locking search_path to the application schema eliminates this class of attack.</p>
+  </div>
+
+  <h3>4.3 &mdash; Every SECURITY DEFINER function has SET search_path</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> proname, pronamespace::regnamespace
+<span class="kw">FROM</span>   pg_proc
+<span class="kw">WHERE</span>  prosecdef = <span class="kw">true</span>
+<span class="kw">AND</span>    proconfig <span class="kw">IS NULL</span>;
+<span class="cm">-- Any row returned is a SECURITY DEFINER function without a fixed search_path</span></code></pre>
+  <p><strong>Fix:</strong></p>
+  <pre><code><span class="kw">CREATE OR REPLACE FUNCTION</span> my_privileged_func()
+<span class="kw">RETURNS</span> void
+<span class="nm">SECURITY DEFINER</span>
+<span class="kw">SET</span> search_path = app, pg_temp   <span class="cm">-- lock before any user-controlled objects</span>
+<span class="kw">LANGUAGE</span> plpgsql <span class="kw">AS</span> <span class="st">$$
+BEGIN
+  -- function body
+END;
+$$</span>;</code></pre>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>SQL Server's <code>EXECUTE AS OWNER</code> (the equivalent of SECURITY DEFINER) is less exploitable because SQL Server's name resolution is schema-bound by default, and the DEFAULT SCHEMA setting for the impersonated owner applies. PostgreSQL's SECURITY DEFINER functions inherit the <em>caller's</em> search_path unless you explicitly freeze it with <code>SET search_path</code> inside the function definition. A missing SET search_path on a SECURITY DEFINER function is a privilege escalation vector.</p>
+  </div>
+
+  <h3>4.4 &mdash; REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC</h3>
+  <p><strong>Check:</strong> By default in pre-15 PostgreSQL, all functions in the public schema are executable by any role. Even after cleaning up the public schema, this should be explicitly revoked:</p>
+  <pre><code><span class="kw">REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA</span> public <span class="kw">FROM PUBLIC</span>;</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 5: Row-Level Security</h2>
+
+  <h3>5.1 &mdash; Multi-tenant tables have RLS enabled</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> schemaname, tablename, rowsecurity
+<span class="kw">FROM</span>   pg_tables
+<span class="kw">WHERE</span>  schemaname <span class="kw">NOT IN</span> (<span class="st">'pg_catalog'</span>, <span class="st">'information_schema'</span>)
+<span class="kw">AND</span>    rowsecurity = <span class="kw">false</span>
+<span class="kw">ORDER BY</span> schemaname, tablename;</code></pre>
+  <p>Any tenant-partitioned table appearing in this result is returning all-tenant data to any role that can SELECT from it.</p>
+
+  <h3>5.2 &mdash; Every RLS policy has both USING and WITH CHECK clauses</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> tablename, policyname, cmd, qual, with_check
+<span class="kw">FROM</span>   pg_policies
+<span class="kw">WHERE</span>  with_check <span class="kw">IS NULL</span>
+<span class="kw">AND</span>    cmd <span class="kw">IN</span> (<span class="st">'ALL'</span>, <span class="st">'INSERT'</span>, <span class="st">'UPDATE'</span>);</code></pre>
+  <p>A policy with a <code>USING</code> clause but no <code>WITH CHECK</code> allows a user to INSERT or UPDATE a row that their USING clause would not let them read back &mdash; potentially writing data into another tenant's partition. Covered in Lesson 7.</p>
+  <div class="callout mssql">
+    <div class="label">SQL Server DBA Note</div>
+    <p>SQL Server separates this cleanly: the FILTER PREDICATE controls reads and the BLOCK PREDICATE controls writes. PostgreSQL's <code>USING</code> maps to FILTER PREDICATE and <code>WITH CHECK</code> maps to the INSERT/UPDATE BLOCK PREDICATE. The common mistake is writing only the USING clause (read filter) and forgetting that INSERT and UPDATE paths also need a write filter.</p>
+  </div>
+
+  <h3>5.3 &mdash; BYPASSRLS granted only to specific admin roles, not application roles</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> rolname <span class="kw">FROM</span> pg_roles <span class="kw">WHERE</span> rolbypassrls = <span class="kw">true</span>;</code></pre>
+  <p>Superusers always bypass RLS. Any non-superuser with <code>BYPASSRLS</code> should be a named, documented administrative role &mdash; never an application role.</p>
+
+  <h3>5.4 &mdash; RLS tested with SET ROLE and current_setting</h3>
+  <p><strong>Verify by running:</strong></p>
+  <pre><code><span class="kw">SET ROLE</span> app_user;
+<span class="kw">SELECT</span> <span class="fn">set_config</span>(<span class="st">'app.tenant_id'</span>, <span class="st">'42'</span>, <span class="kw">true</span>);
+<span class="kw">SELECT</span> <span class="fn">count</span>(*) <span class="kw">FROM</span> orders;   <span class="cm">-- should return only tenant 42's rows</span>
+<span class="kw">RESET ROLE</span>;</code></pre>
+  <p>Do not rely solely on application-layer testing. Test RLS at the database level by impersonating the application role and verifying the row counts are tenant-scoped.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 6: Auditing</h2>
+
+  <h3>6.1 &mdash; pgaudit installed and loaded</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SHOW</span> shared_preload_libraries;
+<span class="cm">-- should contain 'pgaudit'</span>
+
+<span class="kw">SELECT</span> name, setting <span class="kw">FROM</span> pg_settings <span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">'pgaudit%'</span>;
+<span class="cm">-- if pgaudit is not loaded, these GUCs will not appear</span></code></pre>
+
+  <h3>6.2 &mdash; pgaudit.log includes at minimum 'write, ddl'</h3>
+  <p><strong>Check:</strong> <code>SHOW pgaudit.log;</code></p>
+  <p>For PCI-DSS or HIPAA compliance, <code>'read'</code> must also be included to audit SELECT on cardholder data or ePHI tables (either via session audit with <code>'all'</code> or via object audit on specific tables).</p>
+
+  <h3>6.3 &mdash; log_connections and log_disconnections are on</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SHOW</span> log_connections;
+<span class="kw">SHOW</span> log_disconnections;</code></pre>
+  <p>These capture every authentication event including failures &mdash; the equivalent of SQL Server's FAILED_LOGIN_GROUP and SUCCESSFUL_LOGIN_GROUP.</p>
+
+  <h3>6.4 &mdash; log_line_prefix includes timestamp, PID, user, and database</h3>
+  <p><strong>Check:</strong> <code>SHOW log_line_prefix;</code></p>
+  <p><strong>Required minimum:</strong> <code>'%m [%p] %q%u@%d '</code></p>
+  <p>Without the user and database in the prefix, pgaudit entries have no context identifying who ran the audited statement.</p>
+
+  <h3>6.5 &mdash; Audit logs shipped off the database server</h3>
+  <p><strong>Check:</strong> Verify that PostgreSQL logs are ingested by a SIEM, shipped to a centralised log storage system, or replicated off the server in near-real-time. Logs stored only on the database server can be deleted or tampered with by a compromised superuser &mdash; defeating the purpose of the audit trail.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Category 7: Ongoing Maintenance</h2>
+
+  <h3>7.1 &mdash; Password rotation procedure documented</h3>
+  <p>PostgreSQL has no built-in password rotation automation. Document and test the rotation procedure. The safe pattern (avoids downtime):</p>
+  <pre><code><span class="cm">-- Step 1: create the new role with a new password</span>
+<span class="kw">CREATE ROLE</span> app_user_v2 <span class="nm">WITH LOGIN PASSWORD</span> <span class="st">'new-strong-password'</span>
+  <span class="nm">NOSUPERUSER NOCREATEDB NOCREATEROLE</span>;
+
+<span class="cm">-- Step 2: grant it all the same privileges as the old role</span>
+<span class="kw">GRANT</span> app_role <span class="kw">TO</span> app_user_v2;
+
+<span class="cm">-- Step 3: update application connection string to use new role</span>
+<span class="cm">-- Step 4: verify connections succeed; monitor error logs</span>
+
+<span class="cm">-- Step 5: drop the old role once all connections have migrated</span>
+<span class="kw">DROP ROLE</span> app_user_old;</code></pre>
+
+  <h3>7.2 &mdash; pg_hba.conf reviewed when CI/CD IP ranges change</h3>
+  <p>CI/CD pipelines (GitHub Actions, GitLab CI, Jenkins) often run from ephemeral IP ranges that change without notice. If your pg_hba.conf contains specific CI runner IPs, these become stale. Either use a stable egress IP (NAT gateway), a VPN, or a service-account-based certificate authentication that is not IP-bound.</p>
+
+  <h3>7.3 &mdash; Superuser list reviewed quarterly</h3>
+  <p><strong>Check:</strong></p>
+  <pre><code><span class="kw">SELECT</span> rolname, rolcreatedb, rolcreaterole, rolcanlogin, rolvaliduntil
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolsuper = <span class="kw">true</span>;</code></pre>
+  <p>Superusers bypass all security controls. The list should be minimal &mdash; typically only the <code>postgres</code> system role and one named DBA role. Service accounts, application roles, and reporting roles should never appear here.</p>
+
+  <h3>7.4 &mdash; SSL certificate expiry monitored</h3>
+  <p><strong>Check from the OS:</strong></p>
+  <pre><code><span class="cm"># Check expiry date of the PostgreSQL server certificate</span>
+openssl x509 -in /var/lib/postgresql/data/server.crt -noout -enddate
+
+<span class="cm"># Output example:</span>
+<span class="cm"># notAfter=Jan 15 14:23:01 2025 GMT</span></code></pre>
+  <p>Set up a monitoring alert at least 30 days before expiry. PostgreSQL will continue to run with an expired certificate (clients with <code>sslmode=verify-full</code> will refuse to connect), making certificate expiry an availability incident, not just a security finding.</p>
+
+  <h3>7.5 &mdash; pgaudit version compatibility verified after each PostgreSQL upgrade</h3>
+  <p>pgaudit is compiled against a specific PostgreSQL major version. After a major version upgrade (e.g., PG 15 to PG 16), the pgaudit package must also be upgraded. After a minor version upgrade, check the pgaudit release notes to confirm compatibility. Mismatched versions can cause PostgreSQL to fail to start.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>The 5 Items SQL Server DBAs Most Commonly Skip</h2>
+
+  <p>Based on the migration patterns covered across this course, these are the five hardening steps that SQL Server DBAs consistently overlook when hardening a PostgreSQL instance for the first time:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Item</th>
+        <th>Why it gets skipped</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ALTER DEFAULT PRIVILEGES</td>
+        <td>SQL Server DBAs expect schema-level grants to cover future objects automatically. PostgreSQL does not work this way.</td>
+        <td>Without it, tables created by the migration role are invisible to the application role until someone notices and grants manually.</td>
+      </tr>
+      <tr>
+        <td>REVOKE CONNECT ON DATABASE FROM PUBLIC</td>
+        <td>SQL Server DBAs instinctively grant access; they do not think to revoke defaults they did not set.</td>
+        <td>Every role &mdash; including newly created roles with no other privileges &mdash; can connect to every database until this is revoked.</td>
+      </tr>
+      <tr>
+        <td>search_path locking per role</td>
+        <td>SQL Server's DEFAULT SCHEMA is set at role creation and does not cause security issues if left at <code>dbo</code>. PostgreSQL's search_path can be manipulated by objects in a writable public schema.</td>
+        <td>An unlocked search_path enables function/operator hijacking attacks via the public schema.</td>
+      </tr>
+      <tr>
+        <td>SET search_path on SECURITY DEFINER functions</td>
+        <td>SQL Server's EXECUTE AS OWNER is less exploitable because name resolution uses the owner's default schema. PostgreSQL's SECURITY DEFINER uses the <em>caller's</em> search_path unless frozen.</td>
+        <td>A SECURITY DEFINER function without SET search_path is a privilege escalation vector: any user who can create objects in a schema on the caller's path can intercept the function's object lookups.</td>
+      </tr>
+      <tr>
+        <td>WITH CHECK in RLS policies</td>
+        <td>SQL Server separates FILTER PREDICATE (reads) and BLOCK PREDICATE (writes) explicitly. PostgreSQL uses USING and WITH CHECK in the same CREATE POLICY statement, and WITH CHECK is optional &mdash; it is easy to forget.</td>
+        <td>A policy with only USING allows INSERT/UPDATE operations that write to rows the user cannot read back, potentially leaking data across tenant boundaries.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Quick Verification Queries: Security Snapshot for Any Instance</h2>
+
+  <p>Run these seven queries on any PostgreSQL instance to get an immediate security posture snapshot. They are safe to run on a live production instance &mdash; all are read-only queries against system catalog views.</p>
+
+  <pre><code><span class="cm">-- 1. Find all superusers
+--    Expected: only 'postgres' and your named DBA admin role
+--    Finding: any service account or application role is a critical issue</span>
+<span class="kw">SELECT</span> rolname
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolsuper = <span class="kw">true</span>;
+
+
+<span class="cm">-- 2. Find login roles with no password expiry
+--    Expected: roles have VALID UNTIL set, or you have a documented rotation schedule
+--    Finding: NULL means the password never expires regardless of age</span>
+<span class="kw">SELECT</span> rolname, rolvaliduntil
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolcanlogin = <span class="kw">true</span>
+<span class="kw">AND</span>    rolvaliduntil <span class="kw">IS NULL</span>;
+
+
+<span class="cm">-- 3. Check whether SSL is enabled at the server level
+--    Expected: 'on'
+--    Finding: 'off' means all connections are unencrypted</span>
+<span class="kw">SHOW</span> ssl;
+
+
+<span class="cm">-- 4. Check the password hashing algorithm in use
+--    Expected: 'scram-sha-256'
+--    Finding: 'md5' means new passwords are stored as weak MD5 hashes</span>
+<span class="kw">SHOW</span> password_encryption;
+
+
+<span class="cm">-- 5. Find application tables with RLS disabled
+--    Expected: empty result if all tenant tables have RLS enabled
+--    Finding: any tenant-partitioned table in this list returns all-tenant data</span>
+<span class="kw">SELECT</span> schemaname, tablename
+<span class="kw">FROM</span>   pg_tables
+<span class="kw">WHERE</span>  schemaname <span class="kw">NOT IN</span> (<span class="st">'pg_catalog'</span>, <span class="st">'information_schema'</span>)
+<span class="kw">AND</span>    rowsecurity = <span class="kw">false</span>
+<span class="kw">ORDER BY</span> schemaname, tablename;
+
+
+<span class="cm">-- 6. Find SECURITY DEFINER functions without a frozen search_path
+--    Expected: empty result
+--    Finding: any function here is a potential privilege escalation vector</span>
+<span class="kw">SELECT</span> proname, pronamespace::regnamespace <span class="kw">AS</span> schema
+<span class="kw">FROM</span>   pg_proc
+<span class="kw">WHERE</span>  prosecdef = <span class="kw">true</span>
+<span class="kw">AND</span>    proconfig <span class="kw">IS NULL</span>;
+
+
+<span class="cm">-- 7. Check whether PUBLIC still has CREATE on the public schema
+--    Expected: 'f' (false) on PostgreSQL 15+ or after manual revoke
+--    Finding: 't' (true) means any connected role can create objects in public</span>
+<span class="kw">SELECT</span> <span class="fn">has_schema_privilege</span>(<span class="st">'public'</span>, <span class="st">'public'</span>, <span class="st">'create'</span>);</code></pre>
+
+  <div class="callout key">
+    <div class="label">Your Homework</div>
+    <p>Run each of these seven queries against your PostgreSQL instance right now. Record the results. For every gap you find &mdash; a superuser that should not exist, tables with RLS disabled, an md5 password_encryption setting &mdash; use the checklist items in this lesson to plan the remediation. This is the security assessment skill that matters most on the job.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source</div>
+    <strong>CIS PostgreSQL Benchmark</strong><br>
+    <a href="https://www.cisecurity.org/benchmark/postgresql">cisecurity.org/benchmark/postgresql</a><br><br>
+    <strong>PostgreSQL Documentation: Secure TCP/IP Connections</strong><br>
+    <a href="https://www.postgresql.org/docs/current/ssl-tcp.html">postgresql.org/docs/current/ssl-tcp.html</a><br><br>
+    <strong>PostgreSQL Documentation: Role Attributes</strong><br>
+    <a href="https://www.postgresql.org/docs/current/role-attributes.html">postgresql.org/docs/current/role-attributes.html</a><br><br>
+    <strong>Quick Reference for all 15 essential commands:</strong><br>
+    <a href="../reference/quick-reference.html">reference/quick-reference.html</a>
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Good prompts for this lesson: "Which of these checklist items applies to Amazon RDS for PostgreSQL?", "How do I run this security assessment as a scheduled job and alert on findings?", "Which CIS benchmark items are Level 1 (basic) vs Level 2 (advanced)?", or "Can you show me what a hardened postgresql.conf looks like in full?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0010-auditing-pgaudit.html">&larr; Lesson 10: Auditing and Logging</a>
+    <a href="../reference/quick-reference.html">Quick Reference: 15 Commands &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

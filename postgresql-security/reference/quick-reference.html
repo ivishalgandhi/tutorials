@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>15 Commands Every DBA Must Memorise — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    /* ── Card grid ── */
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.2rem;
+      margin: 2rem 0;
+    }
+    @media (max-width: 640px) { .cmd-grid { grid-template-columns: 1fr; } }
+    @media print {
+      .cmd-grid { grid-template-columns: 1fr; }
+      .cmd-card { break-inside: avoid; }
+      .page-footer { display: none; }
+    }
+
+    .cmd-card {
+      background: #fff;
+      border: 1px solid #d8d4cc;
+      border-radius: 8px;
+      padding: 1rem 1.2rem 1rem;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .cmd-card .cmd-num {
+      display: inline-block;
+      background: #1e3a5f;
+      color: #fff;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.15em 0.55em;
+      border-radius: 99px;
+      margin-bottom: 0.5rem;
+      align-self: flex-start;
+    }
+
+    .cmd-card .cmd-title {
+      font-weight: 700;
+      font-size: 0.92rem;
+      color: #1e3a5f;
+      margin-bottom: 0.1rem;
+      line-height: 1.3;
+    }
+
+    .cmd-card pre {
+      font-size: 0.75rem;
+      padding: 0.7em 1em;
+      margin: 0.5rem 0;
+      border-radius: 5px;
+    }
+
+    .cmd-card .cmd-desc {
+      font-size: 0.82rem;
+      color: #444;
+      margin-top: 0.4rem;
+      line-height: 1.45;
+      flex: 1;
+    }
+
+    .cmd-card .cmd-mssql {
+      font-size: 0.75rem;
+      color: #cc2222;
+      margin-top: 0.5rem;
+      font-style: italic;
+      line-height: 1.35;
+      padding-top: 0.4rem;
+      border-top: 1px solid #f0e0e0;
+    }
+
+    .cmd-card .cmd-mssql::before {
+      content: "SQL Server: ";
+      font-style: normal;
+      font-weight: 700;
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-right: 0.2em;
+    }
+
+    /* ── Intro strip ── */
+    .intro-strip {
+      background: #f0f3f8;
+      border-left: 4px solid #1e3a5f;
+      border-radius: 0 6px 6px 0;
+      padding: 0.9em 1.2em;
+      margin: 1.5rem 0 0.5rem;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.95rem;
+      color: #1e3a5f;
+      font-weight: 500;
+    }
+
+    /* ── Section divider labels ── */
+    .grid-section-label {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: #888;
+      margin: 2.5rem 0 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.8em;
+    }
+    .grid-section-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: #d8d4cc;
+    }
+
+    /* ── Footer nav ── */
+    .page-footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid #d8d4cc;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.85rem;
+      color: #888;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      align-items: baseline;
+    }
+    .page-footer a { color: #1a56db; }
+    .page-footer .primary-source-inline {
+      margin-left: auto;
+      font-size: 0.78rem;
+    }
+    @media (max-width: 640px) {
+      .page-footer .primary-source-inline { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span>PostgreSQL Security</span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>15 Commands Every DBA Must Memorise</h1>
+  <div class="intro-strip">
+    These are the 15 most critical PostgreSQL security commands. Know them cold.
+  </div>
+
+  <!-- ════════════════════════════════════════════
+       Section 1: Authentication & Config
+  ════════════════════════════════════════════ -->
+  <div class="grid-section-label">Authentication &amp; Configuration</div>
+  <div class="cmd-grid">
+
+    <!-- 1 -->
+    <div class="cmd-card">
+      <span class="cmd-num">01</span>
+      <div class="cmd-title">Find pg_hba.conf</div>
+      <pre><code><span class="kw">SHOW</span> hba_file;</code></pre>
+      <div class="cmd-desc">Locate the authentication configuration file on any PostgreSQL instance. The file path varies by OS, package manager, and data directory — this is the only reliable way to find it.</div>
+      <div class="cmd-mssql">No equivalent — SQL Server auth config is in Server Properties &rarr; Security, not a file path you query.</div>
+    </div>
+
+    <!-- 2 -->
+    <div class="cmd-card">
+      <span class="cmd-num">02</span>
+      <div class="cmd-title">Reload auth config without restart</div>
+      <pre><code><span class="kw">SELECT</span> pg_reload_conf();
+
+<span class="cm">-- Verify it loaded:</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> pg_hba_file_rules <span class="kw">LIMIT</span> <span class="nm">5</span>;</code></pre>
+      <div class="cmd-desc">Apply pg_hba.conf and postgresql.conf changes (sighup-context GUCs) without restarting the server. Inspect <code>pg_hba_file_rules</code> immediately after to confirm your edits parsed correctly.</div>
+      <div class="cmd-mssql">RECONFIGURE — but SQL Server never reloads auth config without a restart. PostgreSQL's live reload is a significant operational advantage.</div>
+    </div>
+
+    <!-- 3 -->
+    <div class="cmd-card">
+      <span class="cmd-num">03</span>
+      <div class="cmd-title">Enforce SCRAM-SHA-256 encryption</div>
+      <pre><code><span class="kw">ALTER SYSTEM SET</span> password_encryption
+  = <span class="st">'scram-sha-256'</span>;
+<span class="kw">SELECT</span> pg_reload_conf();
+
+<span class="cm">-- Existing md5 passwords must be reset</span></code></pre>
+      <div class="cmd-desc">Switch to the recommended password hashing algorithm. This affects only <em>new</em> or <em>reset</em> passwords — existing md5 hashes remain until users change their passwords.</div>
+      <div class="cmd-mssql">No direct equivalent. SQL Server's password hashing is internal. This is the closest PostgreSQL operation to enforcing a minimum authentication strength.</div>
+    </div>
+
+    <!-- 4 -->
+    <div class="cmd-card">
+      <span class="cmd-num">04</span>
+      <div class="cmd-title">Create a minimal login role</div>
+      <pre><code><span class="kw">CREATE ROLE</span> app_user
+  <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'use-a-vault'</span>
+  <span class="kw">NOSUPERUSER NOCREATEDB NOCREATEROLE</span>
+  <span class="kw">VALID UNTIL</span> <span class="st">'2026-01-01'</span>;</code></pre>
+      <div class="cmd-desc">The safe template for any application or CI/CD login role. Never omit the <code>NO*</code> attributes — they default to the least-privilege values only on fresh installs; explicitly stating them is defensive documentation.</div>
+      <div class="cmd-mssql">CREATE LOGIN ... WITH PASSWORD, DEFAULT_DATABASE. SQL Server has no NOSUPERUSER because sysadmin is a separate fixed role, not an attribute.</div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- ════════════════════════════════════════════
+       Section 2: Privileges & Access Control
+  ════════════════════════════════════════════ -->
+  <div class="grid-section-label">Privileges &amp; Access Control</div>
+  <div class="cmd-grid">
+
+    <!-- 5 -->
+    <div class="cmd-card">
+      <span class="cmd-num">05</span>
+      <div class="cmd-title">Grant database connect</div>
+      <pre><code><span class="cm">-- First, revoke the dangerous default:</span>
+<span class="kw">REVOKE CONNECT ON DATABASE</span> mydb
+  <span class="kw">FROM PUBLIC</span>;
+
+<span class="cm">-- Grant only to roles that need it:</span>
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb
+  <span class="kw">TO</span> app_role;</code></pre>
+      <div class="cmd-desc">By default, PUBLIC has CONNECT on all databases. This means <em>every role in every database on the cluster</em> can connect. Revoke it and re-grant explicitly.</div>
+      <div class="cmd-mssql">DENY CONNECT SQL TO login_name. SQL Server DBAs often miss the PostgreSQL PUBLIC default because SQL Server requires an explicit GRANT to connect.</div>
+    </div>
+
+    <!-- 6 -->
+    <div class="cmd-card">
+      <span class="cmd-num">06</span>
+      <div class="cmd-title">Set up schema-level access</div>
+      <pre><code><span class="cm">-- Step 1: schema entry permission</span>
+<span class="kw">GRANT USAGE ON SCHEMA</span> app <span class="kw">TO</span> app_role;
+
+<span class="cm">-- Step 2: table DML</span>
+<span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span>
+  <span class="kw">ON ALL TABLES IN SCHEMA</span> app
+  <span class="kw">TO</span> app_role;
+
+<span class="cm">-- Step 3: sequence access (for SERIAL/BIGSERIAL)</span>
+<span class="kw">GRANT USAGE</span>, <span class="kw">SELECT</span>
+  <span class="kw">ON ALL SEQUENCES IN SCHEMA</span> app
+  <span class="kw">TO</span> app_role;</code></pre>
+      <div class="cmd-desc">Three-step pattern: schema USAGE, then table DML, then sequence access. All three are required. Skipping USAGE means the role cannot resolve any object name in the schema, even if table grants exist.</div>
+      <div class="cmd-mssql">GRANT SELECT, INSERT... ON SCHEMA::dbo TO role — a single statement covers schema objects. PostgreSQL's three-layer model is more granular but more surprising to SQL Server DBAs.</div>
+    </div>
+
+    <!-- 7 -->
+    <div class="cmd-card">
+      <span class="cmd-num">07</span>
+      <div class="cmd-title">Set default privileges for future objects</div>
+      <pre><code><span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> migration_role
+  <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span>
+  <span class="kw">ON TABLES TO</span> app_role;</code></pre>
+      <div class="cmd-desc">The <strong>#1 missing step</strong> for SQL Server DBAs. Without this, every table created by <code>migration_role</code> in the future is inaccessible to <code>app_role</code> until manually granted. This applies to <em>future</em> objects only.</div>
+      <div class="cmd-mssql">SQL Server schema-based roles inherit access to new objects automatically — no equivalent step needed. This PostgreSQL behaviour is the single most common onboarding surprise.</div>
+    </div>
+
+    <!-- 8 -->
+    <div class="cmd-card">
+      <span class="cmd-num">08</span>
+      <div class="cmd-title">Enable row-level security</div>
+      <pre><code><span class="cm">-- Step 1: enable RLS on the table</span>
+<span class="kw">ALTER TABLE</span> orders
+  <span class="kw">ENABLE ROW LEVEL SECURITY</span>;
+
+<span class="cm">-- Step 2: create the isolation policy</span>
+<span class="kw">CREATE POLICY</span> tenant_isolation <span class="kw">ON</span> orders
+  <span class="kw">AS PERMISSIVE FOR ALL TO</span> app_role
+  <span class="kw">USING</span> (
+    tenant_id = current_setting(
+      <span class="st">'app.tid'</span>, true)::<span class="nm">int</span>
+  )
+  <span class="kw">WITH CHECK</span> (
+    tenant_id = current_setting(
+      <span class="st">'app.tid'</span>, true)::<span class="nm">int</span>
+  );</code></pre>
+      <div class="cmd-desc">Two steps are required. Enabling RLS alone hides <em>all</em> rows from non-superusers until a policy is created. The <code>WITH CHECK</code> clause prevents silent cross-tenant writes.</div>
+      <div class="cmd-mssql">CREATE SECURITY POLICY + ADD FILTER PREDICATE + ADD BLOCK PREDICATE. SQL Server separates read filtering and write blocking into distinct predicate types.</div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- ════════════════════════════════════════════
+       Section 3: Auditing & Inspection
+  ════════════════════════════════════════════ -->
+  <div class="grid-section-label">Auditing &amp; Inspection</div>
+  <div class="cmd-grid">
+
+    <!-- 9 -->
+    <div class="cmd-card">
+      <span class="cmd-num">09</span>
+      <div class="cmd-title">Find all superusers</div>
+      <pre><code><span class="kw">SELECT</span> rolname, rolsuper, rolcanlogin
+<span class="kw">FROM</span>  pg_roles
+<span class="kw">WHERE</span> rolsuper = <span class="kw">true</span>
+<span class="kw">ORDER BY</span> rolname;</code></pre>
+      <div class="cmd-desc">Run this on every new instance you inherit. Production should have at most one or two superuser roles, none of which should have <code>rolcanlogin = true</code> in day-to-day use.</div>
+      <div class="cmd-mssql">SELECT name FROM sys.server_principals WHERE IS_SRVROLEMEMBER('sysadmin', name) = 1</div>
+    </div>
+
+    <!-- 10 -->
+    <div class="cmd-card">
+      <span class="cmd-num">10</span>
+      <div class="cmd-title">Audit role membership</div>
+      <pre><code><span class="kw">SELECT</span>
+  r.rolname  <span class="kw">AS</span> role,
+  m.rolname  <span class="kw">AS</span> member,
+  a.admin_option
+<span class="kw">FROM</span>  pg_auth_members a
+<span class="kw">JOIN</span>  pg_roles r <span class="kw">ON</span> r.oid = a.roleid
+<span class="kw">JOIN</span>  pg_roles m <span class="kw">ON</span> m.oid = a.member
+<span class="kw">ORDER BY</span> r.rolname, m.rolname;</code></pre>
+      <div class="cmd-desc">See exactly which roles are granted to which roles/users and whether they hold <code>ADMIN OPTION</code> (ability to re-grant). The source of truth for your privilege hierarchy.</div>
+      <div class="cmd-mssql">SELECT * FROM sys.database_role_members combined with sys.server_role_members (two separate queries in SQL Server).</div>
+    </div>
+
+    <!-- 11 -->
+    <div class="cmd-card">
+      <span class="cmd-num">11</span>
+      <div class="cmd-title">Verify SSL on active connections</div>
+      <pre><code><span class="kw">SELECT</span> pid, ssl, version,
+       cipher, bits, client_dn
+<span class="kw">FROM</span>  pg_stat_ssl
+<span class="kw">ORDER BY</span> ssl <span class="kw">DESC</span>;</code></pre>
+      <div class="cmd-desc">Every production connection should show <code>ssl = true</code>. Any row where <code>ssl = false</code> is an unencrypted connection transmitting credentials and data in cleartext. Treat each one as an open finding.</div>
+      <div class="cmd-mssql">SELECT encrypt_option FROM sys.dm_exec_connections — same purpose, DMV pattern instead of a static view.</div>
+    </div>
+
+    <!-- 12 -->
+    <div class="cmd-card">
+      <span class="cmd-num">12</span>
+      <div class="cmd-title">Lock search_path per role</div>
+      <pre><code><span class="kw">ALTER ROLE</span> app_user
+  <span class="kw">SET</span> search_path = app, pg_temp;
+
+<span class="kw">ALTER ROLE</span> migration_role
+  <span class="kw">SET</span> search_path = app, pg_temp;</code></pre>
+      <div class="cmd-desc">Prevents search_path hijacking attacks. The setting survives reconnects and overrides the server default. Including <code>pg_temp</code> last prevents temporary table shadowing. Every production role should have this set.</div>
+      <div class="cmd-mssql">ALTER USER ... WITH DEFAULT_SCHEMA. SQL Server's single-schema resolution makes the equivalent attack much harder — the multi-schema search order is unique to PostgreSQL.</div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- ════════════════════════════════════════════
+       Section 4: Hardening & Compliance
+  ════════════════════════════════════════════ -->
+  <div class="grid-section-label">Hardening &amp; Compliance</div>
+  <div class="cmd-grid">
+
+    <!-- 13 -->
+    <div class="cmd-card">
+      <span class="cmd-num">13</span>
+      <div class="cmd-title">Find unsafe SECURITY DEFINER functions</div>
+      <pre><code><span class="kw">SELECT</span>
+  n.nspname   <span class="kw">AS</span> schema,
+  p.proname   <span class="kw">AS</span> function,
+  p.proconfig <span class="kw">AS</span> config
+<span class="kw">FROM</span>  pg_proc p
+<span class="kw">JOIN</span>  pg_namespace n
+        <span class="kw">ON</span> n.oid = p.pronamespace
+<span class="kw">WHERE</span> p.prosecdef = <span class="kw">true</span>
+  <span class="kw">AND</span> p.proconfig <span class="kw">IS NULL</span>;</code></pre>
+      <div class="cmd-desc">Any row returned here is a potential privilege escalation vector. <code>proconfig IS NULL</code> means no <code>SET search_path</code> — an attacker with CREATE on any schema can shadow objects called by the function. Add <code>SET search_path = schema, pg_temp</code> to each function found.</div>
+      <div class="cmd-mssql">No direct equivalent. EXECUTE AS OWNER functions don't have the same search_path attack surface — SQL Server's schema resolution doesn't enable this class of hijacking.</div>
+    </div>
+
+    <!-- 14 -->
+    <div class="cmd-card">
+      <span class="cmd-num">14</span>
+      <div class="cmd-title">Install and configure pgaudit</div>
+      <pre><code><span class="cm">-- postgresql.conf (server restart required):</span>
+shared_preload_libraries = <span class="st">'pgaudit'</span>
+pgaudit.log = <span class="st">'write, ddl'</span>
+pgaudit.log_catalog = <span class="nm">off</span>
+
+<span class="cm">-- Per-role override (reconnect to activate):</span>
+<span class="kw">ALTER ROLE</span> sensitive_user
+  <span class="kw">SET</span> pgaudit.log = <span class="st">'all'</span>;</code></pre>
+      <div class="cmd-desc">Minimum pgaudit configuration for production compliance. <code>shared_preload_libraries</code> requires a server restart. <code>log_catalog = off</code> reduces noise from PostgreSQL's own internal queries. Per-role overrides are effective after the role reconnects.</div>
+      <div class="cmd-mssql">CREATE SERVER AUDIT + CREATE DATABASE AUDIT SPECIFICATION. SQL Server Audit is built into the engine and GUI-configurable; pgaudit requires manual installation and configuration file edits.</div>
+    </div>
+
+    <!-- 15 -->
+    <div class="cmd-card">
+      <span class="cmd-num">15</span>
+      <div class="cmd-title">Fix public schema create privilege (pre-PG15)</div>
+      <pre><code><span class="cm">-- Check if the vulnerability exists:</span>
+<span class="kw">SELECT</span> has_schema_privilege(
+  <span class="st">'public'</span>, <span class="st">'public'</span>, <span class="st">'create'</span>
+);
+
+<span class="cm">-- If true, close it:</span>
+<span class="kw">REVOKE CREATE ON SCHEMA</span> public
+  <span class="kw">FROM PUBLIC</span>;
+<span class="kw">REVOKE EXECUTE ON ALL FUNCTIONS</span>
+  <span class="kw">IN SCHEMA</span> public <span class="kw">FROM PUBLIC</span>;</code></pre>
+      <div class="cmd-desc">Pre-PostgreSQL 15 default: all roles can create objects in the public schema. This is the <strong>single most common production misconfiguration</strong>. PostgreSQL 15+ revokes this by default; older instances must be fixed manually.</div>
+      <div class="cmd-mssql">SQL Server requires explicit GRANT to create objects in any schema — PostgreSQL's PUBLIC default is the exact opposite. SQL Server DBAs are frequently surprised this needs fixing.</div>
+    </div>
+
+  </div><!-- /grid -->
+
+  <!-- ── Footer ── -->
+  <div class="page-footer">
+    <span><a href="../index.html">&larr; Back to course</a></span>
+    <span><a href="glossary.html">Full glossary &rarr;</a></span>
+    <span class="primary-source-inline">
+      Primary source:
+      <a href="https://www.cisecurity.org/benchmark/postgresql" target="_blank" rel="noopener">
+        CIS PostgreSQL Benchmark — cisecurity.org
+      </a>
+    </span>
+  </div>
+
+</div><!-- /.page -->
+</body>
+</html>

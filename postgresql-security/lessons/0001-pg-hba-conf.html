@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: pg_hba.conf — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 1</span>
+    <span>PostgreSQL Security</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>pg_hba.conf — How PostgreSQL Decides Who Gets In</h1>
+
+  <p>Before a password is ever checked, before roles are evaluated, before a single query runs — PostgreSQL reads one file to decide whether to allow a connection at all. That file is <code>pg_hba.conf</code>. Understanding it is not optional. It is the front door, the bouncer, and the access policy all in one.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. What pg_hba.conf Is — and the SQL Server Analogy</h2>
+
+  <p>In SQL Server, authentication mode (Windows Authentication vs. SQL Authentication) is a single server-level toggle set in <strong>Server Properties &rarr; Security</strong>. You flip it once and it applies to every connection. Individual logins have their own method baked in at creation time.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mental Model</div>
+    <p>SQL Server's authentication mode is a binary switch: Mixed Mode or Windows-only. There is no per-database, per-user, per-IP authentication routing. Once the mode is set, every connection goes through the same gate.</p>
+  </div>
+
+  <p>PostgreSQL takes a fundamentally different approach. <strong>pg_hba.conf</strong> (Host-Based Authentication configuration) is a <em>rule engine</em>. Every incoming connection is evaluated against an ordered list of rules. The rule specifies not just <em>what</em> authentication method to use, but <em>when</em> to use it — based on connection type, database name, username, and client IP address simultaneously. The official documentation is at <a href="https://www.postgresql.org/docs/current/auth-pg-hba-conf.html">postgresql.org/docs/current/auth-pg-hba-conf.html</a>.</p>
+
+  <p>Think of it this way: SQL Server decides <em>how</em> to authenticate globally; pg_hba.conf decides <em>whether and how</em> to authenticate for each specific combination of who, from where, and to what.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. File Location</h2>
+
+  <p>The file lives in the PostgreSQL data directory. You can always find it from inside a running instance — no filesystem guessing required:</p>
+
+  <pre><code><span class="cm">-- Run this inside psql as any connected user</span>
+<span class="kw">SHOW</span> hba_file;
+
+<span class="cm">-- Typical output on Linux (Debian/Ubuntu with pg 16):</span>
+<span class="cm">--  /etc/postgresql/16/main/pg_hba.conf</span>
+
+<span class="cm">-- Typical output on a compiled-from-source install:</span>
+<span class="cm">--  /var/lib/postgresql/data/pg_hba.conf</span>
+
+<span class="cm">-- Also discoverable via:</span>
+<span class="kw">SELECT</span> setting <span class="kw">FROM</span> pg_settings <span class="kw">WHERE</span> name = <span class="st">'hba_file'</span>;</code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>On package-managed installations (apt, yum, Homebrew) the data directory and config directory are often <em>separate</em>. <code>SHOW hba_file</code> always gives you the authoritative path regardless of distribution layout.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. Rule Structure: Five Fields, One Decision</h2>
+
+  <p>Each non-comment line in pg_hba.conf follows this exact column order:</p>
+
+  <pre><code><span class="nm">TYPE</span>  <span class="nm">DATABASE</span>  <span class="nm">USER</span>  <span class="nm">ADDRESS</span>  <span class="nm">METHOD</span>  [<span class="nm">OPTIONS</span>]</code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>What it means</th>
+        <th>Common values</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>TYPE</code></td>
+        <td>How the client is connecting — local Unix socket or TCP/IP, with or without TLS</td>
+        <td><code>local</code>, <code>host</code>, <code>hostssl</code>, <code>hostnossl</code>, <code>hostgssenc</code></td>
+      </tr>
+      <tr>
+        <td><code>DATABASE</code></td>
+        <td>Which database(s) this rule applies to</td>
+        <td><code>all</code>, a database name, a comma-separated list, <code>@file</code> to read from a file, <code>replication</code></td>
+      </tr>
+      <tr>
+        <td><code>USER</code></td>
+        <td>Which role(s) this rule applies to</td>
+        <td><code>all</code>, a role name, <code>+group_role</code> for group membership, a comma-separated list</td>
+      </tr>
+      <tr>
+        <td><code>ADDRESS</code></td>
+        <td>Client IP address or CIDR block (omitted for <code>local</code> type)</td>
+        <td><code>127.0.0.1/32</code>, <code>10.0.0.0/8</code>, <code>0.0.0.0/0</code>, <code>::1/128</code></td>
+      </tr>
+      <tr>
+        <td><code>METHOD</code></td>
+        <td>Authentication method to apply when all prior fields match</td>
+        <td><code>scram-sha-256</code>, <code>md5</code>, <code>peer</code>, <code>trust</code>, <code>reject</code>, <code>ldap</code>, <code>cert</code></td>
+      </tr>
+      <tr>
+        <td><code>OPTIONS</code></td>
+        <td>Method-specific parameters (optional)</td>
+        <td><code>ldapserver=</code>, <code>clientcert=verify-full</code>, etc.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>The <code>ADDRESS</code> field only appears for <code>host</code>, <code>hostssl</code>, and <code>hostnossl</code> entries. For <code>local</code> entries (Unix domain sockets), the field is absent entirely — local connections have no IP address to match against.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. Rule Evaluation: First Match Wins</h2>
+
+  <p>This is the single most important behaviour to internalise. PostgreSQL scans the rules <strong>from top to bottom</strong> and stops at the first rule whose TYPE, DATABASE, USER, and ADDRESS all match the incoming connection. Whatever METHOD that rule specifies is used — unconditionally. No further rules are consulted.</p>
+
+  <div class="callout danger">
+    <div class="label">Critical Difference from SQL Server</div>
+    <p>SQL Server has no equivalent ordered-rule engine for authentication. There is no concept of "the first matching rule wins" because there is only one authentication mode. In pg_hba.conf, rule <em>order matters completely</em>. A broad permissive rule placed above a narrow restrictive rule will silently absorb every connection the narrow rule was meant to handle. This is the most common source of security misconfiguration by DBAs coming from SQL Server.</p>
+  </div>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart TD
+    A([Incoming connection]) --> B{Rule 1 matches?}
+    B -- Yes --> C[Apply Method 1]
+    B -- No --> D{Rule 2 matches?}
+    D -- Yes --> E[Apply Method 2]
+    D -- No --> F{Rule N matches?}
+    F -- Yes --> G[Apply Method N]
+    F -- No --> H([Connection rejected\nno rule matched])
+    C --> I([Auth succeeds or fails\nbased on method])
+    E --> I
+    G --> I
+    </div>
+    <p class="diagram-caption">Figure 1. pg_hba.conf evaluation: the first matching rule terminates the search. Rules below it are never reached.</p>
+  </div>
+
+  <p>The practical implication: put your most specific rules first. Place restrictive <code>reject</code> rules for sensitive users before any broad <code>all</code> rules. Place <code>hostssl</code> rules above plain <code>host</code> rules if you intend to force TLS.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Authentication Methods Reference</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>How it works</th>
+        <th>When to use</th>
+        <th>SQL Server analogy</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>trust</code></td>
+        <td>No credentials required. Anyone who can reach this socket/IP is allowed in.</td>
+        <td>Local dev only, never production. Automated tests with throwaway databases.</td>
+        <td>Closest to a SQL Server login with a blank password and no expiry, but worse — no password prompt at all.</td>
+      </tr>
+      <tr>
+        <td><code>reject</code></td>
+        <td>Unconditionally denies the connection with an error. No auth attempted.</td>
+        <td>Blocking specific users or IP ranges explicitly. Placing before a broad <code>all</code> rule.</td>
+        <td>A SQL Server login that is disabled — connection attempt is refused at the server gate.</td>
+      </tr>
+      <tr>
+        <td><code>md5</code></td>
+        <td>Challenge-response using MD5 hash of password. Password never sent in cleartext.</td>
+        <td>Legacy clients that cannot support scram-sha-256. Not recommended for new deployments.</td>
+        <td>SQL Authentication with password hashing (SQL Server uses its own algorithm; md5 is weaker).</td>
+      </tr>
+      <tr>
+        <td><code>scram-sha-256</code></td>
+        <td>SCRAM-SHA-256 mutual authentication. Verifies both client and server. Resistant to replay attacks and offline dictionary attacks.</td>
+        <td>Default for all password-based TCP/IP connections on modern PostgreSQL (14+).</td>
+        <td>SQL Authentication with the most secure password handling — closer to SQL Server's NTLMv2 strength, but SCRAM is standardised.</td>
+      </tr>
+      <tr>
+        <td><code>peer</code></td>
+        <td>Asks the OS for the client's Unix username. Matches against the requested PostgreSQL role name.</td>
+        <td>Local socket connections on Linux/macOS for system-owned roles. The <code>postgres</code> OS user connecting as the <code>postgres</code> role.</td>
+        <td>Windows Authentication on SQL Server — OS identity is trusted without a password. Only valid for local socket connections.</td>
+      </tr>
+      <tr>
+        <td><code>ident</code></td>
+        <td>Queries an RFC 1413 ident server on the client machine for the OS username.</td>
+        <td>Legacy internal networks with a trusted ident daemon. Rarely used in modern deployments.</td>
+        <td>A weaker, network-based version of peer — trusts a remote daemon's assertion of identity.</td>
+      </tr>
+      <tr>
+        <td><code>ldap</code></td>
+        <td>Authenticates by binding to an LDAP server (e.g., Active Directory) with the user's credentials.</td>
+        <td>Centralised identity with Active Directory. Covered in depth in Lesson 2.</td>
+        <td>Windows Authentication / Active Directory integration in SQL Server — same AD credential store, different protocol path.</td>
+      </tr>
+      <tr>
+        <td><code>radius</code></td>
+        <td>Delegates authentication to a RADIUS server. Enables MFA integration.</td>
+        <td>Environments with existing RADIUS infrastructure or MFA appliances.</td>
+        <td>No direct SQL Server equivalent — SQL Server MFA relies on Azure AD / AAD integration, not RADIUS.</td>
+      </tr>
+      <tr>
+        <td><code>cert</code></td>
+        <td>Requires the client to present a TLS client certificate signed by a trusted CA. The CN of the certificate is mapped to a PostgreSQL role.</td>
+        <td>Highest-assurance service-to-service connections. Machine identity, not human identity.</td>
+        <td>SQL Server certificate-based authentication using client certificates — uncommon in practice but structurally identical.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>One-line syntax examples for each method (to be embedded directly in pg_hba.conf lines):</p>
+
+  <pre><code><span class="cm"># trust — local socket only, throwaway dev database</span>
+<span class="nm">local</span>   devdb     devuser                   <span class="kw">trust</span>
+
+<span class="cm"># reject — block a specific user from TCP entirely</span>
+<span class="nm">host</span>    all       blocked_user  0.0.0.0/0   <span class="kw">reject</span>
+
+<span class="cm"># md5 — legacy client compatibility</span>
+<span class="nm">host</span>    appdb     legacyapp     10.0.1.5/32 <span class="kw">md5</span>
+
+<span class="cm"># scram-sha-256 — modern password auth over TLS</span>
+<span class="nm">hostssl</span> appdb     appuser       10.0.1.0/24 <span class="kw">scram-sha-256</span>
+
+<span class="cm"># peer — OS user postgres connecting via Unix socket</span>
+<span class="nm">local</span>   all       postgres                  <span class="kw">peer</span>
+
+<span class="cm"># ident — legacy network identity (avoid on new deployments)</span>
+<span class="nm">host</span>    all       all           10.0.0.0/8  <span class="kw">ident</span>
+
+<span class="cm"># ldap — Active Directory (see Lesson 2 for full options)</span>
+<span class="nm">hostssl</span> all       all           10.0.1.0/24 <span class="kw">ldap</span> ldapserver=ad.example.com ...
+
+<span class="cm"># radius — MFA via RADIUS appliance</span>
+<span class="nm">hostssl</span> all       all           0.0.0.0/0   <span class="kw">radius</span> radiusservers=mfa.example.com radiussecrets=sharedsecret
+
+<span class="cm"># cert — mutual TLS, CN must match PostgreSQL role name</span>
+<span class="nm">hostssl</span> all       all           0.0.0.0/0   <span class="kw">cert</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. A Production-Ready pg_hba.conf Example</h2>
+
+  <p>The following configuration covers a typical three-tier application: a superuser for administrative access via the local socket, an application user from the app server subnet over TLS, a read-only reporting user, and an explicit deny-all backstop. The rules are ordered narrowest to broadest.</p>
+
+  <pre><code><span class="cm"># ─────────────────────────────────────────────────────────────────
+# pg_hba.conf — production example
+# Rule order: most specific FIRST, catch-all LAST
+# ─────────────────────────────────────────────────────────────────</span>
+
+<span class="cm"># 1. Local Unix socket: postgres OS user connects as postgres role (peer)
+#    No password required — OS identity is sufficient.
+#    This is how pg_dump, vacuumdb, and pg_upgrade typically connect.</span>
+<span class="nm">local</span>    <span class="kw">all</span>          postgres                              <span class="fn">peer</span>
+
+<span class="cm"># 2. Local Unix socket: application owner connects locally without password
+#    Use only during maintenance; comment out in normal operation.</span>
+<span class="nm">local</span>    <span class="fn">appdb</span>        <span class="fn">app_owner</span>                             <span class="fn">peer</span>
+
+<span class="cm"># 3. App server — hostssl enforces TLS; scram-sha-256 for password auth
+#    Replace 10.0.1.50/32 with your actual application server IP.</span>
+<span class="nm">hostssl</span>  <span class="fn">appdb</span>        <span class="fn">app_user</span>       <span class="st">10.0.1.50/32</span>          <span class="fn">scram-sha-256</span>
+
+<span class="cm"># 4. Read-only reporting user — allowed from the analytics subnet only</span>
+<span class="nm">hostssl</span>  <span class="fn">appdb</span>        <span class="fn">readonly_user</span>  <span class="st">10.0.2.0/24</span>           <span class="fn">scram-sha-256</span>
+
+<span class="cm"># 5. DBA team — admin database access from the DBA management VLAN</span>
+<span class="nm">hostssl</span>  <span class="kw">all</span>          <span class="fn">dba_role</span>       <span class="st">10.0.100.0/24</span>         <span class="fn">scram-sha-256</span>
+
+<span class="cm"># 6. Replication user — strictly from the standby server IP</span>
+<span class="nm">hostssl</span>  <span class="kw">replication</span>  <span class="fn">replicator</span>     <span class="st">10.0.1.60/32</span>          <span class="fn">scram-sha-256</span>
+
+<span class="cm"># 7. Localhost TCP (IPv4) — reject everything not matched above
+#    Explicit reject is cleaner than relying on the implicit fallthrough.</span>
+<span class="nm">host</span>     <span class="kw">all</span>          <span class="kw">all</span>            <span class="st">127.0.0.1/32</span>          <span class="fn">reject</span>
+
+<span class="cm"># 8. All other TCP connections — reject; no implicit trust
+#    This is the backstop. Any connection not matched above is refused.</span>
+<span class="nm">host</span>     <span class="kw">all</span>          <span class="kw">all</span>            <span class="st">0.0.0.0/0</span>             <span class="fn">reject</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>Notice that every TCP rule uses <code>hostssl</code>, not plain <code>host</code>. This means PostgreSQL will refuse the connection if the client does not negotiate TLS. A plain <code>host</code> rule accepts connections with or without TLS — which means credentials could travel in cleartext over the network even if you intend TLS to be required. Force the intent explicitly.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. Common Misconfigurations</h2>
+
+  <h3>Misconfiguration A: <code>trust</code> on <code>0.0.0.0/0</code></h3>
+
+  <p>This appears in default installations on some platforms and in hastily-assembled containers. It looks like this:</p>
+
+  <pre><code><span class="cm"># DANGEROUS — never do this in production</span>
+<span class="nm">host</span>  <span class="kw">all</span>  <span class="kw">all</span>  <span class="st">0.0.0.0/0</span>  <span class="fn">trust</span></code></pre>
+
+  <p>The blast radius: <strong>any</strong> client that can reach the PostgreSQL TCP port — from anywhere on the internet or your network — can connect as <em>any user</em>, including the <code>postgres</code> superuser, with no password. There is no credential to brute-force. No log entry for a failed attempt. No rate limiting. This is a complete bypass of the entire authentication system.</p>
+
+  <div class="callout danger">
+    <div class="label">Danger</div>
+    <p>Shodan and similar internet scanning services continuously sweep for PostgreSQL instances with trust authentication on port 5432. Databases exposed this way are typically found and exfiltrated within hours. If you inherited an instance, run <code>SHOW hba_file</code> and inspect the file immediately.</p>
+  </div>
+
+  <h3>Misconfiguration B: <code>md5</code> instead of <code>scram-sha-256</code></h3>
+
+  <p>MD5 as a password hash has been broken for practical purposes for over a decade. When PostgreSQL uses <code>md5</code> authentication, it stores an MD5 hash of the password in <code>pg_authid</code>. If an attacker obtains a dump of <code>pg_authid</code> (which any superuser can read), those MD5 hashes can be attacked offline with commodity GPU hardware in hours. SCRAM-SHA-256 uses a salted, iterated hash that is vastly more resistant to offline dictionary attacks.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server has used salted SHA-512 hashing for SQL Authentication passwords since SQL Server 2012. If you have been relying on SQL Server's password hashing strength, be aware that PostgreSQL's <code>md5</code> mode offers significantly weaker protection. Use <code>scram-sha-256</code> — it is the PostgreSQL equivalent of SQL Server's modern password handling. See Lesson 3 for how to enforce it at the server level via <code>password_encryption</code>.</p>
+  </div>
+
+  <h3>Misconfiguration C: The Ordering Trap</h3>
+
+  <p>This is the most subtle and dangerous mistake. Consider this configuration:</p>
+
+  <pre><code><span class="cm"># Intended: app_user uses scram-sha-256, but postgres is rejected from TCP</span>
+<span class="nm">host</span>  <span class="kw">all</span>          <span class="kw">all</span>       <span class="st">10.0.0.0/8</span>   <span class="fn">scram-sha-256</span>   <span class="cm">&lt;-- broad rule first</span>
+<span class="nm">host</span>  <span class="kw">all</span>          postgres  <span class="st">10.0.0.0/8</span>   <span class="fn">reject</span>          <span class="cm">&lt;-- specific rule second</span></code></pre>
+
+  <p>The <code>reject</code> rule for <code>postgres</code> is <strong>never reached</strong>. The first rule matches every connection from <code>10.0.0.0/8</code> — including the <code>postgres</code> superuser — and allows it with password auth. The second rule is dead code. The correct ordering is:</p>
+
+  <pre><code><span class="cm"># Correct: specific reject rule FIRST, broad rule SECOND</span>
+<span class="nm">host</span>  <span class="kw">all</span>          postgres  <span class="st">10.0.0.0/8</span>   <span class="fn">reject</span>          <span class="cm">&lt;-- specific first</span>
+<span class="nm">host</span>  <span class="kw">all</span>          <span class="kw">all</span>       <span class="st">10.0.0.0/8</span>   <span class="fn">scram-sha-256</span>   <span class="cm">&lt;-- broad second</span></code></pre>
+
+  <div class="callout warning">
+    <div class="label">DBA Migration Warning</div>
+    <p>SQL Server DBAs instinctively think of DENY as overriding GRANT regardless of order — because SQL Server's permission system works that way. In pg_hba.conf, there is no such override. Whichever rule matches first wins, full stop. Mentally shift from "deny beats grant" to "first match wins, order is everything."</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>8. Reloading Without a Restart</h2>
+
+  <p>Unlike SQL Server, where changes to connection-level security settings typically require a service restart, pg_hba.conf changes take effect with a simple <strong>reload</strong>. Existing connections are not affected — only new connections will see the updated rules.</p>
+
+  <pre><code><span class="cm">-- From inside psql (requires superuser or pg_reload_conf privilege)</span>
+<span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();
+
+<span class="cm">-- Returns: pg_reload_conf</span>
+<span class="cm">--          ----------------</span>
+<span class="cm">--          t</span>
+<span class="cm">-- 't' means the signal was sent successfully, not that the config is valid.</span>
+
+<span class="cm">-- From the OS shell (Debian/Ubuntu package layout)</span>
+<span class="cm">-- sudo pg_ctlcluster 16 main reload</span>
+
+<span class="cm">-- From the OS shell (generic)</span>
+<span class="cm">-- pg_ctl reload -D /var/lib/postgresql/data</span>
+
+<span class="cm">-- Verify the reload timestamp in the log:</span>
+<span class="cm">-- LOG:  received SIGHUP, reloading configuration files</span>
+<span class="cm">-- LOG:  reloading pg_hba.conf</span></code></pre>
+
+  <div class="callout warning">
+    <div class="label">Warning</div>
+    <p><code>pg_reload_conf()</code> returning <code>t</code> means the signal was delivered to the postmaster — it does <em>not</em> mean your pg_hba.conf is syntactically valid. If there is a syntax error, PostgreSQL will log it and continue using the last valid configuration. Always check the PostgreSQL log after a reload, and test a new connection before closing your current session.</p>
+  </div>
+
+  <p>To check for configuration errors before reloading, inspect the <code>pg_hba_file_rules</code> view (available in PostgreSQL 10+):</p>
+
+  <pre><code><span class="cm">-- Preview what PostgreSQL currently sees in pg_hba.conf</span>
+<span class="kw">SELECT</span> line_number, type, database, user_name, address, auth_method, error
+<span class="kw">FROM</span>   pg_hba_file_rules
+<span class="kw">ORDER BY</span> line_number;
+
+<span class="cm">-- Any row with a non-null 'error' column indicates a parse problem.</span>
+<span class="cm">-- Fix the error before reloading, or PostgreSQL will silently ignore that rule.</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source</div>
+    <strong>PostgreSQL 16 Documentation — Chapter 21: Client Authentication</strong><br>
+    <a href="https://www.postgresql.org/docs/current/auth-pg-hba-conf.html">postgresql.org/docs/current/auth-pg-hba-conf.html</a><br><br>
+    <strong>pg_hba_file_rules view:</strong>
+    <a href="https://www.postgresql.org/docs/current/view-pg-hba-file-rules.html">postgresql.org/docs/current/view-pg-hba-file-rules.html</a><br><br>
+    <strong>SCRAM-SHA-256 authentication details:</strong>
+    <a href="https://www.postgresql.org/docs/current/auth-password.html">postgresql.org/docs/current/auth-password.html</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="PostgreSQL evaluates pg_hba.conf rules in which order when a new connection arrives?"
+         data-correct="A"
+         data-feedback-correct="Correct. PostgreSQL scans from top to bottom and stops at the first rule that matches all four fields: type, database, user, and address. No further rules are consulted after a match."
+         data-feedback-wrong="Not quite. PostgreSQL uses first-match-wins, reading rules sequentially from the top of the file downward. The correct answer is A.">
+      <div class="quiz-option" data-key="A">Top to bottom, stopping at the first rule that matches all fields completely</div>
+      <div class="quiz-option" data-key="B">Bottom to top, using the last matching rule as the final decision always</div>
+      <div class="quiz-option" data-key="C">Most specific rule wins regardless of its exact position anywhere within the file</div>
+      <div class="quiz-option" data-key="D">All matching rules are evaluated and then only the strictest method is applied</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which pg_hba.conf METHOD should you use for password-based authentication over a TCP/IP connection on PostgreSQL 14 and later?"
+         data-correct="C"
+         data-feedback-correct="Correct. scram-sha-256 is the recommended method for password authentication. It provides mutual authentication and is resistant to offline dictionary attacks, unlike md5."
+         data-feedback-wrong="Not quite. The correct answer is C: scram-sha-256. It replaced md5 as the recommended method in PostgreSQL 14, which also changed the default password_encryption setting.">
+      <div class="quiz-option" data-key="A">peer, because it delegates identity verification to the operating system</div>
+      <div class="quiz-option" data-key="B">trust, because it allows connections without any password credential overhead</div>
+      <div class="quiz-option" data-key="C">scram-sha-256, because it provides strong salted mutual authentication over TCP/IP</div>
+      <div class="quiz-option" data-key="D">md5, because it is the longest-established and most compatible method</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A pg_hba.conf entry reads: host all all 0.0.0.0/0 trust — what is the security consequence?"
+         data-correct="B"
+         data-feedback-correct="Correct. The trust method requires no credentials at all. Any client reachable on the network can connect as any PostgreSQL role, including the postgres superuser, without providing a password."
+         data-feedback-wrong="Not quite. The trust method performs zero authentication. Any network-reachable client connects as any role with no password. The correct answer is B.">
+      <div class="quiz-option" data-key="A">Only localhost clients are allowed because trust always implies local-only network access</div>
+      <div class="quiz-option" data-key="B">Any network client connects as any role with absolutely no password required</div>
+      <div class="quiz-option" data-key="C">Connections are allowed but logged with a security warning for audit purposes</div>
+      <div class="quiz-option" data-key="D">The rule targets only the postgres superuser because of the all field</div>
+    </div>
+
+    <div class="quiz"
+         data-question="After editing pg_hba.conf, which command applies the changes without restarting PostgreSQL or dropping existing connections?"
+         data-correct="D"
+         data-feedback-correct="Correct. SELECT pg_reload_conf() sends SIGHUP to the postmaster, which re-reads pg_hba.conf and all other configuration files. Existing connections are not interrupted."
+         data-feedback-wrong="Not quite. The correct answer is D: SELECT pg_reload_conf(). This sends a reload signal without a restart. RESTART would terminate all active connections, which is almost never the right choice for an hba change.">
+      <div class="quiz-option" data-key="A">ALTER SYSTEM RELOAD applies the hba file changes immediately to sessions</div>
+      <div class="quiz-option" data-key="B">SHOW hba_file forces PostgreSQL to reparse the configuration on every execution</div>
+      <div class="quiz-option" data-key="C">SELECT pg_rotate_logfile() rotates the log file and flushes all configuration caches</div>
+      <div class="quiz-option" data-key="D">SELECT pg_reload_conf() sends a reload signal without terminating any active connection</div>
+    </div>
+
+  </div>
+
+  <!-- ── Exercises ── -->
+  <h2>Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Three exercises, each with a broken or incomplete <code>problem.conf</code> and a correct <code>solution.conf</code>.
+    Work through each problem first — diagnose or write your answer — then toggle to the solution.
+    The solution headers explain the <em>why</em>.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Verify live:</strong>
+    <code>SELECT * FROM pg_hba_file_rules ORDER BY line_number;</code> &nbsp;·&nbsp;
+    <code>SELECT pg_reload_conf();</code>
+  </div>
+
+  <div id="ex-viewer" style="border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+
+    <!-- Exercise tabs -->
+    <div style="display:flex; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="ex-tab ex-tab-active" data-ex="01-first-match-trap"
+        title="Broad rule silently swallows specific rule below it">
+        01 — First-match trap
+      </button>
+      <button class="ex-tab" data-ex="02-auth-method-selection"
+        title="Five wrong auth methods — trust, md5, host vs hostssl, wrong catch-all">
+        02 — Auth methods
+      </button>
+      <button class="ex-tab" data-ex="03-write-production-hba"
+        title="Write a complete pg_hba.conf from requirements — blank answer file">
+        03 — Write from scratch
+      </button>
+    </div>
+
+    <!-- Exercise description bar -->
+    <div id="ex-desc" style="padding: 0.6em 1em; background: #fffdf5; border-bottom: 1px solid var(--border); font-size: 0.82rem; color: var(--muted);"></div>
+
+    <!-- Problem / Solution toggle -->
+    <div style="display:flex; align-items:center; gap:0.5em; padding: 0.5em 1em; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="file-toggle file-toggle-active" data-file="problem" style="font-size:0.8rem;">problem.conf</button>
+      <button class="file-toggle" data-file="solution" style="font-size:0.8rem;">solution.conf</button>
+      <span id="ex-copy-btn"
+        style="margin-left:auto; cursor:pointer; font-size:0.78rem; color: var(--elephant); user-select:none;"
+        title="Copy to clipboard">⎘ copy</span>
+    </div>
+
+    <!-- Code display -->
+    <div style="position:relative; max-height: 520px; overflow-y: auto;">
+      <pre id="ex-code" style="margin:0; padding: 1em 1.2em; font-size: 0.8rem; line-height: 1.6; background: #1e1e2e; color: #cdd6f4; overflow-x: auto; white-space: pre;"><code id="ex-code-inner">Loading…</code></pre>
+    </div>
+
+    <!-- Status bar -->
+    <div id="ex-status" style="padding: 0.4em 1em; background: var(--code-bg); border-top: 1px solid var(--border); font-size: 0.76rem; color: var(--muted);"></div>
+  </div>
+
+  <style>
+    .ex-tab {
+      flex: 1; padding: 0.65em 0.5em; font-size: 0.8rem; font-weight: 600;
+      border: none; border-right: 1px solid var(--border); background: transparent;
+      cursor: pointer; color: var(--muted); transition: background 0.1s;
+    }
+    .ex-tab:last-child { border-right: none; }
+    .ex-tab:hover { background: #eee; color: var(--text); }
+    .ex-tab-active { background: #fff; color: var(--elephant); border-bottom: 2px solid var(--elephant); }
+    .file-toggle {
+      padding: 0.3em 0.8em; font-size: 0.8rem; font-weight: 600;
+      border: 1px solid var(--border); border-radius: 4px; background: transparent;
+      cursor: pointer; color: var(--muted);
+    }
+    .file-toggle:hover { background: #e8f0fe; color: var(--elephant); }
+    .file-toggle-active { background: var(--elephant); color: #fff; border-color: var(--elephant); }
+  </style>
+
+  <script>
+  (function () {
+    const BASE = '../exercises/lesson-01-pg-hba-conf/';
+    const descriptions = {
+      '01-first-match-trap':
+        'BUG: a specific audit_user rule is unreachable — a broad rule above it matches first. FIX: reorder so specific rules come before broad ones.',
+      '02-auth-method-selection':
+        'FIVE bugs: trust on network, md5 (deprecated), trust instead of password, host instead of hostssl, wrong catch-all method. Find and fix all five.',
+      '03-write-production-hba':
+        'Write a complete pg_hba.conf from requirements. answer.conf is blank — fill it in, then compare with solution.conf.',
+    };
+
+    // Exercise 03 uses answer.conf instead of problem.conf
+    const problemFile = {
+      '01-first-match-trap':  'problem',
+      '02-auth-method-selection': 'problem',
+      '03-write-production-hba':  'answer',
+    };
+
+    let currentEx   = '01-first-match-trap';
+    let currentFile = 'problem';
+
+    function setStatus(msg) {
+      document.getElementById('ex-status').textContent = msg;
+    }
+
+    function ext() {
+      return 'conf';
+    }
+
+    function actualFile() {
+      if (currentEx === '03-write-production-hba' && currentFile === 'problem') {
+        return 'answer';
+      }
+      return currentFile;
+    }
+
+    async function loadFile() {
+      const path = `${BASE}${currentEx}/${actualFile()}.conf`;
+      setStatus(`Loading ${path}…`);
+      try {
+        const r = await fetch(path);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        document.getElementById('ex-code-inner').textContent = text;
+        setStatus(`${path}  ·  ${text.split('\n').length} lines  ·  ${(text.length / 1024).toFixed(1)} KB`);
+      } catch (e) {
+        document.getElementById('ex-code-inner').textContent = `Could not load file: ${e.message}\n\nIf opening from file://, serve via:\n  python3 -m http.server 8000\nthen open http://localhost:8000/lessons/0001-pg-hba-conf.html`;
+        setStatus('Error loading file — see note above');
+      }
+    }
+
+    function updateToggleLabel() {
+      document.querySelectorAll('.file-toggle').forEach(btn => {
+        if (btn.dataset.file === 'problem') {
+          btn.textContent = currentEx === '03-write-production-hba' ? 'answer.conf' : 'problem.conf';
+        }
+      });
+    }
+
+    // Exercise tab clicks
+    document.querySelectorAll('.ex-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.ex-tab').forEach(b => b.classList.remove('ex-tab-active'));
+        btn.classList.add('ex-tab-active');
+        currentEx = btn.dataset.ex;
+        currentFile = 'problem';
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        document.querySelector('.file-toggle[data-file="problem"]').classList.add('file-toggle-active');
+        document.getElementById('ex-desc').textContent = descriptions[currentEx] || '';
+        updateToggleLabel();
+        loadFile();
+      });
+    });
+
+    // Problem / Solution toggle
+    document.querySelectorAll('.file-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        btn.classList.add('file-toggle-active');
+        currentFile = btn.dataset.file;
+        loadFile();
+      });
+    });
+
+    // Copy button
+    document.getElementById('ex-copy-btn').addEventListener('click', () => {
+      const text = document.getElementById('ex-code-inner').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('ex-copy-btn');
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = '⎘ copy'; }, 1500);
+      });
+    });
+
+    // Initial description + load
+    document.getElementById('ex-desc').textContent = descriptions[currentEx];
+    updateToggleLabel();
+    loadFile();
+  })();
+  </script>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Type a question to your agent — for example: "Why does peer authentication work on local sockets but not over TCP/IP?", "How do I migrate an existing md5 installation to scram-sha-256 without locking users out?", or "What does the pg_hba.conf entry look like to allow only connections from a specific subnet using certificate authentication?"
+  </div>
+
+  <div class="lesson-nav">
+    <span style="color: var(--muted); font-size: 0.85rem;">&#8592; No previous lesson</span>
+    <a href="0002-ldap-authentication.html">Lesson 2: LDAP Authentication &#8594;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

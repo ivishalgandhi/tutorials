@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 8: Schema Security — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 8</span>
+    <span>PostgreSQL Security</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Schema Security</h1>
+  <p style="color: var(--muted); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.95rem; margin-top: -0.2em; margin-bottom: 2rem;">search_path Hijacking and SECURITY DEFINER Risks</p>
+
+  <!-- ── 1. What search_path is ── -->
+  <h2>1. What the search_path Is</h2>
+
+  <p>When you write <code>SELECT * FROM orders</code>, PostgreSQL needs to determine which schema's <code>orders</code> table you mean. It resolves the name by scanning a list of schemas in order: the <strong>search_path</strong>. The first schema in the list that contains a relation named <code>orders</code> wins.</p>
+
+  <pre><code><span class="cm">-- Check the current search_path for the session</span>
+<span class="kw">SHOW</span> search_path;
+<span class="cm">-- Default result: "$user", public</span>
+<span class="cm">-- Means: try a schema named after the current user first, then public</span>
+
+<span class="cm">-- See the effective search_path (with "$user" resolved):</span>
+<span class="kw">SELECT</span> <span class="fn">current_schemas</span>(<span class="nm">true</span>);
+<span class="cm">-- e.g. {alice, public} if current user is alice</span></code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mapping</div>
+    <p>SQL Server resolves unqualified names using the user's <strong>DEFAULT SCHEMA</strong> setting, falling back to <code>dbo</code>. It is a single schema, not a list. PostgreSQL's <code>search_path</code> is a ranked list of schemas, making it more flexible but also more dangerous: an attacker who can influence which schemas are in your search_path can redirect object resolution to their own malicious objects. SQL Server's single-schema resolution is more predictable; PostgreSQL requires active management.</p>
+  </div>
+
+  <!-- ── 2. The attack ── -->
+  <h2>2. The search_path Hijacking Attack — Step by Step</h2>
+
+  <p>This attack is real, documented, and affects production systems that use <code>SECURITY DEFINER</code> functions without setting a fixed <code>search_path</code>. Here is how it works:</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+  participant A as Attacker (low-priv role)
+  participant PG as PostgreSQL
+  participant F as SECURITY DEFINER function<br/>(owned by high-priv role)
+
+  A->>PG: CREATE SCHEMA attack;
+  A->>PG: CREATE FUNCTION attack.get_config() ...<br/>(malicious override)
+  Note over A,PG: Attacker now has a function<br/>shadowing a legitimate one
+  A->>F: EXECUTE get_salary(1)
+  F->>PG: Searches search_path: attack, public
+  PG-->>F: Finds attack.get_config() first!
+  F-->>A: Runs malicious code under high-priv identity
+    </div>
+    <p class="diagram-caption">A SECURITY DEFINER function with a mutable search_path calls a shadowed function, executing attacker-controlled code under the function owner's high privileges.</p>
+  </div>
+
+  <p>The four steps of the attack:</p>
+  <ol>
+    <li>Attacker has a low-privilege role with <code>CREATE</code> on some schema, or <code>TEMP</code> privilege (which everyone has by default)</li>
+    <li>Attacker creates a function with the same name as one called by a <code>SECURITY DEFINER</code> function, placed in a schema earlier in the search_path</li>
+    <li>When the <code>SECURITY DEFINER</code> function runs and calls the helper function without a schema qualifier, PostgreSQL resolves it to the attacker's version</li>
+    <li>The attacker's function runs with the privileges of the <code>SECURITY DEFINER</code> function's owner — potentially a superuser</li>
+  </ol>
+
+  <pre><code><span class="cm">-- Vulnerable function (no SET search_path — attacker can shadow any dependency)</span>
+<span class="kw">CREATE FUNCTION</span> get_salary(emp_id <span class="nm">int</span>)
+<span class="kw">RETURNS</span> <span class="nm">numeric</span>
+<span class="kw">LANGUAGE</span> plpgsql
+<span class="kw">SECURITY DEFINER</span>
+<span class="cm">-- Missing: SET search_path = app, pg_catalog</span>
+<span class="kw">AS</span> <span class="st">$$
+  SELECT salary FROM employees WHERE id = emp_id;
+$$</span>;
+<span class="cm">-- "employees" resolves via the caller's (attacker's) search_path!</span></code></pre>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mapping</div>
+    <p>In SQL Server, <code>EXECUTE AS OWNER</code> (the equivalent of <code>SECURITY DEFINER</code>) resolves unqualified names using the owner's default schema, not the caller's. This is more predictable. SQL Server also has <code>EXECUTE AS CALLER</code> (the safe default) and <code>EXECUTE AS 'user'</code>. PostgreSQL's <code>SECURITY INVOKER</code> is the safe default equivalent of <code>EXECUTE AS CALLER</code>. The key difference: SQL Server's ownership chains and schema resolution make name hijacking much harder; PostgreSQL's flexible <code>search_path</code> makes it a first-class attack surface.</p>
+  </div>
+
+  <!-- ── 3. Four defenses ── -->
+  <h2>3. Preventing search_path Hijacking — Four Defenses</h2>
+
+  <h3>Defense 1: Always use fully-qualified names in production code</h3>
+
+  <pre><code><span class="cm">-- Unqualified (vulnerable — depends on search_path being correct)</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> orders;
+
+<span class="cm">-- Fully qualified (safe — always resolves to app.orders regardless of search_path)</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> app.orders;</code></pre>
+
+  <h3>Defense 2: Lock search_path per role</h3>
+
+  <pre><code><span class="cm">-- app_user always resolves unqualified names in app schema only</span>
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">SET</span> search_path = app;
+
+<span class="cm">-- DBA role: explicit schemas only, no public fallback</span>
+<span class="kw">ALTER ROLE</span> dba_alice <span class="kw">SET</span> search_path = app, audit;
+
+<span class="cm">-- Verify the setting persists:</span>
+<span class="kw">SELECT</span> rolname, rolconfig
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">WHERE</span>  rolname <span class="kw">IN</span> (<span class="st">'app_user'</span>, <span class="st">'dba_alice'</span>);</code></pre>
+
+  <h3>Defense 3: Lock search_path globally in postgresql.conf</h3>
+
+  <pre><code><span class="cm"># postgresql.conf</span>
+<span class="cm"># Restrict the default: only the user's own schema, no implicit public</span>
+search_path = <span class="st">'"$user"'</span>
+
+<span class="cm"># Or, if all production objects are in a fixed schema:</span>
+search_path = <span class="st">'app, pg_catalog'</span></code></pre>
+
+  <p>After editing <code>postgresql.conf</code>, reload the server:</p>
+
+  <pre><code><span class="kw">SELECT</span> <span class="fn">pg_reload_conf</span>();  <span class="cm">-- no restart needed for search_path changes</span></code></pre>
+
+  <h3>Defense 4: SET search_path in every SECURITY DEFINER function</h3>
+
+  <p>This is the most important defense — it locks the search_path at function creation time:</p>
+
+  <pre><code><span class="cm">-- Safe SECURITY DEFINER function with locked search_path</span>
+<span class="kw">CREATE FUNCTION</span> app.get_salary(emp_id <span class="nm">int</span>)
+<span class="kw">RETURNS</span> <span class="nm">numeric</span>
+<span class="kw">LANGUAGE</span> plpgsql
+<span class="kw">SECURITY DEFINER</span>
+<span class="kw">SET</span> search_path = app, pg_catalog, pg_temp
+<span class="kw">AS</span> <span class="st">$$
+BEGIN
+  RETURN (SELECT salary FROM app.employees WHERE id = emp_id);
+END;
+$$</span>;
+<span class="cm">-- Even if caller's search_path includes a malicious schema,</span>
+<span class="cm">-- this function always resolves names against app, pg_catalog, pg_temp only.</span></code></pre>
+
+  <div class="callout key">
+    <div class="label">Why include pg_catalog and pg_temp in SET search_path</div>
+    <p><code>pg_catalog</code> holds built-in functions and types (<code>now()</code>, <code>integer</code>, etc.). Without it in the search_path, even system functions may not resolve. <code>pg_temp</code> is listed <em>last</em> (not first) as a deliberate defense — this prevents temporary table shadows (see section 5). PostgreSQL implicitly prepends <code>pg_temp</code> to the search_path when temporary objects exist; listing it explicitly at the end overrides that implicit prepending.</p>
+  </div>
+
+  <!-- ── 4. SECURITY DEFINER vs INVOKER ── -->
+  <h2>4. SECURITY DEFINER vs SECURITY INVOKER</h2>
+
+  <p>Every PostgreSQL function runs under one of two privilege contexts:</p>
+
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Runs with privileges of</th><th>SQL Server equivalent</th><th>When to use</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>SECURITY INVOKER</code></td>
+        <td>The caller (who called the function)</td>
+        <td><code>EXECUTE AS CALLER</code></td>
+        <td>Default for almost everything. The caller cannot access anything they could not access directly.</td>
+      </tr>
+      <tr>
+        <td><code>SECURITY DEFINER</code></td>
+        <td>The creator (who defined the function)</td>
+        <td><code>EXECUTE AS OWNER</code></td>
+        <td>When a low-privilege user needs to perform one specific privileged operation without granting them the underlying access.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>A legitimate use case for <code>SECURITY DEFINER</code>: you want <code>app_role</code> to be able to call an audit-log function that writes to a table <code>app_role</code> normally cannot write to.</p>
+
+  <pre><code><span class="cm">-- audit.events is only writable by audit_owner, not by app_role</span>
+<span class="kw">CREATE FUNCTION</span> audit.log_event(event_type <span class="nm">text</span>, payload <span class="nm">jsonb</span>)
+<span class="kw">RETURNS</span> <span class="nm">void</span>
+<span class="kw">LANGUAGE</span> plpgsql
+<span class="kw">SECURITY DEFINER</span>
+<span class="kw">SET</span> search_path = audit, pg_catalog, pg_temp
+<span class="kw">AS</span> <span class="st">$$
+BEGIN
+  INSERT INTO audit.events (event_type, payload, logged_by, logged_at)
+  VALUES (event_type, payload, current_user, now());
+END;
+$$</span>;
+
+<span class="cm">-- Grant app_role execute on this specific function only</span>
+<span class="kw">GRANT EXECUTE ON FUNCTION</span> audit.<span class="fn">log_event</span>(<span class="nm">text</span>, <span class="nm">jsonb</span>) <span class="kw">TO</span> app_role;
+<span class="cm">-- app_role can now call log_event() and it will write to audit.events</span>
+<span class="cm">-- app_role still cannot SELECT/INSERT/UPDATE/DELETE on audit.events directly</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>Every <code>SECURITY DEFINER</code> function is a potential privilege escalation path. The attack surface is: (1) the function's <code>search_path</code> must be locked, (2) the function must not blindly use caller-supplied input in dynamic SQL without parameterization, (3) the function should be granted only to the specific roles that need it, not to <code>PUBLIC</code>. Audit all <code>SECURITY DEFINER</code> functions regularly with the query in section 7 below.</p>
+  </div>
+
+  <!-- ── 5. pg_temp attack ── -->
+  <h2>5. The pg_temp Shadow Attack</h2>
+
+  <p>Every database session has access to a temporary schema named <code>pg_temp_N</code> (where N is the session's process ID). PostgreSQL provides the alias <code>pg_temp</code> to refer to the current session's temporary schema. By default, <code>pg_temp</code> is implicitly prepended to the search_path — meaning it is searched before any explicitly listed schema.</p>
+
+  <pre><code><span class="cm">-- Attacker in their own session:</span>
+<span class="kw">CREATE TEMP TABLE</span> employees (id <span class="nm">int</span>, salary <span class="nm">numeric</span>);
+<span class="kw">INSERT INTO</span> employees <span class="kw">VALUES</span> (<span class="nm">1</span>, <span class="nm">9999999</span>);
+
+<span class="cm">-- If they can invoke a SECURITY DEFINER function that queries "employees"</span>
+<span class="cm">-- (unqualified) and whose search_path is not locked, pg_temp is searched first:</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> employees;
+<span class="cm">-- Returns attacker's temp table, not app.employees</span></code></pre>
+
+  <p>The defense is to explicitly place <code>pg_temp</code> at the <em>end</em> of the search_path in your <code>SECURITY DEFINER</code> functions, overriding the implicit prepending behavior:</p>
+
+  <pre><code><span class="cm">-- Safe: pg_temp listed last — temporary objects do not shadow real ones</span>
+<span class="kw">SET</span> search_path = app, pg_catalog, pg_temp
+
+<span class="cm">-- Vulnerable: pg_temp first (or absent, which lets PostgreSQL prepend it implicitly)</span>
+<span class="kw">SET</span> search_path = pg_temp, app, pg_catalog</code></pre>
+
+  <!-- ── 6. Public schema execute risk ── -->
+  <h2>6. Revoking Public EXECUTE on Functions</h2>
+
+  <p>By default, when you create a function in PostgreSQL, <code>PUBLIC</code> is granted <code>EXECUTE</code> on it. This means any authenticated role in any database can call any function in the <code>public</code> schema. In a multi-tenant or shared-cluster environment, this is a significant oversharing default.</p>
+
+  <pre><code><span class="cm">-- Remove public execute from all existing functions in the public schema</span>
+<span class="kw">REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA</span> <span class="kw">public FROM PUBLIC</span>;
+
+<span class="cm">-- Then grant execute explicitly to only the roles that need each function</span>
+<span class="kw">GRANT EXECUTE ON FUNCTION</span> <span class="kw">public</span>.<span class="fn">my_utility_func</span>() <span class="kw">TO</span> app_role;
+
+<span class="cm">-- To prevent future functions from inheriting the PUBLIC execute grant,</span>
+<span class="cm">-- set a default privilege revocation (run as the role that creates functions):</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES IN SCHEMA</span> <span class="kw">public</span>
+  <span class="kw">REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC</span>;
+
+<span class="cm">-- Audit: which functions are currently executable by PUBLIC?</span>
+<span class="kw">SELECT</span>   n.nspname, p.proname, p.proacl
+<span class="kw">FROM</span>     pg_proc p
+<span class="kw">JOIN</span>     pg_namespace n <span class="kw">ON</span> n.oid = p.pronamespace
+<span class="kw">WHERE</span>    n.nspname = <span class="st">'public'</span>
+<span class="kw">AND</span>      p.proacl <span class="kw">IS NULL</span>  <span class="cm">-- NULL acl means PUBLIC has EXECUTE (default)</span>
+<span class="kw">ORDER BY</span> p.proname;</code></pre>
+
+  <div class="callout info">
+    <div class="label">PostgreSQL 15 and Later</div>
+    <p>PostgreSQL 15 changed the defaults for new databases: <code>CREATE</code> on the public schema is revoked from <code>PUBLIC</code> by default, and new databases get a cleaner baseline. However, <code>EXECUTE</code> on functions is still granted to <code>PUBLIC</code> by default in all versions. If you are upgrading from pre-PG15, the public schema hardening steps here still apply.</p>
+  </div>
+
+  <!-- ── 7. Hardening checklist ── -->
+  <h2>7. Schema Security Hardening Checklist</h2>
+
+  <p>Run these statements against every new production database, in this order:</p>
+
+  <pre><code><span class="cm">-- 1. Revoke default CONNECT access (covered in Lesson 6)</span>
+<span class="kw">REVOKE CONNECT ON DATABASE</span> mydb <span class="kw">FROM PUBLIC</span>;
+
+<span class="cm">-- 2. Revoke CREATE on public schema (any role was allowed to create objects here)</span>
+<span class="kw">REVOKE CREATE ON SCHEMA</span> <span class="kw">public FROM PUBLIC</span>;
+
+<span class="cm">-- 3. Revoke EXECUTE on all public schema functions</span>
+<span class="kw">REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA</span> <span class="kw">public FROM PUBLIC</span>;
+
+<span class="cm">-- 4. Lock the default search_path in postgresql.conf</span>
+<span class="cm">-- search_path = '"$user"'   -- users only see their own schema by default</span>
+
+<span class="cm">-- 5. Audit all SECURITY DEFINER functions and verify search_path is set</span>
+<span class="kw">SELECT</span>
+  n.nspname     <span class="kw">AS</span> schema,
+  p.proname     <span class="kw">AS</span> function,
+  r.rolname     <span class="kw">AS</span> owner,
+  p.prosecdef   <span class="kw">AS</span> security_definer,
+  p.proconfig   <span class="kw">AS</span> config  <span class="cm">-- should contain search_path entry</span>
+<span class="kw">FROM</span>   pg_proc p
+<span class="kw">JOIN</span>   pg_namespace n <span class="kw">ON</span> n.oid = p.pronamespace
+<span class="kw">JOIN</span>   pg_roles     r <span class="kw">ON</span> r.oid = p.proowner
+<span class="kw">WHERE</span>  p.prosecdef = <span class="nm">true</span>       <span class="cm">-- only SECURITY DEFINER functions</span>
+<span class="kw">ORDER BY</span> schema, function;
+
+<span class="cm">-- Any row with proconfig IS NULL or proconfig not containing 'search_path'</span>
+<span class="cm">-- is a vulnerability that needs the SET search_path fix applied.</span></code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Hardening Step</th>
+        <th>Why It Matters</th>
+        <th>SQL Server Equivalent</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>REVOKE CREATE ON SCHEMA public FROM PUBLIC</code></td>
+        <td>Prevents any role from creating shadow objects in public schema</td>
+        <td>Schema ownership prevents non-owners from creating objects</td>
+      </tr>
+      <tr>
+        <td><code>REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC</code></td>
+        <td>Stops unauthorized function calls across roles</td>
+        <td><code>DENY EXECUTE ON SCHEMA::dbo TO public</code></td>
+      </tr>
+      <tr>
+        <td><code>search_path = '"$user"'</code> in postgresql.conf</td>
+        <td>Each user resolves names only in their own schema by default</td>
+        <td>Setting per-user DEFAULT SCHEMA</td>
+      </tr>
+      <tr>
+        <td><code>SET search_path</code> in every SECURITY DEFINER function</td>
+        <td>Prevents name hijacking within privileged function context</td>
+        <td>No equivalent needed — EXECUTE AS OWNER uses owner's schema</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── 8. Mistake 1 ── -->
+  <h2>8. Common Mistake 1 — SECURITY DEFINER Without SET search_path</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Writing <code>SECURITY DEFINER</code> functions without <code>SET search_path</code>.</strong> This is the number one PostgreSQL privilege escalation vector, documented in the PostgreSQL security advisory pages and in multiple CVEs against PostgreSQL extensions. In SQL Server, <code>EXECUTE AS OWNER</code> resolves names against the owner's schema, so the equivalent attack surface does not exist in the same way.</p>
+    <p>The symptom is invisible during development because you are the object owner and your search_path is correct. The vulnerability only manifests when a lower-privilege role calls the function with a malicious search_path in their session.</p>
+    <p>The fix is one line, added to every <code>SECURITY DEFINER</code> function:</p>
+    <pre style="margin-top:0.6em;"><code><span class="kw">SET</span> search_path = app, pg_catalog, pg_temp</code></pre>
+    <p>Run the audit query from section 7 against every production database immediately and fix any <code>SECURITY DEFINER</code> functions that lack it.</p>
+  </div>
+
+  <!-- ── 9. Mistake 2 ── -->
+  <h2>9. Common Mistake 2 — Trusting the Public Schema</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Creating production application objects in the <code>public</code> schema and relying on it for production traffic.</strong> In SQL Server, the <code>dbo</code> schema is controlled by <code>db_owner</code> — ordinary users cannot create objects there without explicit <code>db_ddladmin</code> membership. In PostgreSQL (pre-PG15), the <code>public</code> schema allows any authenticated role to create objects by default. This means a compromised application role with no special grants can still create functions, tables, and views in <code>public</code> — including objects that shadow system functions.</p>
+    <p>The fix has two parts:</p>
+    <ol>
+      <li>Move all production objects out of <code>public</code> into an application-owned schema (<code>app</code>, <code>myapp</code>, etc.)</li>
+      <li>Run <code>REVOKE CREATE ON SCHEMA public FROM PUBLIC</code> immediately after database creation</li>
+    </ol>
+    <p>For PostgreSQL 15 and later, the <code>CREATE</code> revocation from <code>PUBLIC</code> is the default for new databases — but <code>EXECUTE</code> on functions remains publicly accessible. The full hardening checklist in section 7 applies regardless of PostgreSQL version.</p>
+  </div>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources — PostgreSQL Official Documentation</div>
+    <ul>
+      <li><a href="https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH" target="_blank">PostgreSQL Docs: The Schema Search Path</a> — full search_path semantics</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-createfunction.html" target="_blank">PostgreSQL Docs: CREATE FUNCTION</a> — SECURITY DEFINER, SET search_path clauses</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY" target="_blank">PostgreSQL Docs: Writing SECURITY DEFINER Functions Safely</a> — official advisory on SET search_path</li>
+      <li><a href="https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PRIV" target="_blank">PostgreSQL Docs: Schema Privileges</a> — USAGE, CREATE on schemas</li>
+      <li><a href="https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH" target="_blank">PostgreSQL Docs: search_path GUC</a> — postgresql.conf setting</li>
+    </ul>
+  </div>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A SECURITY DEFINER function without SET search_path is vulnerable because:"
+         data-correct="B"
+         data-feedback-correct="Correct. When a SECURITY DEFINER function runs, PostgreSQL resolves unqualified object names (tables, functions) using the caller's current search_path, not a fixed path. An attacker with CREATE privilege on any schema in their search_path can place a shadow object there, and the privileged function will call it instead of the intended object — running attacker code under the function owner's identity."
+         data-feedback-wrong="Not quite. The vulnerability is that unqualified names inside the function are resolved using the caller's search_path, not a fixed one set at function creation. An attacker who controls an early schema in their search_path can shadow the objects the function calls, executing malicious code under the function owner's privileges.">
+      <div class="quiz-option" data-key="A">The function owner's password is exposed through the pg_proc catalog view</div>
+      <div class="quiz-option" data-key="B">Object names resolve against the caller's search_path, enabling malicious shadow objects</div>
+      <div class="quiz-option" data-key="C">The function's return type can be overridden by the caller's session</div>
+      <div class="quiz-option" data-key="D">The function cannot access pg_catalog built-ins without an explicit schema grant</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the execution privilege context of SECURITY INVOKER (the default for PostgreSQL functions)?"
+         data-correct="C"
+         data-feedback-correct="Correct. SECURITY INVOKER means the function runs under the caller's identity and privileges. The function can only access what the caller can access directly. This is the safe default — equivalent to SQL Server's EXECUTE AS CALLER."
+         data-feedback-wrong="Not quite. SECURITY INVOKER runs the function with the caller's privileges. The function can do nothing the caller could not do themselves. SECURITY DEFINER is the mode that runs with the function creator's (owner's) privileges.">
+      <div class="quiz-option" data-key="A">Function runs with full superuser privileges regardless of the caller's identity</div>
+      <div class="quiz-option" data-key="B">Function runs with the schema owner's privileges from the definition time</div>
+      <div class="quiz-option" data-key="C">Function runs with the privileges of the role that called it</div>
+      <div class="quiz-option" data-key="D">Function runs with PUBLIC privileges shared across all database roles always</div>
+    </div>
+
+    <div class="quiz"
+         data-question="How do you lock a SECURITY DEFINER function's search_path at function creation time?"
+         data-correct="A"
+         data-feedback-correct="Correct. The SET clause in CREATE FUNCTION sets a GUC (configuration parameter) for the duration of the function's execution. SET search_path = schema, pg_catalog, pg_temp ensures name resolution always uses the listed schemas in order, regardless of the caller's session search_path."
+         data-feedback-wrong="Not quite. The correct mechanism is the SET clause in CREATE FUNCTION, which sets a configuration parameter (like search_path) for the lifetime of the function call. ALTER ROLE affects the role's session defaults but does not lock the function itself — a different role calling the same function would use their own search_path.">
+      <div class="quiz-option" data-key="A">Add SET search_path = schema, pg_catalog, pg_temp in the CREATE FUNCTION</div>
+      <div class="quiz-option" data-key="B">Run ALTER ROLE function_owner SET search_path before creating the function definition</div>
+      <div class="quiz-option" data-key="C">Create the function inside a BEGIN/SET LOCAL search_path/COMMIT explicit transaction block</div>
+      <div class="quiz-option" data-key="D">Grant the function owner SUPERUSER so their search_path always overrides callers</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which schema is implicitly prepended to the search_path when a session creates temporary objects — and what is the correct defense against its misuse in SECURITY DEFINER functions?"
+         data-correct="D"
+         data-feedback-correct="Correct. pg_temp is implicitly placed first in the search_path when temporary objects exist in the session. An attacker can use this to shadow real tables with temporary ones. The defense is to list pg_temp explicitly at the end of SET search_path in every SECURITY DEFINER function, which overrides the implicit prepending and prevents temporary objects from shadowing real ones."
+         data-feedback-wrong="Not quite. pg_temp is the temporary object schema. PostgreSQL implicitly prepends it to the search_path, meaning temporary objects shadow real ones of the same name. The defense in SECURITY DEFINER functions is to list pg_temp explicitly at the end of the SET search_path clause, which neutralizes the implicit-prepend behavior.">
+      <div class="quiz-option" data-key="A">pg_catalog is prepended first; defend by removing it from the search_path list</div>
+      <div class="quiz-option" data-key="B">public schema is prepended first; defend by revoking CREATE privilege from PUBLIC</div>
+      <div class="quiz-option" data-key="C">information_schema is prepended first; defend by revoking all USAGE privileges from PUBLIC</div>
+      <div class="quiz-option" data-key="D">pg_temp is prepended first; defend by listing it last in SET search_path</div>
+    </div>
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Good questions for this lesson:
+    <ul style="margin-top:0.6em;">
+      <li>If I lock search_path at the role level with ALTER ROLE, does that override the SET search_path inside a SECURITY DEFINER function — or does the function's setting take precedence?</li>
+      <li>Can I audit all functions in pg_proc that have been called in the last 30 days to prioritize which SECURITY DEFINER functions to fix first?</li>
+      <li>In PostgreSQL 15+, the public schema defaults changed — does my migration script need to be different for clusters running PG14 vs PG15?</li>
+    </ul>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0007-row-level-security.html">← Lesson 7: Row-Level Security</a>
+    <a href="0009-ssl-tls.html">Lesson 9: SSL/TLS →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

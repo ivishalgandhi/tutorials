@@ -5,85 +5,520 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tutorials</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9f9f7; color: #1a1a1a; padding: 3rem 1.5rem; }
-    .page { max-width: 760px; margin: 0 auto; }
-    h1 { font-size: 1.8rem; font-weight: 700; margin-bottom: 0.4rem; }
-    .subtitle { color: #555; margin-bottom: 2.5rem; font-size: 0.95rem; }
-    .course-grid { display: grid; gap: 1.2rem; }
-    .course-card { background: #fff; border: 1px solid #e0e0dc; border-radius: 8px; padding: 1.4rem 1.6rem; text-decoration: none; color: inherit; display: block; transition: box-shadow 0.15s; }
-    .course-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.08); border-color: #3b6ea5; }
-    .course-title { font-size: 1.1rem; font-weight: 700; color: #3b6ea5; margin-bottom: 0.3rem; }
-    .course-desc { font-size: 0.88rem; color: #555; margin-bottom: 0.8rem; line-height: 1.5; }
-    .course-meta { display: flex; gap: 1rem; font-size: 0.8rem; color: #888; }
-    .tag { background: #eef2f8; color: #3b6ea5; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f5f3;
+      color: #1a1a1a;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: #fff;
+      border-bottom: 1px solid #e0e0dc;
+      padding: 1.25rem 1.5rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    }
+    .header-inner {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .site-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #1a1a1a;
+      white-space: nowrap;
+    }
+    .site-title span { color: #3b6ea5; }
+
+    /* ── Search ── */
+    .search-wrap {
+      flex: 1;
+      min-width: 200px;
+      max-width: 420px;
+      position: relative;
+    }
+    .search-wrap svg {
+      position: absolute;
+      left: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: #999;
+      pointer-events: none;
+    }
+    #search {
+      width: 100%;
+      padding: 0.55rem 0.75rem 0.55rem 2.25rem;
+      border: 1px solid #d4d4d0;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      background: #fafaf8;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    #search:focus {
+      border-color: #3b6ea5;
+      box-shadow: 0 0 0 3px rgba(59,110,165,0.12);
+      background: #fff;
+    }
+    #search::placeholder { color: #aaa; }
+
+    /* ── Main layout ── */
+    .main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.5rem 1.5rem 3rem;
+    }
+
+    /* ── Tag filter bar ── */
+    .filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 1.5rem;
+    }
+    .filter-label {
+      font-size: 0.78rem;
+      color: #888;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .tag-pill {
+      padding: 0.25rem 0.7rem;
+      border-radius: 20px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1.5px solid transparent;
+      background: #eef2f8;
+      color: #3b6ea5;
+      transition: background 0.12s, border-color 0.12s, color 0.12s;
+      user-select: none;
+    }
+    .tag-pill:hover { background: #dce8f5; }
+    .tag-pill.active {
+      background: #3b6ea5;
+      color: #fff;
+      border-color: #3b6ea5;
+    }
+    .tag-pill.clear-btn {
+      background: #f0ede8;
+      color: #666;
+    }
+    .tag-pill.clear-btn:hover { background: #e4e0da; }
+
+    /* ── Results info ── */
+    .results-info {
+      font-size: 0.82rem;
+      color: #888;
+      margin-bottom: 1rem;
+      min-height: 1.2em;
+    }
+
+    /* ── Course grid ── */
+    .course-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.1rem;
+    }
+    @media (max-width: 900px) {
+      .course-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 580px) {
+      .course-grid { grid-template-columns: 1fr; }
+    }
+
+    .course-card {
+      background: #fff;
+      border: 1px solid #e0e0dc;
+      border-radius: 10px;
+      padding: 1.2rem 1.3rem 1rem;
+      text-decoration: none;
+      color: inherit;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      transition: box-shadow 0.15s, border-color 0.15s, transform 0.12s;
+    }
+    .course-card:hover {
+      box-shadow: 0 6px 20px rgba(0,0,0,0.09);
+      border-color: #3b6ea5;
+      transform: translateY(-2px);
+    }
+    .course-card.accent-teal { border-color: #b3dde8; }
+    .course-card.accent-teal:hover { border-color: #007d9c; }
+
+    .course-tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+    .course-tag {
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      background: #eef2f8;
+      color: #3b6ea5;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .course-tag.teal { background: #e6f7fb; color: #007d9c; }
+
+    .course-title {
+      font-size: 0.98rem;
+      font-weight: 700;
+      color: #3b6ea5;
+      line-height: 1.35;
+    }
+    .course-title.teal { color: #007d9c; }
+
+    .course-desc {
+      font-size: 0.82rem;
+      color: #555;
+      line-height: 1.55;
+      flex: 1;
+      /* clamp to ~4 lines */
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .course-meta {
+      display: flex;
+      gap: 0.8rem;
+      font-size: 0.75rem;
+      color: #999;
+      margin-top: 0.2rem;
+      flex-wrap: wrap;
+    }
+
+    /* ── Empty state ── */
+    .empty-state {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 4rem 1rem;
+      color: #999;
+    }
+    .empty-state p { font-size: 1rem; margin-bottom: 0.5rem; }
+    .empty-state small { font-size: 0.82rem; }
+
+    /* ── Pagination ── */
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 2rem;
+    }
+    .page-btn {
+      padding: 0.4rem 0.85rem;
+      border: 1px solid #d4d4d0;
+      border-radius: 6px;
+      background: #fff;
+      font-size: 0.82rem;
+      cursor: pointer;
+      color: #444;
+      transition: background 0.12s, border-color 0.12s;
+      font-family: inherit;
+    }
+    .page-btn:hover:not(:disabled) { background: #eef2f8; border-color: #3b6ea5; color: #3b6ea5; }
+    .page-btn.active { background: #3b6ea5; color: #fff; border-color: #3b6ea5; font-weight: 700; }
+    .page-btn:disabled { opacity: 0.35; cursor: default; }
+    .page-ellipsis { font-size: 0.85rem; color: #aaa; padding: 0 0.2rem; }
   </style>
 </head>
 <body>
-<div class="page">
-  <h1>Tutorials</h1>
-  <p class="subtitle">Self-paced technical courses with lessons, quizzes, and diagrams.</p>
 
-  <div class="course-grid">
-
-    <a class="course-card" href="claude-certified-architect/index.html">
-      <div class="course-title">Claude Certified Architect — Foundations</div>
-      <div class="course-desc">
-        Exam prep for Anthropic's official CCA certification. Covers all 5 domains:
-        agentic architecture, MCP integration, Claude Code configuration,
-        prompt engineering, and context management.
-      </div>
-      <div class="course-meta">
-        <span class="tag">13 lessons</span>
-        <span>~5 hours</span>
-        <span>Claude · MCP · Agents</span>
-      </div>
-    </a>
-
-    <a class="course-card" href="postgres-scanner/index.html">
-      <div class="course-title">PostgreSQL for Scanner Builders</div>
-      <div class="course-desc">
-        PostgreSQL internals for engineers building Go health-check scanners.
-        Covers the connection model, catalog views, replication lag, error handling,
-        concurrency patterns, and pgx v5.
-      </div>
-      <div class="course-meta">
-        <span class="tag">6 lessons</span>
-        <span>~2 hours</span>
-        <span>Go · PostgreSQL</span>
-      </div>
-    </a>
-
-    <a class="course-card" href="zabbix-webhooks-go/index.html">
-      <div class="course-title">Zabbix Webhooks in Go</div>
-      <div class="course-desc">
-        Push Zabbix alerts into a custom Go application and store them idempotently
-        in a database. Built for database reliability teams who need real-time event streams.
-      </div>
-      <div class="course-meta">
-        <span class="tag">1 lesson</span>
-        <span>~35 min</span>
-        <span>Go · Zabbix · PostgreSQL</span>
-      </div>
-    </a>
-
-    <a class="course-card" href="go-db-scheduler/index.html" style="border-color: #b3dde8;">
-      <div class="course-title" style="color: #007d9c;">Concurrent Database Job Scheduler in Go</div>
-      <div class="course-desc">
-        Build a distributed, policy-driven maintenance scheduler that runs backup, integrity
-        check, vacuum, and index operations across 10,000–50,000 SQL&nbsp;Server and PostgreSQL
-        databases — completely async, at scale. Covers leader election, distributed locks,
-        staggered scheduling, per-server concurrency control, T-SQL executors, and Prometheus
-        observability. Inspired by how Hermes and AI agent platforms implement cron.
-      </div>
-      <div class="course-meta">
-        <span class="tag" style="background: #e6f7fb; color: #007d9c;">6 lessons</span>
-        <span>~4 hours</span>
-        <span>Go · SQL Server · PostgreSQL · Redis · Kubernetes</span>
-      </div>
-    </a>
-
+<header class="header">
+  <div class="header-inner">
+    <div class="site-title">Tutorials <span>/ Courses</span></div>
+    <div class="search-wrap">
+      <svg width="15" height="15" viewBox="0 0 15 15" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 6.5a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0Zm-.885 3.322a4.5 4.5 0 1 1 .707-.707l2.782 2.78a.5.5 0 0 1-.708.708l-2.78-2.781Z" fill="currentColor"/>
+      </svg>
+      <input id="search" type="search" placeholder="Search by title, topic, or keyword…" autocomplete="off" />
+    </div>
   </div>
-</div>
+</header>
+
+<main class="main">
+  <div class="filter-bar" id="filter-bar">
+    <span class="filter-label">Filter:</span>
+    <!-- tag pills injected by JS -->
+  </div>
+
+  <div class="results-info" id="results-info"></div>
+
+  <div class="course-grid" id="course-grid">
+    <!-- cards injected by JS -->
+  </div>
+
+  <div class="pagination" id="pagination"></div>
+</main>
+
+<script>
+// ── Course data ──────────────────────────────────────────────────────────────
+const COURSES = [
+  {
+    id: "claude-certified-architect",
+    href: "claude-certified-architect/index.html",
+    title: "Claude Certified Architect — Foundations",
+    desc: "Exam prep for Anthropic's official CCA certification. Covers all 5 domains: agentic architecture, MCP integration, Claude Code configuration, prompt engineering, and context management.",
+    lessons: 13,
+    duration: "~5 hours",
+    tags: ["Claude", "MCP", "Agents", "Prompt Engineering"],
+    accent: false,
+  },
+  {
+    id: "postgres-scanner",
+    href: "postgres-scanner/index.html",
+    title: "PostgreSQL for Scanner Builders",
+    desc: "PostgreSQL internals for engineers building Go health-check scanners. Covers the connection model, catalog views, replication lag, error handling, concurrency patterns, and pgx v5.",
+    lessons: 6,
+    duration: "~2 hours",
+    tags: ["Go", "PostgreSQL"],
+    accent: false,
+  },
+  {
+    id: "zabbix-webhooks-go",
+    href: "zabbix-webhooks-go/index.html",
+    title: "Zabbix Webhooks in Go",
+    desc: "Push Zabbix alerts into a custom Go application and store them idempotently in a database. Built for database reliability teams who need real-time event streams.",
+    lessons: 1,
+    duration: "~35 min",
+    tags: ["Go", "Zabbix", "PostgreSQL"],
+    accent: false,
+  },
+  {
+    id: "go-db-scheduler",
+    href: "go-db-scheduler/index.html",
+    title: "Concurrent Database Job Scheduler in Go",
+    desc: "Build a distributed, policy-driven maintenance scheduler that runs backup, integrity check, vacuum, and index operations across 10,000–50,000 SQL Server and PostgreSQL databases — completely async, at scale. Covers leader election, distributed locks, staggered scheduling, per-server concurrency control, T-SQL executors, and Prometheus observability.",
+    lessons: 6,
+    duration: "~4 hours",
+    tags: ["Go", "SQL Server", "PostgreSQL", "Redis", "Kubernetes"],
+    accent: true,
+  },
+  {
+    id: "postgresql-security",
+    href: "postgresql-security/index.html",
+    title: "PostgreSQL Security — End to End",
+    desc: "Master PostgreSQL security from a SQL Server DBA's perspective. Covers pg_hba.conf, LDAP/AD integration, role hierarchies, CI/CD service accounts, Row-Level Security, schema hardening, SSL/TLS, pgaudit, and a full hardening checklist — with SQL Server mappings throughout.",
+    lessons: 11,
+    duration: "~4.5 hours",
+    tags: ["PostgreSQL", "SQL Server", "Security"],
+    accent: false,
+  },
+];
+
+// ── Config ───────────────────────────────────────────────────────────────────
+const PAGE_SIZE = 6;
+
+// ── State ────────────────────────────────────────────────────────────────────
+let query = "";
+let activeTag = null;
+let currentPage = 1;
+
+// ── Derived tag list (all unique tags, sorted) ───────────────────────────────
+const ALL_TAGS = [...new Set(COURSES.flatMap(c => c.tags))].sort();
+
+// ── Elements ─────────────────────────────────────────────────────────────────
+const searchEl   = document.getElementById("search");
+const filterBar  = document.getElementById("filter-bar");
+const grid       = document.getElementById("course-grid");
+const paginationEl = document.getElementById("pagination");
+const resultsInfo  = document.getElementById("results-info");
+
+// ── Filter logic ─────────────────────────────────────────────────────────────
+function matches(course) {
+  const q = query.trim().toLowerCase();
+  if (activeTag && !course.tags.some(t => t.toLowerCase() === activeTag.toLowerCase())) return false;
+  if (!q) return true;
+  return (
+    course.title.toLowerCase().includes(q) ||
+    course.desc.toLowerCase().includes(q) ||
+    course.tags.some(t => t.toLowerCase().includes(q))
+  );
+}
+
+function filtered() {
+  return COURSES.filter(matches);
+}
+
+// ── Render tag pills ─────────────────────────────────────────────────────────
+function renderTags() {
+  // keep the label, clear the rest
+  const label = filterBar.querySelector(".filter-label");
+  filterBar.innerHTML = "";
+  filterBar.appendChild(label);
+
+  ALL_TAGS.forEach(tag => {
+    const pill = document.createElement("button");
+    pill.className = "tag-pill" + (activeTag === tag ? " active" : "");
+    pill.textContent = tag;
+    pill.setAttribute("aria-pressed", activeTag === tag);
+    pill.addEventListener("click", () => {
+      activeTag = (activeTag === tag) ? null : tag;
+      currentPage = 1;
+      render();
+    });
+    filterBar.appendChild(pill);
+  });
+
+  if (activeTag) {
+    const clear = document.createElement("button");
+    clear.className = "tag-pill clear-btn";
+    clear.textContent = "✕ Clear";
+    clear.addEventListener("click", () => { activeTag = null; currentPage = 1; render(); });
+    filterBar.appendChild(clear);
+  }
+}
+
+// ── Render cards ─────────────────────────────────────────────────────────────
+function renderCards(courses) {
+  grid.innerHTML = "";
+
+  if (courses.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.innerHTML = `<p>No courses match your search.</p><small>Try different keywords or clear the tag filter.</small>`;
+    grid.appendChild(empty);
+    return;
+  }
+
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const page  = courses.slice(start, start + PAGE_SIZE);
+
+  page.forEach(c => {
+    const a = document.createElement("a");
+    a.className = "course-card" + (c.accent ? " accent-teal" : "");
+    a.href = c.href;
+
+    const tagRow = document.createElement("div");
+    tagRow.className = "course-tag-row";
+    c.tags.forEach(t => {
+      const span = document.createElement("span");
+      span.className = "course-tag" + (c.accent ? " teal" : "");
+      span.textContent = t;
+      tagRow.appendChild(span);
+    });
+
+    const title = document.createElement("div");
+    title.className = "course-title" + (c.accent ? " teal" : "");
+    title.textContent = c.title;
+
+    const desc = document.createElement("div");
+    desc.className = "course-desc";
+    desc.textContent = c.desc;
+
+    const meta = document.createElement("div");
+    meta.className = "course-meta";
+    meta.innerHTML = `<span>${c.lessons} lesson${c.lessons !== 1 ? "s" : ""}</span><span>${c.duration}</span>`;
+
+    a.appendChild(tagRow);
+    a.appendChild(title);
+    a.appendChild(desc);
+    a.appendChild(meta);
+    grid.appendChild(a);
+  });
+}
+
+// ── Render pagination ─────────────────────────────────────────────────────────
+function renderPagination(total) {
+  paginationEl.innerHTML = "";
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  if (totalPages <= 1) return;
+
+  const prev = document.createElement("button");
+  prev.className = "page-btn";
+  prev.textContent = "← Prev";
+  prev.disabled = currentPage === 1;
+  prev.addEventListener("click", () => { currentPage--; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
+  paginationEl.appendChild(prev);
+
+  // page numbers with ellipsis
+  const pages = getPageRange(currentPage, totalPages);
+  let lastNum = null;
+  pages.forEach(p => {
+    if (p === "…") {
+      const ell = document.createElement("span");
+      ell.className = "page-ellipsis";
+      ell.textContent = "…";
+      paginationEl.appendChild(ell);
+    } else {
+      const btn = document.createElement("button");
+      btn.className = "page-btn" + (p === currentPage ? " active" : "");
+      btn.textContent = p;
+      btn.addEventListener("click", () => { currentPage = p; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
+      paginationEl.appendChild(btn);
+    }
+  });
+
+  const next = document.createElement("button");
+  next.className = "page-btn";
+  next.textContent = "Next →";
+  next.disabled = currentPage === totalPages;
+  next.addEventListener("click", () => { currentPage++; render(); window.scrollTo({top: 0, behavior: "smooth"}); });
+  paginationEl.appendChild(next);
+}
+
+function getPageRange(current, total) {
+  if (total <= 7) return Array.from({length: total}, (_, i) => i + 1);
+  const pages = [];
+  pages.push(1);
+  if (current > 3) pages.push("…");
+  for (let i = Math.max(2, current - 1); i <= Math.min(total - 1, current + 1); i++) pages.push(i);
+  if (current < total - 2) pages.push("…");
+  pages.push(total);
+  return pages;
+}
+
+// ── Results info ─────────────────────────────────────────────────────────────
+function renderResultsInfo(total) {
+  if (!query && !activeTag) {
+    resultsInfo.textContent = `${total} course${total !== 1 ? "s" : ""}`;
+    return;
+  }
+  const parts = [];
+  if (query) parts.push(`"${query}"`);
+  if (activeTag) parts.push(activeTag);
+  resultsInfo.textContent = total === 0
+    ? `No results for ${parts.join(" · ")}`
+    : `${total} result${total !== 1 ? "s" : ""} for ${parts.join(" · ")}`;
+}
+
+// ── Main render ───────────────────────────────────────────────────────────────
+function render() {
+  const results = filtered();
+  renderTags();
+  renderResultsInfo(results.length);
+  renderCards(results);
+  renderPagination(results.length);
+}
+
+// ── Event listeners ───────────────────────────────────────────────────────────
+searchEl.addEventListener("input", () => {
+  query = searchEl.value;
+  currentPage = 1;
+  render();
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+render();
+</script>
 </body>
 </html>

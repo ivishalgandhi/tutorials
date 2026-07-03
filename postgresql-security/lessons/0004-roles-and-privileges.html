@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 4: Roles and Privileges — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 4</span>
+    <span>PostgreSQL Security</span>
+    <span>~30 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Roles and Privileges — PostgreSQL's Answer to SQL Server Logins, Users, and Roles</h1>
+
+  <p>If there is one area where the conceptual shift from SQL Server to PostgreSQL is most disorienting, it is the authorization model. SQL Server has three separate security objects — logins, users, and roles — and they exist at different levels of the server hierarchy. PostgreSQL collapses all of them into a single object. Understanding this unification is the foundation for everything else in this lesson.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. The Most Important Conceptual Shift: One Object to Rule Them All</h2>
+
+  <p>In SQL Server, the security model is layered:</p>
+  <ul>
+    <li><strong>Login</strong> — a server-level principal that can authenticate. Lives in <code>master</code>. Can be a SQL Auth login or a Windows principal.</li>
+    <li><strong>User</strong> — a database-level principal mapped to a login. Exists inside each individual database. A login must be mapped to a user to access a database.</li>
+    <li><strong>Role</strong> — a container for permissions, either fixed server roles or user-defined database roles. Users are members of roles.</li>
+  </ul>
+
+  <p>In PostgreSQL, there is exactly one object: a <strong>role</strong>.</p>
+
+  <ul>
+    <li>A role with the <code>LOGIN</code> attribute <em>is</em> a login — it can authenticate and connect.</li>
+    <li>A role without <code>LOGIN</code> is a permission group — it can hold privileges and be granted to other roles.</li>
+    <li>There is no separate "user" object at the database level. Roles exist cluster-wide and can be granted access to specific databases via <code>GRANT CONNECT ON DATABASE</code>.</li>
+  </ul>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>The SQL standard <code>CREATE USER</code> syntax works in PostgreSQL as an alias for <code>CREATE ROLE ... WITH LOGIN</code>. Many tutorials use <code>CREATE USER</code> because it is familiar, but it is identical to <code>CREATE ROLE</code> with a <code>LOGIN</code> attribute. There is no technical difference between a "user" and a "role" in PostgreSQL — they are the same catalog object in <code>pg_roles</code>.</p>
+  </div>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+graph TD
+    subgraph SQL Server
+        SL[Login<br/>server-level] --> SU[User<br/>database-level]
+        SU --> SR[Role membership<br/>database-level]
+    end
+    subgraph PostgreSQL
+        PR[Role<br/>cluster-wide]
+        PR -- with LOGIN --> PL[Can connect = login]
+        PR -- without LOGIN --> PG[Permission group = role]
+        PR -- GRANT role TO role --> PM[Role membership = nesting]
+    end
+    </div>
+    <p class="diagram-caption">Figure 1. SQL Server separates logins, users, and roles across two levels. PostgreSQL uses a single role object with attributes controlling its behaviour.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. Role Attributes</h2>
+
+  <p>A role's behaviour is controlled by its attributes, set at creation time or altered later with <code>ALTER ROLE</code>. The official documentation for <code>CREATE ROLE</code> is at <a href="https://www.postgresql.org/docs/current/sql-createrole.html">postgresql.org/docs/current/sql-createrole.html</a>.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Attribute</th>
+        <th>What it does</th>
+        <th>SQL Server equivalent</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>LOGIN</code> / <code>NOLOGIN</code></td>
+        <td>Whether the role can authenticate and open a client connection. Default: NOLOGIN.</td>
+        <td>The distinction between a SQL Server Login (can authenticate) and a Database Role (cannot authenticate, used only for permission grouping).</td>
+      </tr>
+      <tr>
+        <td><code>SUPERUSER</code> / <code>NOSUPERUSER</code></td>
+        <td>Bypasses all permission checks in the entire cluster. Can do anything. Default: NOSUPERUSER.</td>
+        <td>Membership in the <code>sysadmin</code> fixed server role. Equivalent power: no access check can deny a superuser.</td>
+      </tr>
+      <tr>
+        <td><code>CREATEDB</code> / <code>NOCREATEDB</code></td>
+        <td>Can create new databases. Default: NOCREATEDB.</td>
+        <td>Membership in the <code>dbcreator</code> fixed server role.</td>
+      </tr>
+      <tr>
+        <td><code>CREATEROLE</code> / <code>NOCREATEROLE</code></td>
+        <td>Can create, alter, and drop other roles (with restrictions below their own privilege level in PG16+). Default: NOCREATEROLE.</td>
+        <td>Partial equivalent to <code>securityadmin</code> — but PostgreSQL's CREATEROLE is narrower; it cannot grant privileges the role itself does not hold.</td>
+      </tr>
+      <tr>
+        <td><code>REPLICATION</code> / <code>NOREPLICATION</code></td>
+        <td>Can initiate streaming replication and use replication slots. Default: NOREPLICATION.</td>
+        <td>Membership in the <code>sysadmin</code> or <code>dbcreator</code> role is typically used for replication in SQL Server; there is no direct named equivalent.</td>
+      </tr>
+      <tr>
+        <td><code>BYPASSRLS</code> / <code>NOBYPASSRLS</code></td>
+        <td>Bypasses all Row Level Security policies on all tables. Default: NOBYPASSRLS. Superusers implicitly bypass RLS unless the table uses FORCE ROW LEVEL SECURITY.</td>
+        <td>No direct equivalent. SQL Server's RLS predicate functions run for all users including sysadmins unless explicitly skipped via a CONTEXT_INFO check.</td>
+      </tr>
+      <tr>
+        <td><code>INHERIT</code> / <code>NOINHERIT</code></td>
+        <td>Whether this role automatically inherits privileges from roles it is a member of. Default: INHERIT.</td>
+        <td>No direct equivalent. SQL Server role membership always means privilege inheritance. PostgreSQL NOINHERIT means the role must explicitly <code>SET ROLE</code> to activate inherited privileges.</td>
+      </tr>
+      <tr>
+        <td><code>CONNECTION LIMIT</code></td>
+        <td>Maximum number of simultaneous connections for this role. -1 means unlimited. Default: -1.</td>
+        <td>No direct equivalent at the login level; SQL Server Resource Governor limits connections per workload group, not per login.</td>
+      </tr>
+      <tr>
+        <td><code>PASSWORD</code></td>
+        <td>Sets the role's password for authentication. Only meaningful if the role has LOGIN and pg_hba.conf uses a password-based method.</td>
+        <td>The password field of a SQL Authentication login in SQL Server.</td>
+      </tr>
+      <tr>
+        <td><code>VALID UNTIL</code></td>
+        <td>Password expiry timestamp. After this time, password authentication fails for this role.</td>
+        <td>SQL Server login password expiry policy (enforced via Windows policy or CHECK_EXPIRATION setting).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. Creating Roles — Exact Syntax</h2>
+
+  <pre><code><span class="cm">-- A login role: an application service account
+-- Every security attribute is explicit — never rely on defaults for security-sensitive roles</span>
+<span class="kw">CREATE ROLE</span> app_user
+  <span class="kw">WITH</span>
+    <span class="kw">LOGIN</span>
+    <span class="kw">PASSWORD</span>  <span class="st">'initial_password_change_on_first_use'</span>
+    <span class="kw">NOSUPERUSER</span>
+    <span class="kw">NOCREATEDB</span>
+    <span class="kw">NOCREATEROLE</span>
+    <span class="kw">NOREPLICATION</span>
+    <span class="kw">NOBYPASSRLS</span>
+    <span class="kw">INHERIT</span>
+    <span class="kw">CONNECTION LIMIT</span> <span class="nm">10</span>      <span class="cm">-- cap connection count per service account</span>
+    <span class="kw">VALID UNTIL</span> <span class="st">'2025-12-31'</span>;  <span class="cm">-- optional: force rotation</span>
+
+<span class="cm">-- A permission group (no LOGIN — cannot connect directly)</span>
+<span class="kw">CREATE ROLE</span> readonly_role
+  <span class="kw">WITH</span>
+    <span class="kw">NOLOGIN</span>
+    <span class="kw">NOSUPERUSER</span>
+    <span class="kw">NOCREATEDB</span>
+    <span class="kw">NOCREATEROLE</span>;
+
+<span class="cm">-- Grant the group to the login role (role membership)</span>
+<span class="kw">GRANT</span> readonly_role <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Verify: list all roles and their attributes</span>
+<span class="kw">SELECT</span> rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+<span class="kw">FROM</span>   pg_roles
+<span class="kw">ORDER BY</span> rolname;
+
+<span class="cm">-- Modify an existing role:</span>
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">CONNECTION LIMIT</span> <span class="nm">20</span>;
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">PASSWORD</span> <span class="st">'new_strong_password'</span>;
+<span class="kw">ALTER ROLE</span> app_user <span class="kw">VALID UNTIL</span> <span class="st">'infinity'</span>;  <span class="cm">-- remove expiry</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. Object-Level Privileges — GRANT and REVOKE</h2>
+
+  <p>PostgreSQL object privileges are granted on specific object types. The set of available privileges differs by object type. The documentation for GRANT is at <a href="https://www.postgresql.org/docs/current/sql-grant.html">postgresql.org/docs/current/sql-grant.html</a>.</p>
+
+  <h3>Tables</h3>
+
+  <pre><code><span class="cm">-- Available table privileges: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+
+-- Grant read access to the readonly_role group</span>
+<span class="kw">GRANT</span> <span class="kw">SELECT</span>                    <span class="kw">ON</span> orders <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Grant data modification rights (but not schema changes)</span>
+<span class="kw">GRANT</span> <span class="kw">SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span>  <span class="kw">ON</span> orders <span class="kw">TO</span> readwrite_role;
+
+<span class="cm">-- Grant full table control (including truncate and FK references)</span>
+<span class="kw">GRANT</span> <span class="kw">ALL PRIVILEGES</span>             <span class="kw">ON</span> orders <span class="kw">TO</span> app_owner;
+
+<span class="cm">-- Grant on all tables in a schema at once</span>
+<span class="kw">GRANT</span> <span class="kw">SELECT</span> <span class="kw">ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Revoke: removing a privilege</span>
+<span class="kw">REVOKE</span> <span class="kw">INSERT</span> <span class="kw">ON</span> orders <span class="kw">FROM</span> readonly_role;
+
+<span class="cm">-- Inspect current grants on a table:</span>
+<span class="kw">SELECT</span> grantee, privilege_type, is_grantable
+<span class="kw">FROM</span>   information_schema.role_table_grants
+<span class="kw">WHERE</span>  table_schema = <span class="st">'app'</span> <span class="kw">AND</span> table_name = <span class="st">'orders'</span>
+<span class="kw">ORDER BY</span> grantee, privilege_type;</code></pre>
+
+  <h3>Schemas</h3>
+
+  <pre><code><span class="cm">-- USAGE: required to access objects inside a schema (see objects, resolve names)
+-- CREATE: required to create new objects in a schema
+-- Both are needed to create objects and use them; USAGE alone is enough to query.
+
+-- Minimum schema grant for a read-only role:</span>
+<span class="kw">GRANT USAGE ON SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Grant for an application role that needs to create tables in the schema:</span>
+<span class="kw">GRANT USAGE, CREATE ON SCHEMA</span> app <span class="kw">TO</span> app_owner;
+
+<span class="cm">-- Inspect schema grants:</span>
+<span class="kw">SELECT</span> schema_name, privilege_type, grantee
+<span class="kw">FROM</span>   information_schema.role_schema_grants
+<span class="kw">WHERE</span>  schema_name = <span class="st">'app'</span>;</code></pre>
+
+  <h3>Sequences</h3>
+
+  <pre><code><span class="cm">-- Sequences power SERIAL / BIGSERIAL columns.
+-- USAGE: call nextval() and currval()
+-- SELECT: call currval() and lastval() without USAGE
+-- UPDATE: call setval() to reset the sequence counter
+
+-- Application role needs INSERT → needs USAGE on the sequence:</span>
+<span class="kw">GRANT USAGE ON</span> orders_id_seq <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Or grant on all sequences in a schema:</span>
+<span class="kw">GRANT USAGE ON ALL SEQUENCES IN SCHEMA</span> app <span class="kw">TO</span> app_user;</code></pre>
+
+  <h3>Functions</h3>
+
+  <pre><code><span class="cm">-- EXECUTE: call the function
+-- Default: PUBLIC has EXECUTE on all functions (revoke this!)
+
+-- Revoke the public default, then grant explicitly:</span>
+<span class="kw">REVOKE EXECUTE ON FUNCTION</span> <span class="fn">calculate_tax</span>(numeric) <span class="kw">FROM PUBLIC</span>;
+<span class="kw">GRANT  EXECUTE ON FUNCTION</span> <span class="fn">calculate_tax</span>(numeric) <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Grant on all functions in a schema:</span>
+<span class="kw">GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</span> app <span class="kw">TO</span> app_user;</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Column-Level Privileges</h2>
+
+  <p>PostgreSQL supports privilege grants at the individual column level for SELECT, INSERT, UPDATE, and REFERENCES. Column-level grants are additive with table-level grants — a role can have SELECT on all columns via a table grant, and separately have UPDATE on only a subset of columns.</p>
+
+  <pre><code><span class="cm">-- Grant SELECT on a specific column only (e.g., HR can read salaries)</span>
+<span class="kw">GRANT SELECT</span> (employee_id, name, salary) <span class="kw">ON</span> employees <span class="kw">TO</span> hr_readonly;
+
+<span class="cm">-- Revoke the table-level SELECT but keep the column-level grant intact.
+-- The role still has access to exactly those three columns.</span>
+<span class="kw">REVOKE SELECT ON</span> employees <span class="kw">FROM</span> hr_readonly;
+<span class="cm">-- hr_readonly can now SELECT only employee_id, name, salary — not other columns</span>
+
+<span class="cm">-- Inspect column-level grants:</span>
+<span class="kw">SELECT</span> column_name, privilege_type, grantee
+<span class="kw">FROM</span>   information_schema.role_column_grants
+<span class="kw">WHERE</span>  table_name = <span class="st">'employees'</span>
+<span class="kw">ORDER BY</span> grantee, column_name;
+
+<span class="cm">-- Note: column-level INSERT or UPDATE grants require the role to also
+-- have table-level INSERT or UPDATE (respectively) to perform the operation.
+-- Column grants narrow the scope; they do not standalone replace the table grant.</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>Column-level SELECT grants are a clean alternative to views when you need to expose a subset of columns from a table to a specific role without creating a separate view object. They compose naturally with table-level grants: if a role has table-level SELECT and column-level SELECT on a subset, the column grants are redundant — the table grant already covers everything. Column grants become meaningful only when table-level SELECT is revoked.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. ALTER DEFAULT PRIVILEGES — The Concept SQL Server DBAs Most Often Miss</h2>
+
+  <p>This is the most important privilege concept to understand, and it has no direct SQL Server equivalent. Without it, every new table created in a schema will have <em>no privileges</em> for application roles — causing a silent permission denied error the first time the application tries to access the table.</p>
+
+  <p>Here is why it matters. In SQL Server, if a user is a member of <code>db_datareader</code>, they can read all tables in the database — including tables created after the role was granted. SQL Server evaluates the role's permission at query time against whatever objects exist at that moment. There is no per-table bootstrap step required.</p>
+
+  <p>In PostgreSQL, privileges are stored per-object. A GRANT on a table says "this role may SELECT on this specific table." When a new table is created, it has no grants at all. The role that needs to SELECT from it must be granted SELECT explicitly on the new table — or you use <code>ALTER DEFAULT PRIVILEGES</code> to declare the grants that should be applied automatically to every future object.</p>
+
+  <pre><code><span class="cm">-- The problem without ALTER DEFAULT PRIVILEGES:
+-- 1. You grant SELECT on all existing tables to readonly_role</span>
+<span class="kw">GRANT SELECT ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- 2. app_owner creates a new table next week</span>
+<span class="kw">CREATE TABLE</span> app.new_feature (id serial, data text);
+
+<span class="cm">-- 3. readonly_role tries to query it:
+--    SELECT * FROM app.new_feature;
+--    ERROR: permission denied for table new_feature
+-- The GRANT on "ALL TABLES" captured tables at that moment — not future ones.</span>
+
+
+<span class="cm">-- THE FIX: ALTER DEFAULT PRIVILEGES
+-- "For any table that app_owner creates in schema app,
+--  automatically grant these privileges to readonly_role"</span>
+
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner          <span class="cm">-- the role doing the creating</span>
+  <span class="kw">IN SCHEMA</span> app               <span class="cm">-- in this schema</span>
+  <span class="kw">GRANT SELECT ON TABLES TO</span> readonly_role;
+
+<span class="cm">-- For a read/write application role, set defaults for tables, sequences, and functions:</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner
+  <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON TABLES TO</span> app_user;
+
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner
+  <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT USAGE ON SEQUENCES TO</span> app_user;
+
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner
+  <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT EXECUTE ON FUNCTIONS TO</span> app_user;
+
+<span class="cm">-- Inspect current default privileges:</span>
+<span class="kw">SELECT</span> pg_get_userbyid(defaclrole) <span class="kw">AS</span> owner_role,
+       defaclnamespace::regnamespace <span class="kw">AS</span> schema_name,
+       defaclobjtype,
+       pg_get_acl(defaclacl) <span class="kw">AS</span> acl
+<span class="kw">FROM</span>   pg_default_acl;
+
+<span class="cm">-- NOTE: ALTER DEFAULT PRIVILEGES is role-specific.
+-- If a different role (say, app_developer) also creates tables in the schema,
+-- you need a separate ALTER DEFAULT PRIVILEGES FOR ROLE app_developer statement.
+-- Default privileges only apply to objects created by the role listed in FOR ROLE.</span></code></pre>
+
+  <div class="callout danger">
+    <div class="label">DBA Migration Warning — Top Mistake</div>
+    <p>This is the number one silent failure pattern for PostgreSQL deployments managed by DBAs migrating from SQL Server. The initial <code>GRANT SELECT ON ALL TABLES IN SCHEMA app TO readonly_role</code> works perfectly. Two months later, a developer creates a new table, the application starts returning permission errors, and the team has no idea why — because the error looks exactly like the table does not exist from the application's perspective. Always set up <code>ALTER DEFAULT PRIVILEGES</code> at schema creation time, before any application objects are created. Treat it as a schema-level configuration step, not an afterthought.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. The public Schema Problem</h2>
+
+  <p>The <code>public</code> schema exists in every PostgreSQL database and has historically been the default landing zone for objects. Its default privilege configuration changed significantly in PostgreSQL 15, and understanding this change is essential when working across different PostgreSQL versions.</p>
+
+  <h3>Pre-PostgreSQL 15 Behaviour</h3>
+
+  <pre><code><span class="cm">-- In PostgreSQL 14 and earlier:
+-- The PUBLIC pseudo-role (meaning: every role in the cluster) has:
+--   CONNECT on every database (by default)
+--   CREATE on the public schema (by default)
+--   TEMP on every database (by default)
+--
+-- This means: any role that can log in can CREATE TABLES in public.
+-- An attacker who gains access to ANY login role can inject objects
+-- into the public schema — tables, functions, triggers — that other
+-- users may interact with.
+--
+-- FIX for PostgreSQL 14 and earlier (run in each database):</span>
+<span class="kw">REVOKE CREATE ON SCHEMA</span> public <span class="kw">FROM PUBLIC</span>;
+<span class="kw">REVOKE ALL ON DATABASE</span> mydb <span class="kw">FROM PUBLIC</span>;
+<span class="cm">-- Then grant explicitly to the roles that legitimately need these privileges:</span>
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> app_user;
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> readonly_role;</code></pre>
+
+  <h3>PostgreSQL 15+ Behaviour</h3>
+
+  <pre><code><span class="cm">-- In PostgreSQL 15+:
+-- CREATE on the public schema is no longer granted to PUBLIC by default.
+-- A new database has public schema with only USAGE granted to PUBLIC.
+-- This is the correct baseline for new deployments.
+--
+-- However: CONNECT on the database is still granted to PUBLIC by default.
+-- You still need to revoke this explicitly if you want explicit control
+-- over which roles can connect to which databases:</span>
+<span class="kw">REVOKE ALL ON DATABASE</span> mydb <span class="kw">FROM PUBLIC</span>;
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> app_user;
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Check current public schema grants:</span>
+<span class="kw">SELECT</span> nspname, nspacl
+<span class="kw">FROM</span>   pg_namespace
+<span class="kw">WHERE</span>  nspname = <span class="st">'public'</span>;
+<span class="cm">-- Pre-15 output: {=UC/postgres} — U=USAGE, C=CREATE granted to PUBLIC (=)
+-- Post-15 output: {=U/postgres}  — only USAGE granted to PUBLIC</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>Even in PostgreSQL 15+, the habit of placing application objects in the <code>public</code> schema should be avoided for multi-tenant or multi-application databases. Create a dedicated schema per application (<code>CREATE SCHEMA app AUTHORIZATION app_owner</code>), revoke all on public, and use <code>ALTER DEFAULT PRIVILEGES</code> within the application schema. This isolates applications at the schema level and makes privilege management explicit.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>8. SQL Server Mapping Summary</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>SQL Server concept</th>
+        <th>PostgreSQL equivalent</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>sysadmin</code> fixed server role</td>
+        <td><code>SUPERUSER</code> role attribute</td>
+        <td>Both bypass all permission checks. Grant to as few accounts as possible — never to application service accounts.</td>
+      </tr>
+      <tr>
+        <td><code>securityadmin</code> fixed server role</td>
+        <td><code>CREATEROLE</code> role attribute (partial)</td>
+        <td>PostgreSQL CREATEROLE cannot grant privileges the role itself does not hold, making it somewhat safer than SQL Server's securityadmin.</td>
+      </tr>
+      <tr>
+        <td><code>dbcreator</code> fixed server role</td>
+        <td><code>CREATEDB</code> role attribute</td>
+        <td>Direct equivalent — both grant the ability to create new databases.</td>
+      </tr>
+      <tr>
+        <td><code>db_datareader</code> database role</td>
+        <td>Custom role + <code>GRANT SELECT ON ALL TABLES IN SCHEMA</code> + <code>ALTER DEFAULT PRIVILEGES</code></td>
+        <td>PostgreSQL has no built-in db_datareader equivalent. You build it with a NOLOGIN role and explicit grants. Remember: ALTER DEFAULT PRIVILEGES is required for future tables.</td>
+      </tr>
+      <tr>
+        <td><code>db_datawriter</code> database role</td>
+        <td>Custom role + <code>GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA</code></td>
+        <td>Same pattern as db_datareader. Combine with USAGE on sequences if roles need INSERT into tables with serial columns.</td>
+      </tr>
+      <tr>
+        <td><code>db_ddladmin</code> database role</td>
+        <td>Role with <code>GRANT CREATE ON SCHEMA</code> + <code>CREATE ROLE</code> in relevant schemas</td>
+        <td>PostgreSQL does not have a built-in ddladmin role. Grant CREATE on schemas explicitly, not SUPERUSER.</td>
+      </tr>
+      <tr>
+        <td>Fixed server role <code>bulkadmin</code></td>
+        <td><code>COPY</code> privilege on specific tables</td>
+        <td>PostgreSQL's COPY privilege is per-table, not a server-wide capability.</td>
+      </tr>
+      <tr>
+        <td>Windows Authentication login</td>
+        <td>Role with LOGIN + pg_hba.conf using <code>ldap</code> or <code>gss</code> method</td>
+        <td>The role still needs to exist in PostgreSQL; authentication is delegated to AD or Kerberos.</td>
+      </tr>
+      <tr>
+        <td>Schema ownership (<code>db_owner</code>)</td>
+        <td>Schema-level ownership + <code>GRANT ALL ON SCHEMA</code></td>
+        <td><code>CREATE SCHEMA myschema AUTHORIZATION app_owner</code> makes app_owner the schema owner with full control.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>9. Mistake 1 — SUPERUSER on Application Service Accounts</h2>
+
+  <div class="callout danger">
+    <div class="label">DBA Migration Warning — Top Mistake</div>
+    <p>When an application fails with permission errors during initial setup, the fastest workaround is to grant SUPERUSER to the application service account. In SQL Server, the equivalent is adding the login to <code>sysadmin</code> — experienced DBAs know this is wrong, but it happens under deadline pressure. In PostgreSQL, SUPERUSER is even more powerful: it bypasses Row Level Security, all GRANT checks, all schema isolation, and can access every database in the cluster. A compromised application running as SUPERUSER has complete control over the PostgreSQL instance, including the ability to read pg_authid (all password hashes), create new superusers, and read files on the server filesystem via COPY TO/FROM.</p>
+  </div>
+
+  <p>The correct approach is minimum privilege. Here is a recipe for a typical application service account:</p>
+
+  <pre><code><span class="cm">-- Step 1: Create the application role with minimum attributes</span>
+<span class="kw">CREATE ROLE</span> app_user
+  <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'strong_random_password'</span>
+  <span class="kw">NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS</span>;
+
+<span class="cm">-- Step 2: Grant CONNECT on the specific database (not all databases)</span>
+<span class="kw">GRANT CONNECT ON DATABASE</span> appdb <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Step 3: Grant USAGE on the application schema</span>
+<span class="kw">GRANT USAGE ON SCHEMA</span> app <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Step 4: Grant object-level privileges</span>
+<span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> app_user;
+<span class="kw">GRANT USAGE ON ALL SEQUENCES IN SCHEMA</span> app <span class="kw">TO</span> app_user;
+<span class="kw">GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA</span> app <span class="kw">TO</span> app_user;
+
+<span class="cm">-- Step 5: Set up default privileges for future objects
+--         (do this as the schema-owning role, not as app_user)</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON TABLES TO</span> app_user;
+
+<span class="kw">ALTER DEFAULT PRIVILEGES</span>
+  <span class="kw">FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app
+  <span class="kw">GRANT USAGE ON SEQUENCES TO</span> app_user;
+
+<span class="cm">-- Verify: what can app_user do?</span>
+<span class="kw">SELECT</span> table_schema, table_name, privilege_type
+<span class="kw">FROM</span>   information_schema.role_table_grants
+<span class="kw">WHERE</span>  grantee = <span class="st">'app_user'</span>
+<span class="kw">ORDER BY</span> table_schema, table_name, privilege_type;</code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>10. Mistake 2 — Forgetting ALTER DEFAULT PRIVILEGES</h2>
+
+  <p>This has been discussed in Section 6, but it deserves explicit emphasis as a top migration mistake because its failure mode is silent and delayed. The symptoms appear weeks after the initial setup, when new objects are created, and they look like a completely different problem.</p>
+
+  <div class="callout warning">
+    <div class="label">DBA Migration Warning</div>
+    <p>The pattern is always the same: initial deployment works, everything is granted on existing objects, application goes live. Then a developer runs a migration that creates a new table. The application starts returning "permission denied for table X" — but X is a brand-new table that did not exist when the grants were set up. The DBA re-runs the GRANT statement, fixes it, deploys the next migration, same error, repeat. This cycle is the unmistakable signature of a missing ALTER DEFAULT PRIVILEGES configuration.</p>
+    <p>Make ALTER DEFAULT PRIVILEGES part of your schema creation runbook. Run it immediately after creating the schema, before any objects are created. Document it. Include it in your infrastructure-as-code templates.</p>
+  </div>
+
+  <p>A complete schema setup sequence — the template to standardise across all deployments:</p>
+
+  <pre><code><span class="cm">-- ── SCHEMA SETUP TEMPLATE ─────────────────────────────────────────────────────
+-- Run once per schema, at provisioning time.
+-- Replace: mydb, app_schema, app_owner, app_rw_role, app_ro_role</span>
+
+<span class="cm">-- 1. Revoke public defaults</span>
+<span class="kw">REVOKE ALL ON DATABASE</span> mydb <span class="kw">FROM PUBLIC</span>;
+<span class="kw">REVOKE CREATE ON SCHEMA</span> public <span class="kw">FROM PUBLIC</span>;
+
+<span class="cm">-- 2. Create the schema owned by the application owner role</span>
+<span class="kw">CREATE SCHEMA</span> app_schema <span class="kw">AUTHORIZATION</span> app_owner;
+
+<span class="cm">-- 3. Grant connect on the database to application roles</span>
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> app_owner, app_rw_role, app_ro_role;
+
+<span class="cm">-- 4. Grant schema usage</span>
+<span class="kw">GRANT USAGE ON SCHEMA</span> app_schema <span class="kw">TO</span> app_rw_role, app_ro_role;
+<span class="kw">GRANT USAGE, CREATE ON SCHEMA</span> app_schema <span class="kw">TO</span> app_owner;
+
+<span class="cm">-- 5. Set default privileges for future tables</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app_schema
+  <span class="kw">GRANT SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON TABLES TO</span> app_rw_role;
+
+<span class="kw">ALTER DEFAULT PRIVILEGES FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app_schema
+  <span class="kw">GRANT SELECT ON TABLES TO</span> app_ro_role;
+
+<span class="cm">-- 6. Set default privileges for future sequences</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app_schema
+  <span class="kw">GRANT USAGE ON SEQUENCES TO</span> app_rw_role;
+
+<span class="cm">-- 7. Set default privileges for future functions</span>
+<span class="kw">ALTER DEFAULT PRIVILEGES FOR ROLE</span> app_owner <span class="kw">IN SCHEMA</span> app_schema
+  <span class="kw">GRANT EXECUTE ON FUNCTIONS TO</span> app_rw_role, app_ro_role;
+
+<span class="cm">-- Now create application objects — all future grants will be applied automatically.</span></code></pre>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source</div>
+    <strong>PostgreSQL Documentation — Database Roles</strong><br>
+    <a href="https://www.postgresql.org/docs/current/database-roles.html">postgresql.org/docs/current/database-roles.html</a><br><br>
+    <strong>CREATE ROLE syntax and all attributes:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/sql-createrole.html">postgresql.org/docs/current/sql-createrole.html</a><br><br>
+    <strong>GRANT — all object types and privilege levels:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/sql-grant.html">postgresql.org/docs/current/sql-grant.html</a><br><br>
+    <strong>ALTER DEFAULT PRIVILEGES:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html">postgresql.org/docs/current/sql-alterdefaultprivileges.html</a><br><br>
+    <strong>PostgreSQL 15 release notes — public schema changes:</strong><br>
+    <a href="https://www.postgresql.org/docs/15/release-15.html">postgresql.org/docs/15/release-15.html</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="What is the difference between CREATE ROLE with LOGIN and CREATE ROLE with NOLOGIN in PostgreSQL?"
+         data-correct="B"
+         data-feedback-correct="Correct. A role with LOGIN can authenticate and open a client connection — equivalent to a SQL Server login. A role with NOLOGIN cannot connect directly; it is used purely as a container for privileges, equivalent to a SQL Server database role."
+         data-feedback-wrong="Not quite. The correct answer is B. LOGIN controls whether the role can authenticate and open a connection. NOLOGIN roles exist only to hold and group privileges — they cannot be used to connect to PostgreSQL directly.">
+      <div class="quiz-option" data-key="A">LOGIN grants SUPERUSER rights while NOLOGIN restricts the role to read access only</div>
+      <div class="quiz-option" data-key="B">LOGIN allows the role to connect and authenticate while NOLOGIN cannot open connections</div>
+      <div class="quiz-option" data-key="C">LOGIN stores a password hash in pg_authid while NOLOGIN uses OS-level peer authentication</div>
+      <div class="quiz-option" data-key="D">LOGIN applies to the cluster level while NOLOGIN applies to database scope only</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which PostgreSQL role attribute most closely maps to SQL Server's sysadmin fixed server role?"
+         data-correct="C"
+         data-feedback-correct="Correct. SUPERUSER bypasses all permission checks in PostgreSQL — exactly like sysadmin in SQL Server. No GRANT or REVOKE can deny a superuser, and the role can access all databases, tables, and system objects in the cluster."
+         data-feedback-wrong="Not quite. The correct answer is C: SUPERUSER. CREATEDB maps to dbcreator, CREATEROLE is a partial match for securityadmin, and REPLICATION has no clean SQL Server equivalent.">
+      <div class="quiz-option" data-key="A">CREATEDB, because it grants the highest possible level of database administration rights</div>
+      <div class="quiz-option" data-key="B">CREATEROLE, because it allows creating and managing all other roles in cluster</div>
+      <div class="quiz-option" data-key="C">SUPERUSER, because it bypasses all permission checks across the entire PostgreSQL cluster</div>
+      <div class="quiz-option" data-key="D">REPLICATION, because it provides unrestricted access to all data for copying purposes</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app GRANT SELECT ON TABLES TO readonly_role accomplish?"
+         data-correct="A"
+         data-feedback-correct="Correct. ALTER DEFAULT PRIVILEGES sets up grants that are automatically applied to future objects. Any table created by app_owner in the app schema will automatically have SELECT granted to readonly_role — without requiring an explicit GRANT after each CREATE TABLE."
+         data-feedback-wrong="Not quite. The correct answer is A. ALTER DEFAULT PRIVILEGES is forward-looking — it applies grants to objects created after it runs, not to existing objects. For existing objects, use GRANT SELECT ON ALL TABLES IN SCHEMA app TO readonly_role.">
+      <div class="quiz-option" data-key="A">Automatically grants SELECT on every future table created by app_owner in schema app</div>
+      <div class="quiz-option" data-key="B">Grants SELECT on all tables that currently exist in the app schema now</div>
+      <div class="quiz-option" data-key="C">Sets app_owner as default owner of all objects readonly_role creates in schema app</div>
+      <div class="quiz-option" data-key="D">Changes the default schema search path so readonly_role resolves app tables by default</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In PostgreSQL 14 and earlier, what privilege does the PUBLIC pseudo-role have on the public schema by default, and why is it a security risk?"
+         data-correct="D"
+         data-feedback-correct="Correct. In PostgreSQL 14 and earlier, PUBLIC has CREATE on the public schema by default. Any login role can create tables, functions, or triggers there. A malicious or compromised role could inject objects into the public schema that other users might execute or interact with — for example, a function that shadows a system function."
+         data-feedback-wrong="Not quite. The correct answer is D. Pre-PG15, the CREATE privilege on public schema is granted to PUBLIC by default. This means any authenticated role can create objects there, which is a significant injection risk. PostgreSQL 15 revoked this default.">
+      <div class="quiz-option" data-key="A">SUPERUSER access, allowing any login role to bypass all permission checks globally</div>
+      <div class="quiz-option" data-key="B">CONNECT access, allowing any principal to connect to all databases without authentication</div>
+      <div class="quiz-option" data-key="C">SELECT access, exposing all existing table data to every authenticated database user</div>
+      <div class="quiz-option" data-key="D">CREATE access, letting any login role inject objects into the public schema</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Type a question to your agent — for example: "How do I audit all privileges granted to a specific role, including inherited ones from role membership?", "What is the correct way to implement the db_datareader and db_datawriter pattern in PostgreSQL for a new application?", or "How does NOINHERIT work, and when would I use it instead of the default INHERIT behaviour?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0003-postgresql-conf-security.html">&#8592; Lesson 3: postgresql.conf Security Parameters</a>
+    <a href="0005-custom-role-composition.html">Lesson 5: Custom Role Composition &#8594;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2: LDAP Authentication — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 2</span>
+    <span>PostgreSQL Security</span>
+    <span>~20 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>LDAP Authentication — Connecting PostgreSQL to Active Directory</h1>
+
+  <p>Most enterprise environments already have Active Directory. Every Windows server, every user account, every service principal lives there. SQL Server integrates with AD natively through Windows Authentication — your users never need a separate SQL credential. PostgreSQL can join that same identity ecosystem through LDAP authentication, and this lesson shows you exactly how.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. Why LDAP Authentication</h2>
+
+  <p>Without centralised authentication, every PostgreSQL instance maintains its own password store in <code>pg_authid</code>. When a user leaves the company, someone must remember to revoke access in every database on every server. When a password rotation policy runs, it has to target each instance individually. In practice, these manual steps get missed — and orphaned credentials persist for months.</p>
+
+  <p>LDAP authentication delegates the credential check to Active Directory. PostgreSQL never stores the user's password. The AD account is the single source of truth: when the AD account is disabled, the PostgreSQL connection fails immediately — no per-instance cleanup required.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>This maps directly to how you think about Windows Authentication in SQL Server. The goal is identical: AD is the identity provider, the database is a relying party. The mechanism differs — SQL Server uses Kerberos ticket exchange (SSPI/GSSAPI) so the password never crosses the wire at all. PostgreSQL's <code>ldap</code> method still transmits the password to the LDAP server for verification, which is why TLS (ldaps://) is non-negotiable. PostgreSQL does support full Kerberos/GSSAPI as a separate authentication method, covered in a later lesson.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. Two Bind Methods — and Why the Distinction Matters</h2>
+
+  <p>PostgreSQL's LDAP authentication supports two fundamentally different approaches to verifying a user's identity. Choosing the wrong one is a common configuration error. The official documentation is at <a href="https://www.postgresql.org/docs/current/auth-ldap.html">postgresql.org/docs/current/auth-ldap.html</a>.</p>
+
+  <h3>Method 1: Simple Bind</h3>
+
+  <p>In simple bind mode, PostgreSQL constructs the user's Distinguished Name (DN) directly by concatenating a prefix, the username, and a suffix — and then attempts to bind to the LDAP server using that DN and the user's password.</p>
+
+  <pre><code><span class="cm"># Simple bind: DN is assembled as prefix + username + suffix
+# For a Microsoft AD domain EXAMPLE\username style:</span>
+<span class="nm">hostssl</span>  appdb  <span class="kw">all</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">ldap</span>
+         ldapserver=<span class="st">ad.example.com</span>
+         ldapport=<span class="nm">636</span>
+         ldapscheme=<span class="st">ldaps</span>
+         ldapprefix=<span class="st">"EXAMPLE\"</span>
+         ldapsuffix=<span class="st">""</span>
+
+<span class="cm"># PostgreSQL will attempt: bind as "EXAMPLE\alice" with alice's password
+# The username alice is taken from the PostgreSQL connection's user field.</span>
+
+<span class="cm"># For UPN-style (alice@example.com):</span>
+<span class="nm">hostssl</span>  appdb  <span class="kw">all</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">ldap</span>
+         ldapserver=<span class="st">ad.example.com</span>
+         ldapscheme=<span class="st">ldaps</span>
+         ldapprefix=<span class="st">""</span>
+         ldapsuffix=<span class="st">"@example.com"</span></code></pre>
+
+  <p>Simple bind works when the username format is predictable and consistent. Its weakness: it cannot handle cases where the user's LDAP DN does not follow a simple formula — for example, users distributed across multiple OUs, or where sAMAccountName differs from the PostgreSQL role name.</p>
+
+  <h3>Method 2: Search + Bind (the AD-Recommended Approach)</h3>
+
+  <p>Search + bind uses a two-phase process. In the first phase, PostgreSQL binds to the LDAP server using a dedicated service account (the bind DN and its password). In the second phase, it searches the directory for the connecting user's actual DN using a configurable attribute. Once the DN is found, PostgreSQL unbinds and re-binds as the user with their password to verify the credential.</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as PostgreSQL Client
+    participant P as PostgreSQL Server
+    participant L as Active Directory (LDAP)
+
+    C->>P: Connection request (user: alice, password: secret)
+    Note over P: Phase 1 — service account bind
+    P->>L: Bind as ldapbinddn (service account)
+    L-->>P: Bind successful
+    Note over P: Phase 2 — search for alice's DN
+    P->>L: Search: ldapsearchattribute=sAMAccountName, value=alice
+    L-->>P: Found DN: CN=Alice Smith,OU=Staff,DC=example,DC=com
+    P->>L: Unbind service account
+    Note over P: Phase 3 — bind as alice to verify password
+    P->>L: Bind as CN=Alice Smith,... with password "secret"
+    L-->>P: Bind successful (password correct)
+    P-->>C: Authentication approved
+    </div>
+    <p class="diagram-caption">Figure 1. Search+bind flow. PostgreSQL uses a service account to locate the user's DN, then verifies the user's own password in a separate bind.</p>
+  </div>
+
+  <pre><code><span class="cm"># Search+bind configuration parameters:
+#   ldapbinddn      — the service account DN used for the initial search
+#   ldapbindpasswd  — the service account's password (see Section 6 for risks)
+#   ldapbasedn      — the LDAP subtree to search within
+#   ldapsearchattribute — the attribute whose value equals the PostgreSQL username
+#   ldapsearchfilter    — optional additional LDAP filter (e.g., group membership)</span>
+
+<span class="nm">hostssl</span>  <span class="kw">all</span>  <span class="kw">all</span>  <span class="st">10.0.0.0/8</span>  <span class="fn">ldap</span>
+  ldapurl=<span class="st">"ldaps://ad.example.com/OU=Staff,DC=example,DC=com?sAMAccountName?sub"</span>
+  ldapbinddn=<span class="st">"CN=pg-ldap-svc,OU=ServiceAccounts,DC=example,DC=com"</span>
+  ldapbindpasswd=<span class="st">"ServiceAccountPassword123"</span></code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Characteristic</th>
+        <th>Simple Bind</th>
+        <th>Search + Bind</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Service account required</td>
+        <td>No</td>
+        <td>Yes (<code>ldapbinddn</code> + <code>ldapbindpasswd</code>)</td>
+      </tr>
+      <tr>
+        <td>Handles users in multiple OUs</td>
+        <td>No</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>Supports group membership filters</td>
+        <td>No</td>
+        <td>Yes (via <code>ldapsearchfilter</code>)</td>
+      </tr>
+      <tr>
+        <td>Works with sAMAccountName</td>
+        <td>Only if DN formula is consistent</td>
+        <td>Yes, natively</td>
+      </tr>
+      <tr>
+        <td>Recommended for Active Directory</td>
+        <td>Only for simple single-OU deployments</td>
+        <td>Yes — the standard approach</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. pg_hba.conf LDAP Lines — Exact Syntax</h2>
+
+  <p>LDAP options can be specified either as individual keyword parameters or compacted into an <code>ldapurl</code> following RFC 4516. The two forms are mutually exclusive — do not mix them. The <code>ldapurl</code> form is preferred for search+bind as it is more compact and explicitly encodes the search scope.</p>
+
+  <pre><code><span class="cm"># ── FORM 1: Individual keyword parameters (simple bind) ──────────────────</span>
+<span class="nm">hostssl</span>  <span class="fn">mydb</span>  <span class="kw">all</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">ldap</span>
+  ldapserver=<span class="st">ad.example.com</span>
+  ldapport=<span class="nm">636</span>
+  ldapscheme=<span class="st">ldaps</span>
+  ldapprefix=<span class="st">"EXAMPLE\"</span>
+  ldapsuffix=<span class="st">""</span>
+
+<span class="cm"># ── FORM 2: ldapurl (search+bind — recommended for AD) ───────────────────
+# ldapurl encodes: scheme://host/basedn?attribute?scope[?filter]
+# scope: base | one | sub  (use sub for full subtree search)</span>
+<span class="nm">hostssl</span>  <span class="fn">mydb</span>  <span class="kw">all</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">ldap</span>
+  ldapurl=<span class="st">"ldaps://ad.example.com/DC=example,DC=com?sAMAccountName?sub"</span>
+  ldapbinddn=<span class="st">"CN=pg-svc,OU=ServiceAccounts,DC=example,DC=com"</span>
+  ldapbindpasswd=<span class="st">"Passw0rd!"</span>
+
+<span class="cm"># ── FORM 3: ldapurl with additional group membership filter ──────────────
+# Only members of the PostgreSQL-Users AD group can authenticate</span>
+<span class="nm">hostssl</span>  <span class="fn">mydb</span>  <span class="kw">all</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">ldap</span>
+  ldapurl=<span class="st">"ldaps://ad.example.com/DC=example,DC=com?sAMAccountName?sub?(memberOf=CN=PostgreSQL-Users,OU=Groups,DC=example,DC=com)"</span>
+  ldapbinddn=<span class="st">"CN=pg-svc,OU=ServiceAccounts,DC=example,DC=com"</span>
+  ldapbindpasswd=<span class="st">"Passw0rd!"</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>Note that <code>ldap</code> in pg_hba.conf METHOD field refers to the authentication method, not the scheme. To use LDAP over TLS (port 636), you specify either <code>ldapscheme=ldaps</code> (keyword form) or <code>ldaps://</code> in the URL (ldapurl form). The METHOD is always <code>ldap</code> regardless of whether you use plain or TLS.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. Active Directory Specifics</h2>
+
+  <p>Active Directory is an LDAP directory with Microsoft-specific extensions. These are the parameters that matter most for a successful AD integration:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>AD-specific guidance</th>
+        <th>Example value</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ldapurl</code> scheme</td>
+        <td>Always <code>ldaps://</code> for production. AD supports LDAP over SSL on port 636 with a valid domain certificate. Plain <code>ldap://</code> on port 389 sends the bind password in cleartext.</td>
+        <td><code>ldaps://ad.example.com</code></td>
+      </tr>
+      <tr>
+        <td><code>ldapbasedn</code></td>
+        <td>The root of your search. Start at the domain root or the OU that contains all database users. Narrower base = faster search.</td>
+        <td><code>OU=Staff,DC=example,DC=com</code></td>
+      </tr>
+      <tr>
+        <td><code>ldapsearchattribute</code></td>
+        <td>Use <code>sAMAccountName</code> for short Windows logon names (DOMAIN\username). Use <code>userPrincipalName</code> for UPN-style (alice@example.com) — but the PostgreSQL role name must match exactly.</td>
+        <td><code>sAMAccountName</code></td>
+      </tr>
+      <tr>
+        <td><code>ldapbinddn</code></td>
+        <td>A dedicated service account with read-only access to the directory. Do not reuse an admin account. The account needs only Read and List Contents permissions on the searched OUs.</td>
+        <td><code>CN=pg-ldap-svc,OU=ServiceAccounts,DC=example,DC=com</code></td>
+      </tr>
+      <tr>
+        <td><code>ldapbindpasswd</code></td>
+        <td>The service account password. Stored in plaintext in pg_hba.conf. See Section 6 for mitigations.</td>
+        <td>Service account password string</td>
+      </tr>
+      <tr>
+        <td>AD certificate</td>
+        <td>AD's LDAPS certificate must be trusted by the PostgreSQL server. Add the AD CA certificate to the system trust store or reference it via <code>LDAPTLS_CACERT</code> environment variable.</td>
+        <td><code>/etc/ssl/certs/example-root-ca.crt</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout key">
+    <div class="label">Key Concept — Role Name Matching</div>
+    <p>PostgreSQL LDAP authentication verifies the password but does <strong>not</strong> create roles automatically. A PostgreSQL role with the same name as the AD sAMAccountName must already exist in the database. If <code>alice</code> authenticates via AD but there is no PostgreSQL role named <code>alice</code>, the connection fails with "role does not exist." Provision roles with <code>CREATE ROLE alice WITH LOGIN NOLOGIN</code> in advance, or use a pg_ident.conf username map to translate AD usernames to PostgreSQL role names.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Comparing LDAP to SQL Server Windows Authentication</h2>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Comparison</div>
+    <p>SQL Server's Windows Authentication uses Kerberos (or NTLM fallback) — a ticket-based protocol where the user's password hash never leaves the domain controller. The client presents a Kerberos ticket to SQL Server; SQL Server validates the ticket with the KDC. The database password field does not exist for Windows-authenticated logins because there is no database password.</p>
+    <p>PostgreSQL LDAP authentication is fundamentally different: the user types their AD password into the PostgreSQL client, PostgreSQL receives it, and then transmits it to the LDAP server to perform a bind. The password travels across the network (which is why <code>ldaps://</code> is mandatory). This is a bind-and-verify pattern, not a ticket exchange. PostgreSQL does support true Kerberos/GSSAPI authentication as a separate method — the <code>gss</code> method in pg_hba.conf — which provides the ticket-based model SQL Server DBAs expect from Windows Authentication.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Aspect</th>
+        <th>SQL Server Windows Auth</th>
+        <th>PostgreSQL ldap method</th>
+        <th>PostgreSQL gss method</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Protocol</td>
+        <td>Kerberos / NTLM</td>
+        <td>LDAP bind (password verification)</td>
+        <td>Kerberos (GSSAPI)</td>
+      </tr>
+      <tr>
+        <td>Password over network</td>
+        <td>Never (ticket only)</td>
+        <td>Yes (TLS-protected)</td>
+        <td>Never (ticket only)</td>
+      </tr>
+      <tr>
+        <td>Requires service account</td>
+        <td>SPN on SQL Server account</td>
+        <td>Yes (search+bind) or No (simple bind)</td>
+        <td>SPN (postgres/host keytab)</td>
+      </tr>
+      <tr>
+        <td>AD group membership used for access</td>
+        <td>Yes, via AD groups mapped to SQL Server logins</td>
+        <td>Via ldapsearchfilter only</td>
+        <td>No — only role name matching</td>
+      </tr>
+      <tr>
+        <td>Covered in this course</td>
+        <td>Reference only</td>
+        <td>This lesson</td>
+        <td>Separate advanced lesson</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. Gotcha 1 — ldapbindpasswd is Stored in Plaintext</h2>
+
+  <p>This is the top concern for DBAs configuring LDAP for the first time. The service account password you place in <code>ldapbindpasswd</code> is stored as clear text in <code>pg_hba.conf</code>. There is no encryption, no secrets manager integration, no vault reference — the password is literally readable in the file.</p>
+
+  <div class="callout danger">
+    <div class="label">DBA Migration Warning — Top Mistake</div>
+    <p>SQL Server DBAs are accustomed to Windows Authentication service accounts whose credentials are managed at the OS level (Windows service account, Managed Service Account, or gMSA). The credential is never written to a config file. In PostgreSQL LDAP configuration, the bind password is visible to anyone who can read pg_hba.conf. This is a significant difference in the security model.</p>
+  </div>
+
+  <p>Mitigations to apply in order of effectiveness:</p>
+
+  <pre><code><span class="cm"># 1. Restrict file permissions — only the postgres OS user can read it</span>
+chmod <span class="nm">600</span> /etc/postgresql/<span class="nm">16</span>/main/pg_hba.conf
+chown postgres:postgres /etc/postgresql/<span class="nm">16</span>/main/pg_hba.conf
+
+<span class="cm"># 2. Verify the permissions are correct</span>
+ls -la /etc/postgresql/<span class="nm">16</span>/main/pg_hba.conf
+<span class="cm"># Expected: -rw------- 1 postgres postgres ... pg_hba.conf</span>
+
+<span class="cm"># 3. Use a dedicated service account with minimal AD permissions:
+#    - Read: allowed on the search base OU
+#    - List Contents: allowed on the search base OU
+#    - All other permissions: denied
+#    This limits the blast radius if the password is ever exposed.
+
+# 4. Rotate the service account password on a scheduled basis.
+#    After rotation: update ldapbindpasswd, reload pg_hba.conf.
+#    SELECT pg_reload_conf();
+
+# 5. Consider using GSSAPI/Kerberos instead of LDAP if you need
+#    to eliminate the stored credential entirely.</span></code></pre>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>Restrict access to the pg_hba.conf file at the OS level so that only the <code>postgres</code> OS account can read it. Any OS user who can read the file can extract the LDAP service account password. In containerised environments, ensure the file is not baked into a public image layer and is mounted via a secrets volume instead.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>7. Gotcha 2 — Never Use Plain ldap:// in Production</h2>
+
+  <p>When you use plain <code>ldap://</code> (port 389, no TLS), the entire LDAP bind — including the user's Active Directory password — is transmitted in cleartext over the network. Any device on the path between the PostgreSQL server and the domain controller can capture this traffic.</p>
+
+  <pre><code><span class="cm"># WRONG — credentials travel in cleartext</span>
+<span class="nm">host</span>  appdb  <span class="kw">all</span>  <span class="st">10.0.0.0/8</span>  <span class="fn">ldap</span>
+  ldapserver=<span class="st">ad.example.com</span>
+  ldapport=<span class="nm">389</span>           <span class="cm">&lt;-- unencrypted LDAP</span>
+  ldapbasedn=<span class="st">"DC=example,DC=com"</span>
+
+<span class="cm"># CORRECT — always use ldaps:// (port 636) with a valid certificate</span>
+<span class="nm">hostssl</span>  appdb  <span class="kw">all</span>  <span class="st">10.0.0.0/8</span>  <span class="fn">ldap</span>
+  ldapurl=<span class="st">"ldaps://ad.example.com/DC=example,DC=com?sAMAccountName?sub"</span>
+  ldapbinddn=<span class="st">"CN=pg-svc,OU=ServiceAccounts,DC=example,DC=com"</span>
+  ldapbindpasswd=<span class="st">"Passw0rd!"</span></code></pre>
+
+  <p>Note also that using <code>hostssl</code> in the TYPE field (instead of plain <code>host</code>) encrypts the connection between the PostgreSQL client and the PostgreSQL server — but it says nothing about the PostgreSQL-to-LDAP segment. You need <strong>both</strong>: <code>hostssl</code> for the client-to-server leg, and <code>ldaps://</code> for the server-to-AD leg.</p>
+
+  <div class="callout warning">
+    <div class="label">Warning</div>
+    <p>Many internal networks lack TLS on LDAP traffic because "it's all on the same VLAN." An attacker who achieves any foothold on that VLAN — a compromised workstation, a misconfigured switch port — can capture every AD password that PostgreSQL forwards for authentication. LDAP over TLS is not optional for a production deployment.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>8. Complete Active Directory Integration Example</h2>
+
+  <p>The following is a production-ready pg_hba.conf snippet for a search+bind AD integration. It assumes:</p>
+  <ul>
+    <li>AD domain: <code>example.com</code> — DC pair at <code>ad1.example.com</code> and <code>ad2.example.com</code></li>
+    <li>Users are in <code>OU=Staff,DC=example,DC=com</code></li>
+    <li>Service account: <code>CN=pg-ldap-svc,OU=ServiceAccounts,DC=example,DC=com</code></li>
+    <li>Only members of <code>CN=DB-Users,OU=Groups,DC=example,DC=com</code> may connect</li>
+    <li>PostgreSQL client connections use TLS (<code>hostssl</code>)</li>
+  </ul>
+
+  <pre><code><span class="cm"># ─────────────────────────────────────────────────────────────────────────────
+# pg_hba.conf — Active Directory LDAP integration (search+bind)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Local postgres superuser via peer (no AD involvement)
+</span><span class="nm">local</span>    <span class="kw">all</span>  postgres                           <span class="fn">peer</span>
+
+<span class="cm"># 2. Application user from app server — local pg password (not AD)
+#    Service accounts should not be AD accounts; use scram-sha-256 instead.</span>
+<span class="nm">hostssl</span>  <span class="fn">appdb</span>  <span class="fn">app_user</span>  <span class="st">10.0.1.50/32</span>         <span class="fn">scram-sha-256</span>
+
+<span class="cm"># 3. All other users from the office network — authenticate via AD
+#    hostssl : client-to-PG connection must be TLS
+#    ldapurl : ldaps:// ensures PG-to-AD traffic is also TLS
+#    basedn  : search only within Staff OU (faster, narrower scope)
+#    ?sAMAccountName?sub : find users by Windows short logon name
+#    memberOf filter : only AD group members may authenticate</span>
+<span class="nm">hostssl</span>  <span class="kw">all</span>  <span class="kw">all</span>  <span class="st">10.0.0.0/8</span>  <span class="fn">ldap</span>
+  ldapurl=<span class="st">"ldaps://ad1.example.com/OU=Staff,DC=example,DC=com?sAMAccountName?sub?(memberOf=CN=DB-Users,OU=Groups,DC=example,DC=com)"</span>
+  ldapbinddn=<span class="st">"CN=pg-ldap-svc,OU=ServiceAccounts,DC=example,DC=com"</span>
+  ldapbindpasswd=<span class="st">"$tr0ngSvcP@ss!"</span>
+
+<span class="cm"># 4. Backstop — reject everything else</span>
+<span class="nm">host</span>     <span class="kw">all</span>  <span class="kw">all</span>  <span class="st">0.0.0.0/0</span>                    <span class="fn">reject</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">High Availability Tip</div>
+    <p>As of PostgreSQL 14, you can specify multiple LDAP servers for failover using the <code>ldapserver</code> keyword parameter (space-separated list). With <code>ldapurl</code>, specify only one URL per rule — for multi-server failover, list them with the keyword form: <code>ldapserver="ad1.example.com ad2.example.com"</code>. PostgreSQL will try each server in order until one responds.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>9. Testing LDAP Connectivity Before Deploying</h2>
+
+  <p>Never deploy a new pg_hba.conf LDAP configuration cold. Verify each component independently first. The <code>ldapsearch</code> command-line tool lets you simulate exactly what PostgreSQL will do during authentication.</p>
+
+  <pre><code><span class="cm"># Step 1: Verify the AD server is reachable and TLS works
+# -H : the LDAP URI (tests TLS handshake with ldaps://)
+# -x : simple bind (not GSSAPI)
+# -D : the bind DN (service account)
+# -W : prompt for the bind password (do not put in shell history)</span>
+ldapsearch \
+  -H ldaps://ad1.example.com \
+  -x \
+  -D <span class="st">"CN=pg-ldap-svc,OU=ServiceAccounts,DC=example,DC=com"</span> \
+  -W \
+  -b <span class="st">"OU=Staff,DC=example,DC=com"</span> \
+  <span class="st">"(sAMAccountName=alice)"</span> \
+  dn sAMAccountName memberOf
+
+<span class="cm"># Expected output: alice's DN, sAMAccountName, and group memberships
+# If you see "Can't contact LDAP server" — check firewall, port 636, certificate trust
+# If you see "Invalid credentials" — the service account password is wrong
+# If you see 0 results — check the basedn and the search filter
+
+# Step 2: Test the user bind directly (simulates the final auth step)
+ldapsearch \
+  -H ldaps://ad1.example.com \
+  -x \
+  -D <span class="st">"CN=Alice Smith,OU=Staff,DC=example,DC=com"</span> \
+  -W \
+  -b <span class="st">"OU=Staff,DC=example,DC=com"</span> \
+  <span class="st">"(sAMAccountName=alice)"</span> \
+  dn
+
+<span class="cm"># If this succeeds, alice's password is correct and the DN is valid.
+# If PostgreSQL still refuses the connection after this, the issue
+# is most likely a missing PostgreSQL role (CREATE ROLE alice WITH LOGIN).</span></code></pre>
+
+  <div class="callout key">
+    <div class="label">Diagnostic Sequence</div>
+    <p>When LDAP auth fails, work through this sequence: (1) confirm the AD server is reachable from the PostgreSQL host on port 636; (2) confirm the TLS certificate is trusted; (3) confirm the service account can search and find the user's DN; (4) confirm the user's own bind works; (5) confirm a PostgreSQL role exists with the same name as the sAMAccountName; (6) confirm the pg_hba.conf rule matches the connection's type, database, user, and address fields.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Source</div>
+    <strong>PostgreSQL Documentation — LDAP Authentication</strong><br>
+    <a href="https://www.postgresql.org/docs/current/auth-ldap.html">postgresql.org/docs/current/auth-ldap.html</a><br><br>
+    <strong>Username Maps (pg_ident.conf) — mapping AD usernames to PostgreSQL roles:</strong><br>
+    <a href="https://www.postgresql.org/docs/current/auth-username-maps.html">postgresql.org/docs/current/auth-username-maps.html</a><br><br>
+    <strong>RFC 4516 — LDAP Uniform Resource Locator (ldapurl format):</strong><br>
+    <a href="https://www.rfc-editor.org/rfc/rfc4516">rfc-editor.org/rfc/rfc4516</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="When should you use search+bind (ldapbinddn + ldapbindpasswd) instead of simple bind (ldapprefix + ldapsuffix) for Active Directory integration?"
+         data-correct="C"
+         data-feedback-correct="Correct. Search+bind is required when users are spread across multiple OUs, because simple bind assembles a DN using a fixed formula that cannot handle varied locations. Search+bind locates the actual DN dynamically."
+         data-feedback-wrong="Not quite. The correct answer is C. Search+bind is needed when user DNs cannot be predicted by a simple formula — for example when users are distributed across multiple OUs or when you need group membership filtering.">
+      <div class="quiz-option" data-key="A">When the AD domain uses a single flat OU and all accounts follow one naming pattern</div>
+      <div class="quiz-option" data-key="B">When the PostgreSQL server cannot reach the domain controller over port 636 for any LDAP lookup</div>
+      <div class="quiz-option" data-key="C">When users are in multiple OUs or the DN cannot be assembled from a fixed prefix</div>
+      <div class="quiz-option" data-key="D">When the LDAP server requires TLS and a valid client certificate must be presented for binding</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the security consequence of using ldap:// (port 389) instead of ldaps:// (port 636) for Active Directory authentication?"
+         data-correct="B"
+         data-feedback-correct="Correct. Plain LDAP transmits the entire bind operation — including the user's AD password and the service account password — in cleartext. Any network observer on the path between PostgreSQL and AD can capture these credentials."
+         data-feedback-wrong="Not quite. The correct answer is B. Plain ldap:// sends credentials in cleartext. Even if the PostgreSQL client connection uses hostssl (TLS), the separate PostgreSQL-to-AD segment is unencrypted on port 389.">
+      <div class="quiz-option" data-key="A">The LDAP bind becomes slower because the TLS handshake overhead is completely eliminated</div>
+      <div class="quiz-option" data-key="B">AD passwords and the service account credential travel across the network completely unencrypted</div>
+      <div class="quiz-option" data-key="C">The PostgreSQL role must match the full distinguished name instead of just sAMAccountName</div>
+      <div class="quiz-option" data-key="D">Active Directory rejects the bind because AD requires StartTLS on port 389 always</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Where is the ldapbindpasswd (service account password) stored when configured in pg_hba.conf, and what is the primary mitigation?"
+         data-correct="A"
+         data-feedback-correct="Correct. ldapbindpasswd is stored as plaintext in pg_hba.conf. The primary mitigation is restricting file permissions to 600 with postgres:postgres ownership so only the PostgreSQL process can read it."
+         data-feedback-wrong="Not quite. The correct answer is A. PostgreSQL does not encrypt or hash ldapbindpasswd — it is stored as a plaintext string. chmod 600 and postgres:postgres ownership are the minimum required mitigations.">
+      <div class="quiz-option" data-key="A">Stored as plaintext in pg_hba.conf — always mitigate with chmod 600 and postgres ownership</div>
+      <div class="quiz-option" data-key="B">Stored as SHA-256 hash in pg_authid — mitigate by rotating it every 90 days</div>
+      <div class="quiz-option" data-key="C">Stored in the OS keychain — mitigate by restricting DBA group keychain access explicitly</div>
+      <div class="quiz-option" data-key="D">Stored encrypted in postgresql.conf — mitigate with ALTER SYSTEM SET to re-encrypt it regularly</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Type a question to your agent — for example: "How do I configure pg_ident.conf to map an AD username like DOMAIN\alice to a shorter PostgreSQL role name?", "What is the difference between LDAP authentication and GSSAPI/Kerberos in PostgreSQL, and when should I use each?", or "How do I troubleshoot an LDAP authentication failure that only happens for some users but not others?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0001-pg-hba-conf.html">&#8592; Lesson 1: pg_hba.conf</a>
+    <a href="0003-postgresql-conf-security.html">Lesson 3: postgresql.conf Security Parameters &#8594;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

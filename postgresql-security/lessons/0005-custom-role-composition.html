@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 5: Custom Roles and Role Composition — PostgreSQL Security</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 5</span>
+    <span>PostgreSQL Security</span>
+    <span>~25 min</span>
+    <span><a href="../reference/glossary.html">Glossary</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Custom Roles and Role Composition</h1>
+  <p style="color: var(--muted); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.95rem; margin-top: -0.2em; margin-bottom: 2rem;">Building a Role Hierarchy from Scratch</p>
+
+  <!-- ── 1. The key difference ── -->
+  <h2>1. No Fixed Application Roles — You Build Them</h2>
+
+  <p>In SQL Server, the server ships with fixed database roles (<code>db_datareader</code>, <code>db_datawriter</code>, <code>db_owner</code>, etc.) that you add users to. You can also create custom application roles using <code>CREATE APPLICATION ROLE</code> with a password, activated via <code>sp_setapprole</code>. The scaffolding is partly pre-built.</p>
+
+  <p>PostgreSQL ships with almost no fixed application roles. You build everything yourself from a single primitive: the <strong>role</strong>. A role is simultaneously the concept of a user, a group, and an application role. The login attribute determines whether it can authenticate; everything else is about what it can do.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mapping</div>
+    <p><strong>SQL Server fixed roles</strong> (<code>db_datareader</code>, <code>db_datawriter</code>) have no PostgreSQL equivalents — you recreate their semantics yourself. <strong><code>CREATE APPLICATION ROLE</code></strong> maps loosely to a <code>NOLOGIN</code> role used as a permission group, but PostgreSQL roles are simpler: no activation password, no <code>sp_setapprole</code> ceremony. <strong><code>sp_addrolemember</code></strong> maps to <code>GRANT role_name TO user_name</code>.</p>
+  </div>
+
+  <p>The central pattern: create <code>NOLOGIN</code> roles as permission groups, then grant those groups to <code>LOGIN</code> roles (the actual users). The <code>NOLOGIN</code> role can never connect to a database directly — it exists only as a bundle of privileges.</p>
+
+  <!-- ── 2. Role as group pattern ── -->
+  <h2>2. The "Role as Group" Pattern</h2>
+
+  <p>Here is the full lifecycle of the pattern, step by step:</p>
+
+  <pre><code><span class="cm">-- Step 1: Create the permission group (cannot log in)</span>
+<span class="kw">CREATE ROLE</span> readonly_role <span class="nm">NOLOGIN</span>;
+
+<span class="cm">-- Step 2: Grant privileges to the group role</span>
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> readonly_role;
+<span class="kw">GRANT USAGE ON SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+<span class="kw">GRANT SELECT ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Step 3: Create a real user (can log in)</span>
+<span class="kw">CREATE ROLE</span> alice <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'change-me-in-vault'</span>;
+
+<span class="cm">-- Step 4: Add user to the group — alice inherits all SELECT on app</span>
+<span class="kw">GRANT</span> readonly_role <span class="kw">TO</span> alice;</code></pre>
+
+  <p>After step 4, <code>alice</code> can connect and run <code>SELECT</code> on every table in the <code>app</code> schema. When you add a new table and re-run the <code>GRANT SELECT ON ALL TABLES</code> statement (or use <code>ALTER DEFAULT PRIVILEGES</code> — covered in Lesson 6), alice automatically gains access without any per-user grant.</p>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p><code>GRANT SELECT ON ALL TABLES IN SCHEMA app TO readonly_role</code> grants on all <em>currently existing</em> tables. New tables added later do <strong>not</strong> automatically inherit this grant. Use <code>ALTER DEFAULT PRIVILEGES</code> to cover future tables — this is one of the most-missed PostgreSQL behaviors for SQL Server DBAs.</p>
+  </div>
+
+  <!-- ── 3. Three-tier hierarchy ── -->
+  <h2>3. Building a Reusable 3-Tier Hierarchy</h2>
+
+  <p>Production schemas almost always need three permission tiers. The diagram shows how they stack:</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+graph BT
+  admin_role["admin_role\n(DDL: CREATE TABLE, ALTER, DROP)"]
+  readwrite_role["readwrite_role\n(SELECT + INSERT + UPDATE + DELETE)"]
+  readonly_role["readonly_role\n(SELECT only)"]
+  readwrite_role --> admin_role
+  readonly_role --> readwrite_role
+    </div>
+    <p class="diagram-caption">Arrows show role membership direction. <code>admin_role</code> inherits all privileges from <code>readwrite_role</code>, which inherits from <code>readonly_role</code>.</p>
+  </div>
+
+  <p>Here are the exact statements to build this hierarchy:</p>
+
+  <pre><code><span class="cm">-- Tier 1: Read-only</span>
+<span class="kw">CREATE ROLE</span> readonly_role <span class="nm">NOLOGIN</span>;
+<span class="kw">GRANT CONNECT ON DATABASE</span> mydb <span class="kw">TO</span> readonly_role;
+<span class="kw">GRANT USAGE ON SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+<span class="kw">GRANT SELECT ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readonly_role;
+
+<span class="cm">-- Tier 2: Read-write (inherits Tier 1 via role membership)</span>
+<span class="kw">CREATE ROLE</span> readwrite_role <span class="nm">NOLOGIN</span>;
+<span class="kw">GRANT</span> readonly_role <span class="kw">TO</span> readwrite_role;
+<span class="kw">GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA</span> app <span class="kw">TO</span> readwrite_role;
+<span class="kw">GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA</span> app <span class="kw">TO</span> readwrite_role;
+
+<span class="cm">-- Tier 3: Admin (inherits Tier 2; adds DDL)</span>
+<span class="kw">CREATE ROLE</span> admin_role <span class="nm">NOLOGIN</span>;
+<span class="kw">GRANT</span> readwrite_role <span class="kw">TO</span> admin_role;
+<span class="cm">-- DDL is governed by schema ownership or explicit CREATE privilege</span>
+<span class="kw">GRANT CREATE ON SCHEMA</span> app <span class="kw">TO</span> admin_role;
+
+<span class="cm">-- Assign real users to appropriate tiers</span>
+<span class="kw">CREATE ROLE</span> alice <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span>;
+<span class="kw">CREATE ROLE</span> bob   <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span>;
+<span class="kw">CREATE ROLE</span> carol <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span>;
+
+<span class="kw">GRANT</span> readonly_role  <span class="kw">TO</span> alice;  <span class="cm">-- alice: SELECT only</span>
+<span class="kw">GRANT</span> readwrite_role <span class="kw">TO</span> bob;    <span class="cm">-- bob: SELECT + DML</span>
+<span class="kw">GRANT</span> admin_role     <span class="kw">TO</span> carol;  <span class="cm">-- carol: SELECT + DML + DDL</span></code></pre>
+
+  <div class="callout info">
+    <div class="label">Note on DDL in PostgreSQL</div>
+    <p>In SQL Server, <code>db_ddladmin</code> is a fixed role. In PostgreSQL, DDL access is controlled by schema ownership and the <code>CREATE</code> privilege on a schema. If a role <em>owns</em> a schema, it has full DDL on objects it creates within it. For objects it does not own, explicit <code>GRANT ... ON TABLE ... TO role</code> is required. <code>admin_role</code> receiving <code>GRANT CREATE ON SCHEMA</code> allows it to create new objects; altering or dropping objects it does not own still requires ownership transfer or superuser.</p>
+  </div>
+
+  <!-- ── 4. INHERIT vs NOINHERIT ── -->
+  <h2>4. INHERIT vs NOINHERIT — Automatic vs Explicit Privilege Activation</h2>
+
+  <p><code>INHERIT</code> (the default) means that when a role is a member of another role, its privileges flow automatically. No action required — the user just connects and the permissions are active.</p>
+
+  <p><code>NOINHERIT</code> breaks that automatic flow. The user still has the role membership, but the privileges do not activate until they explicitly run <code>SET ROLE</code>. This is analogous to <code>sudo</code> in Unix: you have the capability, but you must consciously invoke it.</p>
+
+  <pre><code><span class="cm">-- Create a DBA login that does NOT automatically inherit admin_role privileges</span>
+<span class="kw">CREATE ROLE</span> dba_carol <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span> <span class="nm">NOINHERIT</span>;
+<span class="kw">GRANT</span> admin_role <span class="kw">TO</span> dba_carol;
+
+<span class="cm">-- dba_carol connects: she has NO DDL or DML privileges yet</span>
+<span class="cm">-- She must explicitly activate the role before DDL:</span>
+<span class="kw">SET ROLE</span> admin_role;
+<span class="kw">CREATE TABLE</span> app.new_table (id <span class="nm">serial</span> <span class="nm">PRIMARY KEY</span>);
+
+<span class="cm">-- When done with privileged work, drop back to base identity:</span>
+<span class="kw">RESET ROLE</span>;
+<span class="cm">-- or equivalently: SET ROLE dba_carol;</span></code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Attribute</th>
+        <th>Behavior</th>
+        <th>When to use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>INHERIT</code> (default)</td>
+        <td>Privileges from all granted roles are active immediately on connect</td>
+        <td>Application service accounts, read-only users, standard developers</td>
+      </tr>
+      <tr>
+        <td><code>NOINHERIT</code></td>
+        <td>Granted roles are dormant until <code>SET ROLE role_name</code></td>
+        <td>DBA logins, admin accounts, any role with DDL or superuser-equivalent grants</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout security">
+    <div class="label">Security Note</div>
+    <p>Use <code>NOINHERIT</code> for any login role that has membership in a high-privilege group role. Without it, a compromised DBA session has full admin powers the moment it connects — no escalation step required for an attacker. With <code>NOINHERIT</code>, the attacker must also know to run <code>SET ROLE</code>, and that step is auditable.</p>
+  </div>
+
+  <!-- ── 5. Role-to-role vs direct grants ── -->
+  <h2>5. Role-to-Role Grants vs Direct User Grants</h2>
+
+  <p>There are two ways to give a user a privilege:</p>
+
+  <pre><code><span class="cm">-- Option A: via role hierarchy (preferred)</span>
+<span class="kw">GRANT</span> readwrite_role <span class="kw">TO</span> alice;
+<span class="cm">-- alice inherits all current and future privileges of readwrite_role</span>
+
+<span class="cm">-- Option B: direct grant (avoid in production)</span>
+<span class="kw">GRANT SELECT ON</span> app.orders <span class="kw">TO</span> alice;
+<span class="cm">-- alice has SELECT on orders only — one table, one user, one grant</span></code></pre>
+
+  <p>Direct grants accumulate silently. After six months, you cannot answer "why does alice have SELECT on that table?" without <code>pg_class</code> archaeology. Role-based grants make the answer obvious: alice has <code>readwrite_role</code>, which grants everything in the <code>app</code> schema. Revoke the role, access is gone — no residual grants to hunt down.</p>
+
+  <div class="callout warning">
+    <div class="label">Audit Implication</div>
+    <p>When you grant a role to a role (<code>GRANT readwrite_role TO alice</code>), the grant is visible in <code>pg_auth_members</code>. When you grant a privilege directly to a user (<code>GRANT SELECT ON ... TO alice</code>), it is recorded in <code>pg_class.relacl</code> and <code>information_schema.role_table_grants</code> separately for each object. Direct grants create a sprawling audit surface that is painful to clean up.</p>
+  </div>
+
+  <!-- ── 6. Auditing role membership ── -->
+  <h2>6. Auditing Role Membership</h2>
+
+  <p>Three tools to inspect what roles exist and who has what:</p>
+
+  <pre><code><span class="cm">-- All roles and their attributes (rolcanlogin, rolsuper, rolinherit, etc.)</span>
+<span class="kw">SELECT</span> rolname, rolcanlogin, rolsuper, rolinherit, rolcreatedb, rolcreaterole
+<span class="kw">FROM</span> pg_roles
+<span class="kw">ORDER BY</span> rolcanlogin <span class="kw">DESC</span>, rolname;
+
+<span class="cm">-- Direct role memberships (one level only)</span>
+<span class="kw">SELECT</span>
+  r.rolname  <span class="kw">AS</span> member,
+  g.rolname  <span class="kw">AS</span> granted_role,
+  m.admin_option
+<span class="kw">FROM</span>   pg_auth_members m
+<span class="kw">JOIN</span>   pg_roles r <span class="kw">ON</span> r.oid = m.member
+<span class="kw">JOIN</span>   pg_roles g <span class="kw">ON</span> g.oid = m.roleid
+<span class="kw">ORDER BY</span> member, granted_role;
+
+<span class="cm">-- psql shortcut: compact view of users and their group memberships</span>
+<span class="cm">-- \du</span></code></pre>
+
+  <p>The two queries above show only direct memberships. For a deep hierarchy, you need a recursive query. The following resolves all transitive roles for a given user:</p>
+
+  <pre><code><span class="cm">-- All roles alice has, including transitive grants through role chains</span>
+<span class="kw">WITH RECURSIVE</span> role_tree <span class="kw">AS</span> (
+  <span class="cm">-- Anchor: direct roles granted to alice</span>
+  <span class="kw">SELECT</span> m.member, m.roleid
+  <span class="kw">FROM</span>   pg_auth_members m
+  <span class="kw">WHERE</span>  m.member = (<span class="kw">SELECT</span> oid <span class="kw">FROM</span> pg_roles <span class="kw">WHERE</span> rolname = <span class="st">'alice'</span>)
+
+  <span class="kw">UNION ALL</span>
+
+  <span class="cm">-- Recursive step: roles granted to those roles</span>
+  <span class="kw">SELECT</span> rt.member, am.roleid
+  <span class="kw">FROM</span>   pg_auth_members am
+  <span class="kw">JOIN</span>   role_tree rt <span class="kw">ON</span> am.member = rt.roleid
+)
+<span class="kw">SELECT DISTINCT</span> r.rolname <span class="kw">AS</span> effective_role
+<span class="kw">FROM</span>   role_tree rt
+<span class="kw">JOIN</span>   pg_roles  r  <span class="kw">ON</span> r.oid = rt.roleid
+<span class="kw">ORDER BY</span> effective_role;</code></pre>
+
+  <p>Run this query when onboarding or auditing a user. It exposes every privilege bundle they carry, including grants two or three levels deep.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Mapping</div>
+    <p>The equivalent in SQL Server is <code>sys.database_role_members</code> joined to <code>sys.database_principals</code>. SQL Server's <code>IS_MEMBER()</code> function checks a single role. For transitive membership, you also need a recursive CTE against <code>sys.database_role_members</code>. The structure is similar; the catalog names differ. SQL Server also has <code>sys.fn_my_permissions()</code> to enumerate effective permissions on a specific object — PostgreSQL has no single equivalent function, but <code>\z tablename</code> in psql and the <code>has_table_privilege()</code> function cover most needs.</p>
+  </div>
+
+  <!-- ── 7. Mistake 1 ── -->
+  <h2>7. Common Mistake 1 — The Mega-Role Anti-Pattern</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Creating one powerful role and granting it to everyone.</strong> The temptation: define a single <code>app_full_access</code> role with <code>SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER</code> on all tables, then grant it to every developer, every service account, and every reporting tool. It works — but you lose:</p>
+    <ul>
+      <li><strong>Least privilege:</strong> your read-only reporting dashboard can now truncate production tables.</li>
+      <li><strong>Auditability:</strong> when a row is deleted, you cannot tell if it was the app, a developer, or a report query.</li>
+      <li><strong>Blast radius:</strong> a compromised reporting credential has full write access to all application data.</li>
+    </ul>
+    <p>The fix is enforced at design time: draw the 3-tier hierarchy first, assign users to tiers, and never grant a higher tier to a service that only needs a lower one.</p>
+  </div>
+
+  <!-- ── 8. Mistake 2 ── -->
+  <h2>8. Common Mistake 2 — Forgetting NOINHERIT for Privileged Roles</h2>
+
+  <div class="callout danger">
+    <div class="label">Top Mistake — Coming from SQL Server</div>
+    <p><strong>Leaving privileged DBA logins as <code>INHERIT</code> (the default).</strong> In SQL Server, granting a user membership in <code>db_owner</code> is an explicit, intentional escalation — most DBAs do not do it casually. In PostgreSQL, a DBA login that is a member of <code>admin_role</code> with the default <code>INHERIT</code> attribute has full DDL access the moment they connect. No <code>SET ROLE</code> required. A mistyped <code>DROP TABLE</code> runs without friction.</p>
+    <p>Always create DBA logins with <code>NOINHERIT</code>:</p>
+    <pre style="margin-top:0.6em;"><code><span class="kw">CREATE ROLE</span> dba_alice <span class="kw">WITH LOGIN PASSWORD</span> <span class="st">'...'</span> <span class="nm">NOINHERIT</span>;
+<span class="kw">GRANT</span> admin_role <span class="kw">TO</span> dba_alice;</code></pre>
+    <p>Now <code>dba_alice</code> logs in with minimal privileges and must consciously <code>SET ROLE admin_role</code> before performing any DDL. This is the PostgreSQL equivalent of running <code>runas /user:Administrator</code> only when needed.</p>
+  </div>
+
+  <!-- ── Primary source ── -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources — PostgreSQL Official Documentation</div>
+    <ul>
+      <li><a href="https://www.postgresql.org/docs/current/user-manag.html" target="_blank">PostgreSQL Docs: Database Roles</a> — <code>CREATE ROLE</code>, <code>GRANT</code>, <code>NOLOGIN</code>, <code>INHERIT</code></li>
+      <li><a href="https://www.postgresql.org/docs/current/role-membership.html" target="_blank">PostgreSQL Docs: Role Membership</a> — <code>GRANT role TO role</code>, <code>SET ROLE</code>, <code>RESET ROLE</code></li>
+      <li><a href="https://www.postgresql.org/docs/current/catalog-pg-auth-members.html" target="_blank">PostgreSQL Docs: pg_auth_members</a> — system catalog for role membership</li>
+      <li><a href="https://www.postgresql.org/docs/current/sql-grant.html" target="_blank">PostgreSQL Docs: GRANT</a> — full syntax reference</li>
+    </ul>
+  </div>
+
+  <!-- ── Quiz ── -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="A role created with NOLOGIN in PostgreSQL is best described as:"
+         data-correct="B"
+         data-feedback-correct="Correct. A NOLOGIN role cannot authenticate to the database. It acts as a named bundle of privileges — a permission group — that is granted to LOGIN roles to transfer those privileges."
+         data-feedback-wrong="Not quite. NOLOGIN roles cannot authenticate directly. They serve as permission groups that LOGIN roles inherit from. They are the PostgreSQL equivalent of a group role or database role in SQL Server.">
+      <div class="quiz-option" data-key="A">A disabled account that stores credentials for periodic rotation</div>
+      <div class="quiz-option" data-key="B">A named permission group role that cannot authenticate directly</div>
+      <div class="quiz-option" data-key="C">A system-reserved role used only by the postgres superuser</div>
+      <div class="quiz-option" data-key="D">A temporary role that expires after the session closes</div>
+    </div>
+
+    <div class="quiz"
+         data-question="When a LOGIN role is created without specifying INHERIT or NOINHERIT, what is the default behavior?"
+         data-correct="A"
+         data-feedback-correct="Correct. INHERIT is the default. Privileges from all granted roles are active immediately upon connection — no SET ROLE required. This is why DBAs should explicitly create privileged logins with NOINHERIT."
+         data-feedback-wrong="Not quite. The default is INHERIT, meaning privileges from all granted roles are automatically active after connecting. You must explicitly specify NOINHERIT if you want the SET ROLE gating behavior.">
+      <div class="quiz-option" data-key="A">Privileges from all granted roles are active automatically on connect</div>
+      <div class="quiz-option" data-key="B">Privileges require an explicit SET ROLE before they become active</div>
+      <div class="quiz-option" data-key="C">Privileges are active only during the first session after grant</div>
+      <div class="quiz-option" data-key="D">Privileges are inherited only from direct role grants, not transitive</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which system catalog shows direct role memberships in PostgreSQL (who has been granted which role)?"
+         data-correct="C"
+         data-feedback-correct="Correct. pg_auth_members stores the (roleid, member) pairs representing direct role grants. For transitive membership across a chain, you need a recursive CTE over this catalog."
+         data-feedback-wrong="Not quite. pg_auth_members is the catalog for direct role memberships. pg_roles shows role attributes (NOLOGIN, INHERIT, etc.) but not who is a member of what. information_schema.applicable_roles also exists but pg_auth_members is the primary source.">
+      <div class="quiz-option" data-key="A">pg_roles joined to pg_class on role name column</div>
+      <div class="quiz-option" data-key="B">information_schema.role_usage_grants view filtered by grantee role name column</div>
+      <div class="quiz-option" data-key="C">pg_auth_members with member and roleid columns directly stored</div>
+      <div class="quiz-option" data-key="D">pg_namespace joined to pg_depend on owner object id</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In a production database, a developer needs SELECT and INSERT on application tables. What is the preferred approach?"
+         data-correct="B"
+         data-feedback-correct="Correct. Grant a role that has the appropriate privileges, not individual object privileges directly to the user. This keeps grants composable, auditable, and easy to revoke by removing a single role membership."
+         data-feedback-wrong="Not quite. Granting privileges directly to individual users creates sprawl across pg_class.relacl that is hard to audit and revoke completely. The preferred pattern is to grant the user a role that carries the appropriate privilege set.">
+      <div class="quiz-option" data-key="A">Grant SELECT and INSERT on each table directly to the developer</div>
+      <div class="quiz-option" data-key="B">Grant the developer login membership in a readwrite_role group role directly</div>
+      <div class="quiz-option" data-key="C">Grant the developer login the CREATEROLE attribute to self-manage their access</div>
+      <div class="quiz-option" data-key="D">Grant the developer login superuser privileges temporarily then revoke after work</div>
+    </div>
+  </div>
+
+  <!-- ── Teacher note ── -->
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> Good questions for this lesson:
+    <ul style="margin-top:0.6em;">
+      <li>If I have 20 schemas, do I create three roles per schema or one set of roles that spans all schemas?</li>
+      <li>What happens to existing role-to-role grants if I drop an intermediate role in the hierarchy?</li>
+      <li>Can I have NOINHERIT on the group role itself rather than on the login role, and does that change anything?</li>
+    </ul>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0004-roles-and-privileges.html">← Lesson 4: Roles and Privileges</a>
+    <a href="0006-cicd-service-accounts.html">Lesson 6: CI/CD Service Accounts →</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>
