@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: The Agent Loop in Go — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0001-agent-loop.mp3">
+    <span class="tag">Lesson 1</span>
+    <span>Go Agents: Concurrency, Webhooks, and Architecture</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0002-webhooks.html">Lesson 2: Receiving Webhooks →</a></span>
+  </div>
+
+  <h1>The Agent Loop in Go</h1>
+
+  <p>
+    Your blog post argues that coding agents teach us something important about concurrency and webhooks.
+    Before we can talk about webhooks or worker pools, we need the simplest piece: the <strong>agent loop</strong>.
+    In this lesson you will build a tiny but real loop in Go — <code>sense → decide → act</code> — and learn the
+    three Go tools that make it work: <code>goroutines</code>, <code>channels</code>, and <code>context.Context</code>.
+  </p>
+
+  <p>
+    The post calls this the <em>nervous system</em>: the code that wraps the model so a 30-second thought
+    process does not freeze the whole environment. The loop is the first cell of that nervous system.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    S[Sense] --> D[Decide]
+    D --> A[Act]
+    A --> S
+    style S fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style D fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style A fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    </div>
+    <div class="diagram-caption">
+      Figure 1.1 — The agent loop. Each iteration reads the world, chooses an action, and executes it.
+    </div>
+  </div>
+
+  <h2>The Three Jobs of an Agent Loop</h2>
+
+  <p>
+    An agent is just a program that keeps acting on the world until it is done. The loop has three responsibilities:
+  </p>
+
+  <ul>
+    <li><strong>Sense.</strong> Gather input. For a coding agent this might be a prompt, a file change, or a webhook payload.</li>
+    <li><strong>Decide.</strong> Pick the next action. This can be a hard-coded rule, a state machine, or an LLM call.</li>
+    <li><strong>Act.</strong> Execute the action and observe the result.</li>
+  </ul>
+
+  <p>
+    The loop repeats until a terminal condition is met: the task is complete, an error is unrecoverable, or the operator
+    tells it to stop. This is the same shape whether the agent is a cron job, a GitHub bot, or a coding assistant.
+  </p>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      The agent loop is <strong>control flow</strong>, not artificial intelligence. The "decide" step can be a simple
+      <code>if</code> statement today and an LLM tomorrow. The loop shape stays the same.
+    </p>
+  </div>
+
+  <h2>A Minimal Loop in Go</h2>
+
+  <p>
+    Here is the smallest idiomatic version. It does not use an LLM; it just watches a mock "inbox" and prints actions.
+    Notice the four Go habits that appear in almost every production loop:
+  </p>
+
+  <ul>
+    <li><code>ctx context.Context</code> is the first parameter of every function that does I/O.</li>
+    <li><code>ctx.Err()</code> is checked before doing work so cancellation is respected.</li>
+    <li>A <code>for</code> loop with a clear terminal condition.</li>
+    <li>Errors are returned, not swallowed.</li>
+  </ul>
+
+  <pre><code>package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+// Sense returns the next event, or an error if something goes wrong.
+func Sense(ctx context.Context) (string, error) {
+    if err := ctx.Err(); err != nil {
+        return "", err
+    }
+    time.Sleep(100 * time.Millisecond)
+    return "build", nil
+}
+
+// Decide maps a sensed event into a concrete action.
+func Decide(event string) string {
+    switch event {
+    case "build":
+        return "run go build ./..."
+    case "test":
+        return "run go test ./..."
+    default:
+        return "noop"
+    }
+}
+
+// Act performs the action. In a real agent this would call a tool or API.
+func Act(ctx context.Context, action string) error {
+    if err := ctx.Err(); err != nil {
+        return err
+    }
+    fmt.Printf("executing: %s\n", action)
+    time.Sleep(50 * time.Millisecond)
+    return nil
+}
+
+func RunAgent(ctx context.Context, maxIterations int) error {
+    for i := 0; i < maxIterations; i++ {
+        event, err := Sense(ctx)
+        if err != nil {
+            return fmt.Errorf("sense: %w", err)
+        }
+
+        action := Decide(event)
+        if action == "noop" {
+            fmt.Println("nothing to do")
+            continue
+        }
+
+        if err := Act(ctx, action); err != nil {
+            return fmt.Errorf("act: %w", err)
+        }
+
+        if action == "run go build ./..." {
+            fmt.Println("build succeeded; stopping")
+            return nil
+        }
+    }
+    return fmt.Errorf("reached max iterations (%d)", maxIterations)
+}
+
+func main() {
+    ctx := context.Background()
+    if err := RunAgent(ctx, 10); err != nil {
+        fmt.Println("agent error:", err)
+    }
+}
+</code></pre>
+
+  <p>
+    This program is not concurrent yet, but it is already <strong>cancelable</strong>. If we replace
+    <code>context.Background()</code> with a context that has a deadline, every call to <code>ctx.Err()</code>
+    will return the cancellation reason and the loop stops cleanly.
+  </p>
+
+  <h2>Why Go: Goroutines</h2>
+
+  <p>
+    A Go <code>goroutine</code> is an independently scheduled function. You start one by writing <code>go f()</code>.
+    It is cheaper than an OS thread, so it is normal to have thousands of them. The scheduler multiplexes them onto
+    a small number of OS threads.
+  </p>
+
+  <p>
+    For an agent, goroutines are the building block of parallel work: a webhook handler can start a goroutine to
+    process the event while returning HTTP 200 immediately. A worker pool can run many agents at once. A background
+    poller can sense events concurrently with the main loop.
+  </p>
+
+  <pre><code>func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // Start a background sensor that writes events into a channel.
+    events := make(chan string)
+    go Sensor(ctx, events)
+
+    // The main loop reads from the channel.
+    for event := range events {
+        action := Decide(event)
+        if err := Act(ctx, action); err != nil {
+            fmt.Println("act failed:", err)
+            break
+        }
+    }
+}
+
+func Sensor(ctx context.Context, out chan<- string) {
+    defer close(out)
+    for {
+        if err := ctx.Err(); err != nil {
+            return
+        }
+        time.Sleep(100 * time.Millisecond)
+        out <- "build"
+    }
+}
+</code></pre>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      A goroutine that is never told to stop leaks. Always pair a goroutine with a cancellation mechanism:
+      a <code>context.Context</code>, a <code>done</code> channel, or a closed job channel.
+    </p>
+  </div>
+
+  <h2>Channels Are the Glue</h2>
+
+  <p>
+    A <code>channel</code> is a typed conduit for values between goroutines. The arrow operator <code>&lt;-</code>
+    sends or receives, and <code>close(ch)</code> signals that no more values will come. Channels are how goroutines
+    coordinate without sharing memory.
+  </p>
+
+  <p>
+    Two channel patterns show up constantly in agent code:
+  </p>
+
+  <ul>
+    <li><strong>Buffered channel.</strong> <code>make(chan string, 10)</code> holds up to 10 values before send blocks.
+    Use it as a queue or a semaphore.</li>
+    <li><strong>Directional channel.</strong> <code>chan<- string</code> can only send; <code>&lt;-chan string</code>
+    can only receive. Use them in function signatures to make intent explicit.</li>
+  </ul>
+
+  <pre><code>// Generator pattern: a goroutine produces values, the main goroutine consumes them.
+func Counter(ctx context.Context, out chan<- int) {
+    defer close(out)
+    for i := 1; ; i++ {
+        select {
+        case <-ctx.Done():
+            return
+        case out <- i:
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
+}
+
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+    defer cancel()
+
+    nums := make(chan int)
+    go Counter(ctx, nums)
+
+    for n := range nums {
+        fmt.Println(n)
+    }
+}
+</code></pre>
+
+  <p>
+    The <code>select</code> block above is the idiomatic way to combine work with cancellation. It either sends the
+    next value or exits when the context is cancelled.
+  </p>
+
+  <h2>Stopping the Loop with Context</h2>
+
+  <p>
+    <code>context.Context</code> is the standard way to carry deadlines, cancellation signals, and request-scoped
+    values across API boundaries in Go. Every function that does I/O should accept a context as its first argument.
+  </p>
+
+  <p>
+    The pattern is always the same:
+  </p>
+
+  <ol>
+    <li>Create a derived context: <code>ctx, cancel := context.WithCancel(parent)</code> or <code>WithTimeout</code>.</li>
+    <li>Defer <code>cancel()</code> to avoid leaking resources.</li>
+    <li>Pass <code>ctx</code> to every function that does work.</li>
+    <li>Check <code>ctx.Err()</code> or <code>&lt;-ctx.Done()</code> inside long-running work.</li>
+  </ol>
+
+  <pre><code>func main() {
+    // The agent must stop after 500 ms, or when Ctrl+C is pressed.
+    ctx, stop := signal.NotifyContext(
+        context.Background(),
+        os.Interrupt,
+    )
+    defer stop()
+
+    ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+    defer cancel()
+
+    if err := RunAgent(ctx, 100); err != nil {
+        fmt.Println("stopped:", err)
+    }
+}
+</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY THIS MATTERS</div>
+    <p>
+      In production, your agent will receive a <code>SIGTERM</code> when the container shuts down. Without context
+      cancellation, the loop keeps running until the orchestrator kills it. With context, the loop stops cleanly,
+      finishes the current action, and returns.
+    </p>
+  </div>
+
+  <h2>Watch First</h2>
+
+  <div class="callout info video-embed">
+    <div class="video-meta">
+      <div class="label">Best video on this topic</div>
+      <strong>Jake Wright — Concurrency in Go</strong><br>
+      <span style="font-size:0.82rem; color: var(--muted);">Under 20 min · covers goroutines, channels, and select</span>
+    </div>
+    <div class="video-iframe">
+      <iframe
+        src="https://www.youtube.com/embed/LvgVSSpwND8"
+        title="Jake Wright — Concurrency in Go"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="What is the primary purpose of context.Context in an agent loop?"
+         data-correct="B"
+         data-feedback-correct="Correct. context.Context carries cancellation signals and deadlines so the loop stops cleanly when the user or orchestrator asks."
+         data-feedback-wrong="Think about what happens when a container receives SIGTERM or a request times out.">
+      <div class="quiz-option" data-key="A">Store configuration values across function calls</div>
+      <div class="quiz-option" data-key="B">Propagate cancellation and deadlines through the call graph</div>
+      <div class="quiz-option" data-key="C">Replace error handling in long-running loops</div>
+      <div class="quiz-option" data-key="D">Cache results from expensive I/O operations</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A goroutine that is never told to stop will do what?"
+         data-correct="C"
+         data-feedback-correct="Correct. A goroutine without a cancellation path leaks memory and scheduler resources."
+         data-feedback-wrong="Goroutines are not garbage-collected while they are still executing. What tells them to exit?">
+      <div class="quiz-option" data-key="A">Stop when the main function returns</div>
+      <div class="quiz-option" data-key="B">Panic after the parent function ends</div>
+      <div class="quiz-option" data-key="C">Leak until the program exits</div>
+      <div class="quiz-option" data-key="D">Return an error automatically</div>
+    </div>
+
+    <div class="quiz"
+         data-question="In the loop, the Decide step is responsible for what?"
+         data-correct="A"
+         data-feedback-correct="Correct. Decide maps sensed input to a concrete action. It can be a rule, a state machine, or an LLM."
+         data-feedback-wrong="Decide is not where the action runs. It is the planning step between sensing and acting.">
+      <div class="quiz-option" data-key="A">Map sensed input to the next action</div>
+      <div class="quiz-option" data-key="B">Execute the chosen action</div>
+      <div class="quiz-option" data-key="C">Collect input from the environment</div>
+      <div class="quiz-option" data-key="D">Handle the final shutdown signal</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which operator starts a new goroutine in Go?"
+         data-correct="D"
+         data-feedback-correct="Correct. The go keyword starts a goroutine: go f()."
+         data-feedback-wrong="Look for the keyword that Go uses to launch concurrent execution.">
+      <div class="quiz-option" data-key="A">async</div>
+      <div class="quiz-option" data-key="B">spawn</div>
+      <div class="quiz-option" data-key="C">thread</div>
+      <div class="quiz-option" data-key="D">go</div>
+    </div>
+  </div>
+
+  <div class="lesson-nav">
+    <span></span>
+    <a href="0002-webhooks.html">Lesson 2: Receiving Webhooks in Go →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="http://localhost:3000/what-coding-agents-teach-us-about-concurrency-webhooks-architecture" target="_blank">What Coding Agents Teach Us About AI Agent Concurrency, Webhooks, and Design Architecture</a> — your blog post; the anchor for this course</li>
+      <li><a href="https://gobyexample.com/goroutines" target="_blank">Go by Example — Goroutines</a></li>
+      <li><a href="https://gobyexample.com/channels" target="_blank">Go by Example — Channels</a></li>
+      <li><a href="https://go.dev/blog/context" target="_blank">The Go Blog — Go Concurrency Patterns: Context</a></li>
+      <li><a href="https://pkg.go.dev/context" target="_blank">Go standard library: context</a></li>
+      <li><a href="https://pkg.go.dev/os/signal" target="_blank">Go standard library: os/signal</a></li>
+      <li><a href="https://www.youtube.com/watch?v=LvgVSSpwND8" target="_blank">Jake Wright — Concurrency in Go (YouTube)</a></li>
+    </ul>
+  </div>
+
+  <h2>Go Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Two exercises, each with a broken <code>problem.go</code> and a working <code>solution.go</code>.
+    Pick an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>go version</code> &nbsp;·&nbsp;
+    <code>cd exercises/lesson-01-agent-loop/01-...</code>
+  </div>
+
+  <div class="exercise-viewer"
+       data-base="../exercises/lesson-01-agent-loop/"
+       data-exercises='[
+         {"id":"01-cancelable-agent","label":"01 — Cancelable Agent","description":"BUG: RunAgent ignores context cancellation and runs to completion. FIX: check ctx.Err() at the top of the loop."},
+         {"id":"02-done-channel","label":"02 — Stop with a Done Channel","description":"BUG: the printer goroutine has no cancellation path and leaks. FIX: select on a done channel so it exits cleanly."}
+       ]'>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/exercise-viewer.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

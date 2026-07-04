@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Glossary — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>Glossary</h1>
+
+  <p>
+    Ubiquitous language for the course. All lessons, exercises, and quizzes use these terms consistently.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Term</th>
+        <th>Definition</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Agent loop</strong></td>
+        <td>The repeated <code>sense → decide → act</code> cycle that drives an agent until it reaches a terminal condition.</td>
+      </tr>
+      <tr>
+        <td><strong>Goroutine</strong></td>
+        <td>An independently scheduled function in Go, started with the <code>go</code> keyword. Cheaper than an OS thread.</td>
+      </tr>
+      <tr>
+        <td><strong>Channel</strong></td>
+        <td>A typed conduit for values between goroutines. Sends and receives use the <code>&lt;-</code> operator.</td>
+      </tr>
+      <tr>
+        <td><strong>Buffered channel</strong></td>
+        <td>A channel with capacity <code>make(chan T, n)</code>. Sends block only when the buffer is full.</td>
+      </tr>
+      <tr>
+        <td><strong>Worker pool</strong></td>
+        <td>A fixed set of long-lived goroutines that read jobs from a channel and process them concurrently.</td>
+      </tr>
+      <tr>
+        <td><strong>Semaphore</strong></td>
+        <td>A concurrency limiter implemented as a buffered channel of empty structs: <code>make(chan struct{}, n)</code>.</td>
+      </tr>
+      <tr>
+        <td><strong>context.Context</strong></td>
+        <td>A request-scoped object that carries deadlines, cancellation signals, and values across API boundaries.</td>
+      </tr>
+      <tr>
+        <td><strong>Webhook</strong></td>
+        <td>An HTTP callback pushed by a provider when an event occurs, rather than the consumer polling for it.</td>
+      </tr>
+      <tr>
+        <td><strong>HMAC signature</strong></td>
+        <td>A hash-based message authentication code used to prove that a webhook payload came from the provider.</td>
+      </tr>
+      <tr>
+        <td><strong>Idempotency key</strong></td>
+        <td>A unique identifier for a webhook event that lets the receiver process retries as no-ops.</td>
+      </tr>
+      <tr>
+        <td><strong>Async acknowledgement</strong></td>
+        <td>Responding HTTP 200 immediately while processing the event in a background goroutine or queue.</td>
+      </tr>
+      <tr>
+        <td><strong>Backpressure</strong></td>
+        <td>A mechanism that slows the sender when the receiver is overloaded, preventing unbounded memory growth.</td>
+      </tr>
+      <tr>
+        <td><strong>Graceful shutdown</strong></td>
+        <td>Stopping new work, draining in-flight work, and then exiting cleanly on SIGTERM.</td>
+      </tr>
+      <tr>
+        <td><strong>Thundering herd</strong></td>
+        <td>A sudden burst of concurrent work that saturates downstream resources.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="primary-source">
+    <div class="ps-label">Related Reference</div>
+    <ul>
+      <li><a href="go-concurrency-patterns.html">Go Concurrency Patterns</a></li>
+      <li><a href="webhook-patterns.html">Webhook Patterns</a></li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>

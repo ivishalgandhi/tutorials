@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2: Receiving Webhooks in Go — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0002-webhooks.mp3">
+    <span class="tag">Lesson 2</span>
+    <span>Go Agents: Concurrency, Webhooks, and Architecture</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0001-agent-loop.html">← Lesson 1</a></span>
+    <span><a href="0003-concurrency.html">Lesson 3 →</a></span>
+  </div>
+
+  <h1>Receiving Webhooks in Go</h1>
+
+  <p>
+    In the agent loop, the <strong>sense</strong> step is how the agent learns that the world changed.
+    For a coding agent, that signal is usually a <strong>webhook</strong> from GitHub, a CI system, or a
+    task dispatcher. In this lesson you will build a production-style webhook receiver in Go using only
+    the standard library: <code>net/http</code>, <code>crypto/hmac</code>, <code>sync</code>, and
+    <code>io.LimitReader</code>.
+  </p>
+
+  <p>
+    The goal is to receive a payload, prove it came from the right sender, acknowledge it quickly, and
+    process it safely without blocking the HTTP response. The five patterns we need are: a
+    <code>net/http</code> handler, HMAC-SHA256 signature verification, body size limits, an asynchronous
+    acknowledgement, and idempotency with replay protection.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    P["GitHub / Provider"] -->|POST| H["Go http.Handler"]
+    H --> V["Verify HMAC signature"]
+    V --> A["Return 200 OK"]
+    A --> Q["Queue / channel"]
+    Q --> W["Worker goroutine"]
+    style P fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style H fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style V fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style A fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style Q fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style W fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    </div>
+    <div class="diagram-caption">
+      Figure 2.1 — Webhook flow: receive, verify, acknowledge, then process asynchronously.
+    </div>
+  </div>
+
+  <h2>Webhooks Are the Agent's Inbox</h2>
+
+  <p>
+    A webhook is just an HTTP POST sent by a provider when something happens. The receiver's job is to
+    accept the request, trust it only if it can be verified, and hand the event off to the agent loop.
+    Because the provider is watching the response, the receiver must answer quickly. A slow handler causes
+    retries, duplicates, and alert noise.
+  </p>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      The HTTP handler should only do three fast things: read the body, verify the signature, and return
+      HTTP 200. Expensive work belongs in a goroutine or a worker queue so the connection is released.
+    </p>
+  </div>
+
+  <h2>A Minimal net/http Handler</h2>
+
+  <p>
+    Go's <code>net/http</code> package gives us an HTTP server without any external framework. You register
+    a function with <code>http.HandleFunc</code> and start listening with <code>http.ListenAndServe</code>.
+    Here is the smallest possible receiver.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprint(w, "ok")
+    })
+    http.ListenAndServe(":8080", nil)
+}
+</code></pre>
+
+  <p>
+    This is not a REST framework, a router, or a middleware chain. It is just a function that receives
+    an <code>http.ResponseWriter</code> and an <code>*http.Request</code>. That is the right place to start
+    because every production feature we add will live inside this function.
+  </p>
+
+  <h2>Limit the Body Size with io.LimitReader</h2>
+
+  <p>
+    Webhook payloads should be small, but attackers may send enormous bodies. Reading an unbounded body
+    into memory can crash the process. The standard-library pattern is to wrap the request body with
+    <code>io.LimitReader</code>. The reader returns <code>io.EOF</code> once the cap is reached, so we also
+    check the final size.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+)
+
+const maxBodyBytes = 1 &lt;&lt; 20
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+    if err != nil {
+        http.Error(w, "failed to read body", http.StatusBadRequest)
+        return
+    }
+    if len(body) > maxBodyBytes {
+        http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+        return
+    }
+    fmt.Fprintf(w, "received %d bytes", len(body))
+}
+</code></pre>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      Using <code>io.ReadAll(r.Body)</code> without a limit lets a single request consume unlimited memory.
+      Always cap the body before reading it, even when you trust the provider.
+    </p>
+  </div>
+
+  <h2>Verify HMAC-SHA256 with Constant-Time Comparison</h2>
+
+  <p>
+    HMAC is a shared-secret signature. The provider and the receiver both know a secret. The provider sends
+    the body plus a header with the signature; the receiver recomputes the signature and checks that the
+    values match. Because the signature is a secret, the comparison must be <strong>constant-time</strong>:
+    it must take the same amount of time regardless of how many bytes match. Otherwise an attacker can
+    measure response times to guess the signature one byte at a time.
+  </p>
+
+  <p>
+    Go provides this in <code>crypto/hmac</code> and <code>crypto/subtle</code> through
+    <code>hmac.Equal</code>. Never compare signatures with <code>==</code>.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "io"
+    "net/http"
+    "strings"
+)
+
+const secret = "your-webhook-secret"
+
+func verify(body []byte, signature string) bool {
+    sig := strings.TrimPrefix(signature, "sha256=")
+    got, err := hex.DecodeString(sig)
+    if err != nil {
+        return false
+    }
+    want := hmac.New(sha256.New, []byte(secret))
+    want.Write(body)
+    return hmac.Equal(got, want.Sum(nil))
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    body, _ := io.ReadAll(r.Body)
+    if !verify(body, r.Header.Get("X-Signature")) {
+        http.Error(w, "invalid signature", http.StatusUnauthorized)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+}
+</code></pre>
+
+  <p>
+    The signature is computed over the raw bytes of the body. That is why we read the body once and store it
+    in a slice. If you parse JSON first, you must still keep the original bytes for the HMAC check.
+  </p>
+
+  <div class="callout danger">
+    <div class="label">SECURITY NOTE</div>
+    <p>
+      A comparison using <code>==</code> stops at the first different byte. That timing difference leaks
+      information. <code>hmac.Equal</code> compares every byte in constant time, so an attacker learns nothing.
+    </p>
+  </div>
+
+  <h2>Acknowledge Asynchronously</h2>
+
+  <p>
+    A provider expects a quick HTTP 200. If the receiver does expensive work before responding, the provider
+    may time out and retry, creating duplicate events. The fix is to accept the event into a queue, return 200,
+    and process the event in a background goroutine.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+    "time"
+)
+
+type event struct {
+    id      string
+    payload []byte
+}
+
+func main() {
+    events := make(chan event, 100)
+
+    go worker(events)
+
+    http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+        payload, _ := io.ReadAll(r.Body)
+        events &lt;- event{id: "evt-123", payload: payload}
+        w.WriteHeader(http.StatusOK)
+    })
+
+    http.ListenAndServe(":8080", nil)
+}
+
+func worker(events &lt;-chan event) {
+    for e := range events {
+        time.Sleep(100 * time.Millisecond)
+        fmt.Printf("processed %s\n", e.id)
+    }
+}
+</code></pre>
+
+  <p>
+    The buffered channel acts as a small queue. The goroutine drains the channel and does the work. If the
+    worker is slow, the buffer fills up and the handler blocks until there is room. That is a simple form of
+    backpressure, which we will expand in the next lesson.
+  </p>
+
+  <h2>Idempotency and Replay Protection</h2>
+
+  <p>
+    Even with async acknowledgement, providers may retry. The same event may arrive twice. The receiver must
+    remember which event IDs it has already processed and skip duplicates. An in-memory map protected by a
+    <code>sync.Mutex</code> is the simplest standard-library solution.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "net/http"
+    "strconv"
+    "sync"
+    "time"
+)
+
+const replayWindow = 5 * time.Minute
+
+type seenIDs struct {
+    mu  sync.Mutex
+    ids map[string]struct{}
+}
+
+func newSeen() *seenIDs {
+    return &seenIDs{ids: make(map[string]struct{})}
+}
+
+func (s *seenIDs) add(id string) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if _, ok := s.ids[id]; ok {
+        return false
+    }
+    s.ids[id] = struct{}{}
+    return true
+}
+
+func validTimestamp(ts string) bool {
+    if ts == "" {
+        return true
+    }
+    t, err := strconv.ParseInt(ts, 10, 64)
+    if err != nil {
+        return false
+    }
+    return time.Since(time.Unix(t, 0)).Abs() &lt;= replayWindow
+}
+</code></pre>
+
+  <p>
+    <code>Replay protection</code> adds a time window. The provider sends a timestamp header; the receiver
+    rejects events that are too old or too far in the future. This limits how long a captured request can
+    be replayed by an attacker. The example above accepts a five-minute window.
+  </p>
+
+  <div class="callout info">
+    <div class="label">WHY THIS MATTERS</div>
+    <p>
+      In production, idempotency is usually stored in a database. The same map-and-mutex pattern scales to
+      that: check the database before processing, and commit the ID in the same transaction as the work.
+    </p>
+  </div>
+
+  <h2>Production Webhook Design for Agent Runtimes</h2>
+
+  <p>
+    Your blog post calls webhooks the <em>lingua franca</em> of the event-driven backbone. The inbound webhook
+    is how the agent learns that the world changed, so the receiver has to be reliable before it is clever.
+    The table below maps the five design decisions from the post to the Go code you have already seen.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>Why it matters</th>
+        <th>Go primitive used</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Authentication</td>
+        <td>A public endpoint that triggers agent work is a tempting target.</td>
+        <td><code>crypto/hmac</code> + <code>hmac.Equal</code></td>
+      </tr>
+      <tr>
+        <td>Idempotency</td>
+        <td>GitHub, PagerDuty, and others retry; duplicate events must be no-ops.</td>
+        <td><code>map</code> + <code>sync.Mutex</code></td>
+      </tr>
+      <tr>
+        <td>Retries and backpressure</td>
+        <td>Blindly accepting more work when overloaded crashes the runtime.</td>
+        <td><code>select</code> with <code>default</code> returning 503</td>
+      </tr>
+      <tr>
+        <td>Bounded payload</td>
+        <td>Attackers can exhaust memory with huge POST bodies.</td>
+        <td><code>io.LimitReader</code></td>
+      </tr>
+      <tr>
+        <td>Async acknowledgement</td>
+        <td>Providers time out and retry if the handler keeps the connection open.</td>
+        <td>Buffered channel + background goroutine</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>A Complete Webhook Receiver</h2>
+
+  <p>
+    Here is a single, runnable program that combines all the pieces. It reads a limited body, checks the
+    timestamp and HMAC signature, acknowledges the request, and hands the event to a worker that deduplicates
+    by event ID.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+)
+
+const maxBodyBytes = 1 &lt;&lt; 20
+const replayWindow = 5 * time.Minute
+
+type event struct {
+    id      string
+    payload []byte
+}
+
+func main() {
+    secret := os.Getenv("WEBHOOK_SECRET")
+    if secret == "" {
+        secret = "dev-secret"
+    }
+
+    seen := newSeen()
+    events := make(chan event, 100)
+
+    go worker(events, seen)
+
+    http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+        webhookHandler(w, r, secret, events)
+    })
+
+    fmt.Println("listening on :8080")
+    http.ListenAndServe(":8080", nil)
+}
+
+func webhookHandler(w http.ResponseWriter, r *http.Request, secret string, events chan&lt;- event) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    ts := r.Header.Get("X-Event-Timestamp")
+    if !validTimestamp(ts) {
+        http.Error(w, "timestamp outside allowed window", http.StatusBadRequest)
+        return
+    }
+
+    sig := r.Header.Get("X-Signature")
+    if sig == "" {
+        http.Error(w, "missing signature", http.StatusBadRequest)
+        return
+    }
+
+    body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+    if err != nil {
+        http.Error(w, "failed to read body", http.StatusInternalServerError)
+        return
+    }
+    r.Body.Close()
+
+    if len(body) > maxBodyBytes {
+        http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+        return
+    }
+
+    if !verifySignature(body, secret, sig) {
+        http.Error(w, "invalid signature", http.StatusUnauthorized)
+        return
+    }
+
+    eventID := r.Header.Get("X-Event-ID")
+    if eventID == "" {
+        eventID = hex.EncodeToString(hmacHash(append([]byte(ts), body...), secret))[:16]
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("ok"))
+
+    events &lt;- event{id: eventID, payload: body}
+}
+
+func validTimestamp(ts string) bool {
+    if ts == "" {
+        return true
+    }
+    t, err := strconv.ParseInt(ts, 10, 64)
+    if err != nil {
+        return false
+    }
+    return time.Since(time.Unix(t, 0)).Abs() &lt;= replayWindow
+}
+
+func verifySignature(body []byte, secret, sig string) bool {
+    sig = strings.TrimPrefix(sig, "sha256=")
+    got, err := hex.DecodeString(sig)
+    if err != nil {
+        return false
+    }
+    return hmac.Equal(got, hmacHash(body, secret))
+}
+
+func hmacHash(data []byte, secret string) []byte {
+    h := hmac.New(sha256.New, []byte(secret))
+    h.Write(data)
+    return h.Sum(nil)
+}
+
+func worker(events &lt;-chan event, seen *seenIDs) {
+    for e := range events {
+        if seen.add(e.id) {
+            fmt.Printf("processed event %s: %d bytes\n", e.id, len(e.payload))
+        } else {
+            fmt.Printf("skipped duplicate event %s\n", e.id)
+        }
+    }
+}
+
+type seenIDs struct {
+    mu  sync.Mutex
+    ids map[string]struct{}
+}
+
+func newSeen() *seenIDs {
+    return &seenIDs{ids: make(map[string]struct{})}
+}
+
+func (s *seenIDs) add(id string) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if _, ok := s.ids[id]; ok {
+        return false
+    }
+    s.ids[id] = struct{}{}
+    return true
+}
+</code></pre>
+
+  <p>
+    You can run this with <code>WEBHOOK_SECRET=test-secret go run main.go</code>. Send it a request with
+    <code>X-Signature</code>, <code>X-Event-ID</code>, and <code>X-Event-Timestamp</code> headers, and the
+    handler will verify, deduplicate, and log the event.
+  </p>
+
+  <h2>Watch First</h2>
+
+  <div class="callout info video-embed">
+    <div class="video-meta">
+      <div class="label">Best video on this topic</div>
+      <strong>The simplest explanation of how Webhooks work</strong> — ByteByteGo<br>
+      <span style="font-size:0.82rem; color: var(--muted);">Stripe, GitHub, Slack · retries, signatures, and reverse APIs</span>
+    </div>
+    <div class="video-iframe">
+      <iframe
+        src="https://www.youtube.com/embed/mniOzs7OKBQ"
+        title="The simplest explanation of how Webhooks work (Stripe, GitHub, Slack)"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Why use hmac.Equal instead of == for signature comparison?"
+         data-correct="A"
+         data-feedback-correct="Correct. hmac.Equal compares the bytes in constant time, so an attacker cannot learn the signature byte by byte."
+         data-feedback-wrong="Think about what an attacker can learn if the comparison short-circuits on the first wrong byte.">
+      <div class="quiz-option" data-key="A">Avoid leaking signature bytes through timing differences</div>
+      <div class="quiz-option" data-key="B">Ignore whitespace differences in the signature string</div>
+      <div class="quiz-option" data-key="C">Replace the need for a constant-time comparison</div>
+      <div class="quiz-option" data-key="D">Allow the handler to accept unsigned webhook requests</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does io.LimitReader protect against in a webhook handler?"
+         data-correct="A"
+         data-feedback-correct="Correct. io.LimitReader caps how many bytes are read, preventing enormous payloads from exhausting memory."
+         data-feedback-wrong="io.LimitReader does not verify signatures or queue work. What does it control?">
+      <div class="quiz-option" data-key="A">Limit the size of the request body to prevent abuse</div>
+      <div class="quiz-option" data-key="B">Verify the HMAC signature on the incoming payload</div>
+      <div class="quiz-option" data-key="C">Store the event so it can be retried later on</div>
+      <div class="quiz-option" data-key="D">Return an immediate HTTP 200 response to the caller</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why should the handler return HTTP 200 before processing the event?"
+         data-correct="A"
+         data-feedback-correct="Correct. Webhook providers retry failed requests. Returning 200 quickly removes the request from the provider's retry queue."
+         data-feedback-wrong="If the handler keeps the connection open during slow work, the provider may time out and retry.">
+      <div class="quiz-option" data-key="A">Stop the provider from resending the same event repeatedly</div>
+      <div class="quiz-option" data-key="B">Allow the provider to retry the request many more times</div>
+      <div class="quiz-option" data-key="C">Ensure the signature is verified before the body is read</div>
+      <div class="quiz-option" data-key="D">Keep the HTTP connection open while the work runs</div>
+    </div>
+
+    <div class="quiz"
+         data-question="How can a handler remember already processed event IDs?"
+         data-correct="B"
+         data-feedback-correct="Correct. A map with a sync.Mutex (or sync.Map) lets the handler remember event IDs and skip duplicates."
+         data-feedback-wrong="Signature verification and timestamp checks solve different problems. What stores the set of IDs?">
+      <div class="quiz-option" data-key="A">Compare the signature against the provider secret</div>
+      <div class="quiz-option" data-key="B">Track seen event IDs in a map protected by a mutex</div>
+      <div class="quiz-option" data-key="C">Reject events whose timestamp is outside the window</div>
+      <div class="quiz-option" data-key="D">Read the payload with a limited body reader for safety</div>
+    </div>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0001-agent-loop.html">← Lesson 1</a>
+    <a href="0003-concurrency.html">Lesson 3 →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="http://localhost:3000/what-coding-agents-teach-us-about-concurrency-webhooks-architecture" target="_blank">What Coding Agents Teach Us About AI Agent Concurrency, Webhooks, and Design Architecture</a> — your blog post; see the "Webhook Design for Production Agent Runtimes" section</li>
+      <li><a href="https://webhookwhisper.com/blog/webhook-receiver-go" target="_blank">WebhookWhisper — Building a Webhook Receiver in Go</a></li>
+      <li><a href="https://gethook.to/blog/writing-a-webhook-consumer-in-go" target="_blank">gethook.to — Writing a Webhook Consumer in Go</a></li>
+      <li><a href="https://pkg.go.dev/net/http" target="_blank">Go standard library: net/http</a></li>
+      <li><a href="https://pkg.go.dev/crypto/hmac" target="_blank">Go standard library: crypto/hmac</a></li>
+      <li><a href="https://pkg.go.dev/crypto/sha256" target="_blank">Go standard library: crypto/sha256</a></li>
+      <li><a href="https://pkg.go.dev/crypto/subtle" target="_blank">Go standard library: crypto/subtle</a></li>
+      <li><a href="https://pkg.go.dev/encoding/hex" target="_blank">Go standard library: encoding/hex</a></li>
+      <li><a href="https://pkg.go.dev/sync" target="_blank">Go standard library: sync</a></li>
+      <li><a href="https://pkg.go.dev/io" target="_blank">Go standard library: io</a></li>
+    </ul>
+  </div>
+
+  <h2>Go Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Two exercises, each with a broken <code>problem.go</code> and a working <code>solution.go</code>.
+    Pick an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>go version</code> &nbsp;·&nbsp;
+    <code>cd exercises/lesson-02-webhooks/01-...</code>
+  </div>
+
+  <div class="exercise-viewer"
+       data-base="../exercises/lesson-02-webhooks/"
+       data-exercises='[
+         {"id":"01-verify-signature","label":"01 — Verify Signature","description":"BUG: signature is compared with ==, which is vulnerable to timing attacks. FIX: use hmac.Equal with constant-time comparison."},
+         {"id":"02-idempotent-handler","label":"02 — Idempotent Handler","description":"BUG: duplicate event IDs are processed again, causing duplicate work. FIX: track seen IDs in a map protected by sync.Mutex."}
+       ]'>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/exercise-viewer.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

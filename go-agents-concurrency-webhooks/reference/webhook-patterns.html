@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Webhook Patterns — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>Webhook Patterns</h1>
+
+  <p>
+    Production checklist for receiving webhooks in Go. Use this as a quick reference when building or reviewing a webhook receiver.
+  </p>
+
+  <h2>1. Verify the Signature First</h2>
+  <p>
+    Read the raw body, compute the HMAC, and compare with constant-time comparison. Never parse JSON before verifying.
+  </p>
+  <pre><code>func verifySignature(body []byte, secret, sig string) bool {
+    mac := hmac.New(sha256.New, []byte(secret))
+    mac.Write(body)
+    expected := hex.EncodeToString(mac.Sum(nil))
+    provided := strings.TrimPrefix(sig, "sha256=")
+    return hmac.Equal([]byte(expected), []byte(provided))
+}
+</code></pre>
+
+  <h2>2. Bound the Body</h2>
+  <p>
+    Always cap the body size to prevent memory exhaustion from a malicious sender.
+  </p>
+  <pre><code>body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MB
+if err != nil {
+    http.Error(w, "bad request", http.StatusBadRequest)
+    return
+}
+</code></pre>
+
+  <h2>3. Acknowledge Asynchronously</h2>
+  <p>
+    Return HTTP 200 quickly and do the real work in a goroutine or queue. If the queue is full, return 503 so the provider retries.
+  </p>
+  <pre><code>w.WriteHeader(http.StatusOK)
+
+select {
+case queue <- event:
+default:
+    log.Println("queue full; returning 503")
+    http.Error(w, "overload", http.StatusServiceUnavailable)
+}
+</code></pre>
+
+  <h2>4. Make It Idempotent</h2>
+  <p>
+    Store the event ID on the first delivery. Subsequent retries with the same ID are no-ops.
+  </p>
+  <pre><code>_, err := db.ExecContext(ctx,
+    `INSERT INTO events (id, payload) VALUES ($1, $2)
+     ON CONFLICT (id) DO NOTHING`,
+    eventID, payload)
+</code></pre>
+
+  <h2>5. Defend Against Replays</h2>
+  <p>
+    Reject payloads with a timestamp outside a short window (e.g., 5 minutes) unless you also store every event ID.
+  </p>
+  <pre><code>age := time.Since(time.Unix(ts, 0))
+if age < 0 || age > 5*time.Minute {
+    http.Error(w, "stale webhook", http.StatusUnauthorized)
+    return
+}
+</code></pre>
+
+  <h2>Production Checklist</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>Practice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Authentication</td>
+        <td>HMAC-SHA256 signature with a shared secret; constant-time comparison.</td>
+      </tr>
+      <tr>
+        <td>Payload safety</td>
+        <td><code>io.LimitReader</code> to cap body size; read raw bytes before JSON parsing.</td>
+      </tr>
+      <tr>
+        <td>Reliability</td>
+        <td>Return 200 quickly; process asynchronously; make handlers idempotent.</td>
+      </tr>
+      <tr>
+        <td>Retries</td>
+        <td>Expect duplicate deliveries; use event ID or idempotency key to deduplicate.</td>
+      </tr>
+      <tr>
+        <td>Observability</td>
+        <td>Log every receipt, verification failure, and processing error with structured fields.</td>
+      </tr>
+      <tr>
+        <td>Shutdown</td>
+        <td>Drain the in-flight queue on SIGTERM; do not accept new HTTP requests during shutdown.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://webhookwhisper.com/blog/webhook-receiver-go" target="_blank">WebhookWhisper — Building a Webhook Receiver in Go</a></li>
+      <li><a href="https://gethook.to/blog/writing-a-webhook-consumer-in-go" target="_blank">gethook.to — Writing a Webhook Consumer in Go</a></li>
+      <li><a href="https://pkg.go.dev/crypto/hmac" target="_blank">Go standard library: crypto/hmac</a></li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>

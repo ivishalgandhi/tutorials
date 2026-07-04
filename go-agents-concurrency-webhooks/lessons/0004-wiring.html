@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 4: Wiring Agent + Webhooks — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0004-wiring.mp3">
+    <span class="tag">Lesson 4</span>
+    <span>Go Agents: Concurrency, Webhooks, and Architecture</span>
+    <span>~50 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0003-concurrency.html">← Lesson 3: Concurrency Control</a></span>
+  </div>
+
+  <h1>Wiring Agent + Webhooks</h1>
+
+  <p>
+    In the first three lessons you built the pieces: the agent loop, the webhook receiver, and the worker pool.
+    In this lesson you wire them into one runnable program. A webhook becomes the <strong>sense</strong> step,
+    a worker pool runs the <strong>decide → act</strong> steps, and <code>context.Context</code> plus
+    <code>signal.NotifyContext</code> give you a clean shutdown path.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    P["Provider"] -->|POST| H["http.Handler"]
+    H -->|verify| H
+    H -->|enqueue| Q["events channel"]
+    Q -->|dispatch| D["Dispatcher"]
+    D -->|assign| W1["Worker 1"]
+    D -->|assign| W2["Worker 2"]
+    D -->|assign| WN["Worker N"]
+    W1 --> A["Agent loop\nsense → decide → act"]
+    W2 --> A
+    WN --> A
+    A --> L[(log / metrics)]
+
+    style P fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style H fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style Q fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style D fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style W1 fill:#ffffff,stroke:#555
+    style W2 fill:#ffffff,stroke:#555
+    style WN fill:#ffffff,stroke:#555
+    style A fill:#fff8e1,stroke:#92400e,stroke-width:2px
+    style L fill:#f3f2ee,stroke:#555
+    </div>
+    <div class="diagram-caption">
+      Figure 4.1 — End-to-end flow: a webhook is the sense step, the dispatcher feeds workers, and each worker runs the agent loop.
+    </div>
+  </div>
+
+  <h2>The Dispatcher</h2>
+
+  <p>
+    The dispatcher is the bridge between the HTTP handler and the worker pool. It reads events from a
+    channel and hands each one to a worker. The worker then runs the agent loop for that single event.
+  </p>
+
+  <p>
+    The dispatcher in this course is just a <code>for event := range events</code> loop plus a
+    <code>sync.WaitGroup</code>. It is deliberately small: the concurrency control lives in the worker pool,
+    and the cancellation control lives in the context. This separation makes the program easy to reason about.
+  </p>
+
+  <pre><code>func dispatcher(ctx context.Context, events <-chan Event, workers int) {
+    var wg sync.WaitGroup
+    for i := 0; i < workers; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            for e := range events {
+                runAgent(ctx, id, e)
+            }
+        }(i)
+    }
+    wg.Wait()
+}
+</code></pre>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      The dispatcher does not decide how to process an event; it only routes events to workers. The worker
+      does not decide how to limit concurrency; it only consumes from the shared channel. Each layer has one
+      job.
+    </p>
+  </div>
+
+  <h2>A Complete Program</h2>
+
+  <p>
+    The program below ties everything together. It starts an HTTP server on <code>:8080</code>, accepts POST
+    events at <code>/webhook</code>, enqueues them, and processes them with three workers. When you press
+    Ctrl+C it stops accepting new connections, drains the queue, and exits.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "context"
+    "fmt"
+    "log/slog"
+    "net/http"
+    "os"
+    "os/signal"
+    "sync"
+    "sync/atomic"
+    "time"
+)
+
+// Event is the payload that arrives from the webhook.
+type Event struct {
+    ID      string
+    Action  string
+    Payload []byte
+}
+
+func main() {
+    logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+    defer stop()
+
+    const (
+        queueSize   = 100
+        numWorkers  = 3
+        httpAddr    = ":8080"
+    )
+
+    events := make(chan Event, queueSize)
+    var processed atomic.Uint64
+
+    var wg sync.WaitGroup
+    for i := 0; i < numWorkers; i++ {
+        wg.Add(1)
+        go worker(ctx, i, events, &wg, logger, &processed)
+    }
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+        webhookHandler(w, r, events, logger)
+    })
+    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintln(w, "ok")
+    })
+
+    srv := &http.Server{
+        Addr:    httpAddr,
+        Handler: mux,
+    }
+
+    go func() {
+        logger.Info("server listening", "addr", httpAddr)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            logger.Error("server error", "err", err)
+        }
+    }()
+
+    <-ctx.Done()
+    logger.Info("shutdown signal received")
+
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(shutdownCtx); err != nil {
+        logger.Error("shutdown error", "err", err)
+    }
+
+    close(events)
+    wg.Wait()
+
+    logger.Info("server stopped", "processed", processed.Load())
+}
+
+func webhookHandler(w http.ResponseWriter, r *http.Request, events chan<- Event, logger *slog.Logger) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    eventID := r.Header.Get("X-Event-ID")
+    if eventID == "" {
+        eventID = fmt.Sprintf("evt-%d", time.Now().UnixNano())
+    }
+
+    select {
+    case events <- Event{ID: eventID, Action: r.URL.Query().Get("action"), Payload: []byte("{}")}:
+        logger.Info("event accepted", "id", eventID)
+        w.WriteHeader(http.StatusAccepted)
+    default:
+        logger.Warn("queue full", "id", eventID)
+        w.Header().Set("Retry-After", "5")
+        http.Error(w, "queue full", http.StatusServiceUnavailable)
+    }
+}
+
+func worker(ctx context.Context, id int, events <-chan Event, wg *sync.WaitGroup, logger *slog.Logger, processed *atomic.Uint64) {
+    defer wg.Done()
+    for e := range events {
+        logger.Info("worker started", "worker", id, "event", e.ID)
+        runAgent(ctx, e, logger)
+        processed.Add(1)
+        logger.Info("worker finished", "worker", id, "event", e.ID)
+    }
+}
+
+func runAgent(ctx context.Context, e Event, logger *slog.Logger) {
+    if err := ctx.Err(); err != nil {
+        logger.Warn("agent cancelled before start", "event", e.ID, "err", err)
+        return
+    }
+
+    action := decide(e)
+    if action == "" {
+        logger.Info("no action", "event", e.ID)
+        return
+    }
+
+    logger.Info("acting", "event", e.ID, "action", action)
+    time.Sleep(50 * time.Millisecond) // simulate work
+    logger.Info("action complete", "event", e.ID, "action", action)
+}
+
+func decide(e Event) string {
+    if e.Action == "" {
+        return "noop"
+    }
+    return e.Action
+}
+</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY THIS MATTERS</div>
+    <p>
+      This is the smallest complete agent runtime. It has no external dependencies, no framework, and no
+      distributed coordination. Yet it already demonstrates the four hard parts of production agent systems:
+      event ingestion, bounded concurrency, cancellation propagation, and graceful shutdown.
+    </p>
+  </div>
+
+  <h2>The Blog Post's Hybrid Architecture, in Miniature</h2>
+
+  <p>
+    Your blog post concludes that the winning production architecture is a combination of three layers:
+    a systems-language runtime for orchestration, durable event logs for state, and webhooks for real-world
+    integration. The program above is a miniature of that stack:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Blog-post layer</th>
+        <th>What it does</th>
+        <th>Where it lives in this code</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Systems-language runtime</td>
+        <td>Lightweight concurrency and single-binary deployment</td>
+        <td>Go, goroutines, and the worker pool</td>
+      </tr>
+      <tr>
+        <td>Durable event log</td>
+        <td>Survives restarts and enables replay</td>
+        <td>The bounded <code>events</code> channel (production would persist to a log or database)</td>
+      </tr>
+      <tr>
+        <td>Webhook integration</td>
+        <td>Tells the agent the world changed</td>
+        <td>The <code>/webhook</code> handler that enqueues events</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    A real system would replace the in-memory channel with a durable queue (Postgres, Redis, or a log) and
+    add a database-backed event log before dispatching. The Go code that wraps the queue stays the same shape.
+  </p>
+
+  <h2>Graceful Shutdown</h2>
+
+  <p>
+    Graceful shutdown has two phases. First, stop accepting new HTTP requests so the load balancer or provider
+    stops sending work. Second, close the event channel and wait for the workers to finish. The code above does
+    exactly this:
+  </p>
+
+  <ol>
+    <li><code>signal.NotifyContext</code> creates a context that is cancelled on <code>SIGINT</code> or <code>SIGTERM</code>.</li>
+    <li><code>srv.Shutdown</code> closes the listener and waits for in-flight HTTP requests to finish.</li>
+    <li><code>close(events)</code> signals that no more events will arrive.</li>
+    <li><code>wg.Wait()</code> blocks until every worker has drained its last event and returned.</li>
+  </ol>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      Calling <code>srv.Shutdown</code> only waits for HTTP requests. It does not wait for background workers.
+      Always pair it with a <code>sync.WaitGroup</code> that tracks your goroutines, or you may exit mid-task.
+    </p>
+  </div>
+
+  <h2>Observability: Logging and Metrics</h2>
+
+  <p>
+    For a learning project, structured logging is enough. The standard library <code>log/slog</code> gives you
+    key-value pairs without pulling in a third-party logger. The example uses an atomic counter to track how
+    many events were processed. In production you would export that counter to Prometheus, but the shape is the
+    same.
+  </p>
+
+  <pre><code>var processed atomic.Uint64
+
+// In the worker:
+processed.Add(1)
+
+// At shutdown:
+logger.Info("server stopped", "processed", processed.Load())
+</code></pre>
+
+  <h2>Watch First</h2>
+
+  <div class="callout info video-embed">
+    <div class="video-meta">
+      <div class="label">Best video on this topic</div>
+      <strong>How we built 1,000 AI agents that run a marathon</strong> — Hands On AI / Google Cloud<br>
+      <span style="font-size:0.82rem; color: var(--muted);">42 min · Go gateway, Redis pub/sub dispatch, and why the runtime needs explicit concurrency control</span>
+    </div>
+    <div class="video-iframe">
+      <iframe
+        src="https://www.youtube.com/embed/WSIzaih2vq4"
+        title="How we built 1,000 AI agents that run a marathon"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="What is the dispatcher's job in the end-to-end system?"
+         data-correct="B"
+         data-feedback-correct="Correct. The dispatcher routes events from the queue to workers. It does not process the events itself."
+         data-feedback-wrong="The dispatcher does not verify signatures or run the agent loop. What layer sits between the handler and the workers?">
+      <div class="quiz-option" data-key="A">Verify the HMAC signature of each webhook</div>
+      <div class="quiz-option" data-key="B">Route events from the queue to available workers</div>
+      <div class="quiz-option" data-key="C">Run the agent sense-decide-act loop</div>
+      <div class="quiz-option" data-key="D">Return HTTP 200 to the webhook provider</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why must the program call wg.Wait() after closing the event channel?"
+         data-correct="C"
+         data-feedback-correct="Correct. http.Server.Shutdown waits for HTTP requests, not background workers. The WaitGroup waits for workers to finish their last events."
+         data-feedback-wrong="Shutdown closes the listener; it does not track goroutines you started yourself. What tracks those?">
+      <div class="quiz-option" data-key="A">Because the server needs to restart automatically</div>
+      <div class="quiz-option" data-key="B">Because the event channel cannot close until HTTP stops</div>
+      <div class="quiz-option" data-key="C">Because Shutdown does not wait for background workers</div>
+      <div class="quiz-option" data-key="D">Because the atomic counter must be read before exit</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What happens when the events channel is full and a new webhook arrives?"
+         data-correct="A"
+         data-feedback-correct="Correct. The select with a default case returns 503, telling the provider to retry and protecting the queue from unbounded growth."
+         data-feedback-wrong="A blocking send would stall the HTTP handler. The non-blocking send with default is what creates backpressure.">
+      <div class="quiz-option" data-key="A">The handler returns 503 Service Unavailable</div>
+      <div class="quiz-option" data-key="B">The handler blocks until a worker is free</div>
+      <div class="quiz-option" data-key="C">The handler rejects the request with 401</div>
+      <div class="quiz-option" data-key="D">The handler drops the event silently</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which context should be passed to runAgent in the worker?"
+         data-correct="B"
+         data-feedback-correct="Correct. The signal-derived context carries cancellation. Passing it through the worker lets the agent stop when the system is shutting down."
+         data-feedback-wrong="Background would never cancel. The request context is tied to the HTTP request, which is already done when async processing starts.">
+      <div class="quiz-option" data-key="A">context.Background from the main function</div>
+      <div class="quiz-option" data-key="B">The context derived from signal.NotifyContext</div>
+      <div class="quiz-option" data-key="C">The request context from the HTTP handler</div>
+      <div class="quiz-option" data-key="D">A new context created inside the worker</div>
+    </div>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0003-concurrency.html">← Lesson 3: Concurrency Control</a>
+    <span></span>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="http://localhost:3000/what-coding-agents-teach-us-about-concurrency-webhooks-architecture" target="_blank">What Coding Agents Teach Us About AI Agent Concurrency, Webhooks, and Design Architecture</a> — your blog post; see the conclusion on systems-language runtime + durable logs + webhooks</li>
+      <li><a href="https://backendbytes.com/articles/go-graceful-shutdown-production/" target="_blank">BackendBytes — Go Graceful HTTP Shutdown: Zero-Downtime Production Patterns</a></li>
+      <li><a href="https://victoriametrics.com/blog/go-graceful-shutdown/" target="_blank">VictoriaMetrics — Graceful Shutdown in Go: Practical Patterns</a></li>
+      <li><a href="https://mohammadkhan.dev/blog/multi-agent-distributed-systems-problem" target="_blank">Mohammad Khan — Multi-Agent Development Is a Distributed Systems Problem</a></li>
+      <li><a href="https://theagentstack.substack.com/p/openclaw-architecture-part-2-concurrency" target="_blank">OpenClaw Architecture — Concurrency, Isolation, and Invariants</a></li>
+      <li><a href="https://pkg.go.dev/log/slog" target="_blank">Go standard library: log/slog</a></li>
+      <li><a href="https://pkg.go.dev/net/http" target="_blank">Go standard library: net/http</a></li>
+      <li><a href="https://pkg.go.dev/sync/atomic" target="_blank">Go standard library: sync/atomic</a></li>
+    </ul>
+  </div>
+
+  <h2>Go Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Two exercises, each with a broken <code>problem.go</code> and a working <code>solution.go</code>.
+    Pick an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>go version</code> &nbsp;·&nbsp;
+    <code>cd exercises/lesson-04-wiring/01-...</code>
+  </div>
+
+  <div class="exercise-viewer"
+       data-base="../exercises/lesson-04-wiring/"
+       data-exercises='[
+         {"id":"01-webhook-to-pool","label":"01 — Webhook to Worker Pool","description":"BUG: the handler processes the event synchronously, keeping the HTTP connection open and risking retries. FIX: enqueue to a buffered channel and let workers process asynchronously."},
+         {"id":"02-graceful-shutdown","label":"02 — Graceful Shutdown","description":"BUG: http.ListenAndServe exits immediately on SIGINT and drops in-flight work. FIX: use http.Server.Shutdown + sync.WaitGroup to drain workers."}
+       ]'>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/exercise-viewer.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

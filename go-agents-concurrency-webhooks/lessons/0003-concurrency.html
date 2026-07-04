@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: Concurrency Control — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0003-concurrency.mp3">
+    <span class="tag">Lesson 3</span>
+    <span>Go Agents: Concurrency, Webhooks, and Architecture</span>
+    <span>~45 min</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="0002-webhooks.html">← Lesson 2: Receiving Webhooks</a></span>
+    <span><a href="0004-wiring.html">Lesson 4: Wiring Agent + Webhooks →</a></span>
+  </div>
+
+  <h1>Concurrency Control</h1>
+
+  <p>
+    A webhook receiver is useless if it melts under load. A coding agent that spawns one goroutine per task
+    will eventually exhaust memory, file descriptors, or the API rate limit of the service it calls.
+    In this lesson you will learn four tools that keep concurrent Go programs predictable:
+    <strong>worker pools</strong>, <strong>semaphores</strong>, <strong>rate limiting</strong>, and
+    <strong>backpressure</strong>.
+  </p>
+
+  <h2>The Concurrency Spectrum in Real Agents</h2>
+
+  <p>
+    Your blog post places real agents on a spectrum. Pi uses child processes for strong isolation;
+    Keen Code uses goroutines and channels for lightweight throughput; OpenHands uses Python
+    <code>asyncio</code> plus a durable event log for long-running sessions. The choice depends on what
+    you are optimizing for.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Runtime</th>
+        <th>Concurrency primitive</th>
+        <th>Isolation</th>
+        <th>Overhead</th>
+        <th>Best fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Pi</td>
+        <td>Child processes + JSONL/IPC</td>
+        <td>Strong</td>
+        <td>High per agent</td>
+        <td>Security-critical, multi-tenant agents</td>
+      </tr>
+      <tr>
+        <td>Keen Code</td>
+        <td>Goroutines + streaming channels</td>
+        <td>Cooperative</td>
+        <td>Very low per agent</td>
+        <td>High-throughput, many sub-agents</td>
+      </tr>
+      <tr>
+        <td>OpenHands</td>
+        <td>Asyncio + durable event log</td>
+        <td>Same process</td>
+        <td>Low per coroutine</td>
+        <td>Long-running sessions, ML-heavy workflows</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    This lesson focuses on the Keen Code end of the spectrum: Go primitives that let you model each
+    sub-agent, tool call, or wait-state as a cheap unit of concurrency. Even if you later add durable logs
+    or process isolation, the goroutine-and-channel model is the right starting point for the runtime.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    subgraph WP["Worker Pool: fixed goroutines"]
+        J1[jobs channel]
+        W1[Worker 1]
+        W2[Worker 2]
+        WN[Worker N]
+        R1[results channel]
+        J1 --> W1
+        J1 --> W2
+        J1 --> WN
+        W1 --> R1
+        W2 --> R1
+        WN --> R1
+    end
+
+    subgraph SEM["Semaphore: bounded channel"]
+        J2[per-task goroutines]
+        TOK[chan struct{} cap N]
+        TASK[do work]
+        R2[collect results]
+        J2 -->|acquire| TOK
+        TOK --> TASK
+        TASK -->|release| TOK
+        TASK --> R2
+    end
+
+    WP -.->|long-lived workers, clean stop| DIFF1[close jobs channel]
+    SEM -.->|short-lived workers, cap at N| DIFF2[send / receive token]
+
+    style WP fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style SEM fill:#fff8e1,stroke:#92400e,stroke-width:2px
+    style J1 fill:#ffffff,stroke:#555
+    style W1 fill:#ffffff,stroke:#555
+    style W2 fill:#ffffff,stroke:#555
+    style WN fill:#ffffff,stroke:#555
+    style R1 fill:#ffffff,stroke:#555
+    style J2 fill:#ffffff,stroke:#555
+    style TOK fill:#ffffff,stroke:#555
+    style TASK fill:#ffffff,stroke:#555
+    style R2 fill:#ffffff,stroke:#555
+    </div>
+    <div class="diagram-caption">
+      Figure 3.1 — A worker pool keeps N goroutines alive and feeds them jobs. A semaphore starts a
+      goroutine per job but caps how many can run at once with a token channel.
+    </div>
+  </div>
+
+  <h2>Worker Pools: Fixed, Long-Lived Goroutines</h2>
+
+  <p>
+    A worker pool is a fixed set of goroutines that wait on a <code>jobs</code> channel. When work arrives,
+    the first idle worker picks it up. When there is no more work, the dispatcher closes the jobs channel,
+    each worker exits its <code>for job := range jobs</code> loop, and a <code>sync.WaitGroup</code> waits for
+    every worker to finish before the program moves on.
+  </p>
+
+  <p>
+    This pattern is ideal when the work is <strong>homogeneous</strong>: every job is the same shape, and the
+    cost of keeping workers alive is small compared to the cost of spawning and destroying them. It is the
+    default pattern for a webhook dispatcher that processes many events of the same type.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+// Job is the unit of work. In a real agent this might be a webhook payload.
+type Job struct {
+    ID   int
+    Name string
+}
+
+// Result reports what happened. A real agent might return an error or action output.
+type Result struct {
+    ID    int
+    Value string
+}
+
+// worker reads jobs until the channel is closed, then signals Done.
+func worker(id int, jobs <-chan Job, results chan<- Result, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for job := range jobs {
+        // Simulate work. In production this would call a tool or API.
+        time.Sleep(50 * time.Millisecond)
+        results <- Result{ID: job.ID, Value: fmt.Sprintf("worker %d processed %s", id, job.Name)}
+    }
+}
+
+func main() {
+    const numWorkers = 3
+    const numJobs = 10
+
+    jobs := make(chan Job, numJobs)
+    results := make(chan Result, numJobs)
+    var wg sync.WaitGroup
+
+    // Start a fixed pool of workers.
+    for i := 1; i <= numWorkers; i++ {
+        wg.Add(1)
+        go worker(i, jobs, results, &wg)
+    }
+
+    // Send jobs. The workers will pick them up concurrently.
+    for i := 1; i <= numJobs; i++ {
+        jobs <- Job{ID: i, Name: fmt.Sprintf("job-%d", i)}
+    }
+    close(jobs) // signal that no more work is coming
+
+    // Collect results in a separate goroutine so sending never blocks.
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    for result := range results {
+        fmt.Println(result.Value)
+    }
+}
+</code></pre>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      Closing the jobs channel is the standard way to tell workers to stop. A <code>for range</code>
+      over a channel exits automatically when the channel is closed and drained, so the worker returns
+      without extra control logic.
+    </p>
+  </div>
+
+  <h2>Semaphores: A Bounded Channel as a Token Bucket</h2>
+
+  <p>
+    A semaphore is a channel that holds <code>N</code> tokens. Before a goroutine starts work, it takes a
+    token. When the work is done, it returns the token. The buffered channel acts as a concurrency limiter:
+    if N goroutines are already running, the next one blocks until a token is released.
+  </p>
+
+  <p>
+    In Go, a semaphore is usually just <code>make(chan struct{}, N)</code>. A worker pool starts the goroutines
+    up front; a semaphore starts them on demand but keeps the number of active ones bounded.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+// processOne simulates a task. In a real agent this might call an LLM API.
+func processOne(id int, sem chan struct{}, wg *sync.WaitGroup) {
+    defer wg.Done()
+
+    sem <- struct{}{}        // acquire
+    defer func() { <-sem }() // release
+
+    fmt.Printf("task %d starting (active: %d)\n", id, len(sem))
+    time.Sleep(100 * time.Millisecond)
+    fmt.Printf("task %d done\n", id)
+}
+
+func main() {
+    const maxConcurrent = 2
+    const totalTasks = 6
+
+    sem := make(chan struct{}, maxConcurrent)
+    var wg sync.WaitGroup
+
+    for i := 1; i <= totalTasks; i++ {
+        wg.Add(1)
+        go processOne(i, sem, &wg)
+    }
+
+    wg.Wait()
+    fmt.Println("all tasks finished")
+}
+</code></pre>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      Forgetting to release the token creates a slow leak. Always pair the acquire with a
+      <code>defer</code> that releases the token, even if the function returns early because of an error.
+    </p>
+  </div>
+
+  <h2>When to Choose a Worker Pool vs a Semaphore</h2>
+
+  <p>
+    Both patterns cap concurrency, but they differ in ergonomics and lifecycle. The table below maps each
+    pattern to the agent shapes you will build in the rest of the course.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Concern</th>
+        <th>Worker Pool</th>
+        <th>Semaphore</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Goroutine lifecycle</td>
+        <td>Fixed N goroutines created once</td>
+        <td>New goroutine per task</td>
+      </tr>
+      <tr>
+        <td>Best for</td>
+        <td>Homogeneous, continuous streams</td>
+        <td>Heterogeneous, bursty tasks</td>
+      </tr>
+      <tr>
+        <td>Stop signal</td>
+        <td>Close the jobs channel</td>
+        <td>Cancel context or drain queue</td>
+      </tr>
+      <tr>
+        <td>When the agent starts</td>
+        <td>Workers already warm</td>
+        <td>Workers start on demand</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Use a worker pool for the dispatcher in Lesson 4: it owns a long-running queue and wants predictable memory.
+    Use a semaphore when a handler needs to call three different APIs concurrently but must not open more than
+    a handful of connections at once.
+  </p>
+
+  <h2>Rate Limiting: Token Bucket with time.Ticker</h2>
+
+  <p>
+    Capping the number of concurrent tasks is not enough. If each task calls an external API, you can still
+    overwhelm that API with a burst of requests. Rate limiting controls how many requests are allowed over time.
+  </p>
+
+  <p>
+    The simplest standard-library token bucket uses a <code>time.Ticker</code> that refills a channel. The
+    worker must receive from the channel before it is allowed to do work. The channel size is the bucket size;
+    the ticker interval is the refill rate.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    // Allow 2 requests per second, with a burst of 2.
+    limiter := time.NewTicker(500 * time.Millisecond)
+    defer limiter.Stop()
+
+    for i := 1; i <= 5; i++ {
+        <-limiter.C // wait for the next token
+        fmt.Printf("request %d at %s\n", i, time.Now().Format("15:04:05.000"))
+    }
+}
+</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY THIS MATTERS</div>
+    <p>
+      A rate limiter is part of being a good API citizen. If your agent calls GitHub, OpenAI, or an internal
+      service, exceeding the rate limit will get you throttled or banned. The standard library gives you the
+      primitives to build one in a few lines.
+    </p>
+  </div>
+
+  <h2>Backpressure: Say No Before You Drown</h2>
+
+  <p>
+    Backpressure is the opposite of buffering blindly. When the queue is full, the receiver refuses new work
+    instead of accepting it into an ever-growing backlog. For an HTTP webhook receiver, the right response is
+    usually <code>503 Service Unavailable</code> with a <code>Retry-After</code> header, so the provider can
+    retry later.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "net/http"
+    "time"
+)
+
+const maxQueueSize = 5
+
+var jobs = make(chan string, maxQueueSize)
+
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    // Non-blocking send: if the queue is full, reject the request.
+    select {
+    case jobs <- r.URL.Path:
+        w.WriteHeader(http.StatusAccepted)
+        fmt.Fprintln(w, "accepted")
+    default:
+        w.Header().Set("Retry-After", "5")
+        http.Error(w, "queue full", http.StatusServiceUnavailable)
+    }
+}
+
+func main() {
+    // One worker processes the queue.
+    go func() {
+        for job := range jobs {
+            fmt.Println("processing", job)
+            time.Sleep(200 * time.Millisecond)
+        }
+    }()
+
+    http.HandleFunc("/webhook", webhookHandler)
+    http.ListenAndServe(":8080", nil)
+}
+</code></pre>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      A <code>select</code> with a <code>default</code> case makes a channel send non-blocking. If the queue is
+      full, the handler immediately returns 503. This protects the worker pool from unbounded backlog.
+    </p>
+  </div>
+
+  <h2>Watch First</h2>
+
+  <div class="callout info video-embed">
+    <div class="video-meta">
+      <div class="label">Best video on this topic</div>
+      <strong>WorkerPools in Go Tutorial</strong><br>
+      <span style="font-size:0.82rem; color: var(--muted);">Fixed-size pool pattern, buffered channels, and the for-select loop</span>
+    </div>
+    <div class="video-iframe">
+      <iframe
+        src="https://www.youtube.com/embed/1iBj5qVyfQA"
+        title="WorkerPools in Go Tutorial"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <p>
+    For more depth, also watch
+    <a href="https://www.youtube.com/watch?v=qyM8Pi1KiiM" target="_blank">Master Go Concurrency Patterns</a>
+    and for the business side of agent throughput,
+    <a href="https://www.youtube.com/watch?v=ORc7-DeCp2o" target="_blank">5-Step Framework for Scaling Coding Agents</a>.
+  </p>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="In a worker pool, how do workers know when to stop?"
+         data-correct="B"
+         data-feedback-correct="Correct. Closing the jobs channel makes every for range loop exit when the channel is drained."
+         data-feedback-wrong="Look at how the workers read jobs. What signal tells them no more work is coming?">
+      <div class="quiz-option" data-key="A">Each worker receives a context cancellation message</div>
+      <div class="quiz-option" data-key="B">The dispatcher closes the jobs channel</div>
+      <div class="quiz-option" data-key="C">The workers stop after a fixed timeout</div>
+      <div class="quiz-option" data-key="D">The main goroutine calls runtime.Goexit</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does a semaphore use to limit active goroutines?"
+         data-correct="C"
+         data-feedback-correct="Correct. A buffered chan struct{} holds N tokens; a goroutine must acquire one before it runs."
+         data-feedback-wrong="A semaphore does not spawn a fixed set of workers. What channel shape acts as a token bucket?">
+      <div class="quiz-option" data-key="A">A fixed slice of goroutines created up front</div>
+      <div class="quiz-option" data-key="B">An unbuffered channel closed after all work is done</div>
+      <div class="quiz-option" data-key="C">A buffered channel of empty struct tokens</div>
+      <div class="quiz-option" data-key="D">A mutex that wraps every function call</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which HTTP status code best signals backpressure to a webhook provider?"
+         data-correct="A"
+         data-feedback-correct="Correct. 503 Service Unavailable tells the provider to retry later, often with Retry-After."
+         data-feedback-wrong="A 200 would accept work into a queue that may already be full. What status asks the sender to back off?">
+      <div class="quiz-option" data-key="A">503 Service Unavailable with a Retry-After header</div>
+      <div class="quiz-option" data-key="B">200 OK and queue the event for later processing</div>
+      <div class="quiz-option" data-key="C">404 Not Found because the endpoint is temporarily disabled</div>
+      <div class="quiz-option" data-key="D">401 Unauthorized until the client slows down</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What problem does a token-bucket rate limiter solve?"
+         data-correct="D"
+         data-feedback-correct="Correct. It smooths the rate of outbound requests so an external API does not throttle or ban the agent."
+         data-feedback-wrong="Rate limiting controls requests over time, not just concurrent requests. What does that prevent?">
+      <div class="quiz-option" data-key="A">Too many goroutines running at the same time</div>
+      <div class="quiz-option" data-key="B">A goroutine that never releases its token</div>
+      <div class="quiz-option" data-key="C">A channel that is closed too early</div>
+      <div class="quiz-option" data-key="D">A burst of requests that overwhelms an API</div>
+    </div>
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0002-webhooks.html">← Lesson 2: Receiving Webhooks</a>
+    <a href="0004-wiring.html">Lesson 4: Wiring Agent + Webhooks →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="http://localhost:3000/what-coding-agents-teach-us-about-concurrency-webhooks-architecture" target="_blank">What Coding Agents Teach Us About AI Agent Concurrency, Webhooks, and Design Architecture</a> — your blog post; see the "Comparing the Concurrency Models" table</li>
+      <li><a href="https://github.com/mochow13/keen-code" target="_blank">mochow13/keen-code</a> — goroutine-and-channel streaming in a Go coding agent</li>
+      <li><a href="https://github.com/earendil-works/pi" target="_blank">earendil-works/pi</a> — process-based agent orchestration</li>
+      <li><a href="https://github.com/OpenHands/OpenHands" target="_blank">OpenHands/OpenHands</a> — asyncio + durable event log</li>
+      <li><a href="https://arxiv.org/abs/2604.03515" target="_blank">Rombaut, “Inside the Scaffold: A Source-Code Taxonomy of Coding Agent Architectures”</a></li>
+      <li><a href="https://gobyexample.com/worker-pools" target="_blank">Go by Example — Worker Pools</a></li>
+      <li><a href="https://pkg.go.dev/sync" target="_blank">Go standard library: sync</a></li>
+      <li><a href="https://pkg.go.dev/time" target="_blank">Go standard library: time</a></li>
+      <li><a href="https://pkg.go.dev/net/http" target="_blank">Go standard library: net/http</a></li>
+      <li><a href="https://www.youtube.com/watch?v=1iBj5qVyfQA" target="_blank">WorkerPools in Go Tutorial (YouTube)</a></li>
+      <li><a href="https://www.youtube.com/watch?v=qyM8Pi1KiiM" target="_blank">Master Go Concurrency Patterns (YouTube)</a></li>
+      <li><a href="https://www.youtube.com/watch?v=ORc7-DeCp2o" target="_blank">5-Step Framework for Scaling Coding Agents (YouTube)</a></li>
+    </ul>
+  </div>
+
+  <h2>Go Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Two exercises, each with a broken <code>problem.go</code> and a working <code>solution.go</code>.
+    Pick an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>go version</code> &nbsp;·&nbsp;
+    <code>cd exercises/lesson-03-concurrency/01-...</code>
+  </div>
+
+  <div class="exercise-viewer"
+       data-base="../exercises/lesson-03-concurrency/"
+       data-exercises='[
+         {"id":"01-worker-pool","label":"01 — Worker Pool","description":"BUG: the main goroutine spawns one goroutine per job and never limits concurrency. FIX: start a fixed number of workers and feed them through a jobs channel."},
+         {"id":"02-semaphore","label":"02 — Semaphore","description":"BUG: fetching URLs concurrently has no limit, so the runtime opens too many connections. FIX: cap active goroutines with a buffered chan struct{} token bucket."}
+       ]'>
+  </div>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/exercise-viewer.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Go Concurrency Patterns — Go Agents: Concurrency, Webhooks, and Architecture</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>Go Concurrency Patterns</h1>
+
+  <p>
+    Compressed reference for the patterns used in the course. Each pattern is shown with a minimal,
+    compilable snippet and a note on when to use it.
+  </p>
+
+  <h2>1. Generator</h2>
+  <p>A goroutine produces values; a consumer reads them. Close the channel when done.</p>
+  <pre><code>func generator(ctx context.Context) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for i := 0; ; i++ {
+            select {
+            case <-ctx.Done():
+                return
+            case out <- i:
+            }
+        }
+    }()
+    return out
+}
+</code></pre>
+
+  <h2>2. Worker Pool</h2>
+  <p>A fixed set of workers drains a shared job channel. Best for sustained throughput.</p>
+  <pre><code>func worker(id int, jobs <-chan int, results chan<- int, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for j := range jobs {
+        results <- j * j
+    }
+}
+
+func runPool(work []int, workers int) []int {
+    jobs := make(chan int, len(work))
+    results := make(chan int, len(work))
+    var wg sync.WaitGroup
+
+    for w := 0; w < workers; w++ {
+        wg.Add(1)
+        go worker(w, jobs, results, &wg)
+    }
+
+    for _, j := range work {
+        jobs <- j
+    }
+    close(jobs)
+
+    go func() { wg.Wait(); close(results) }()
+
+    var out []int
+    for r := range results {
+        out = append(out, r)
+    }
+    return out
+}
+</code></pre>
+
+  <h2>3. Semaphore</h2>
+  <p>A bounded channel limits concurrent work. Best for adding a cap to existing code without rewriting it.</p>
+  <pre><code>func fetchAll(ctx context.Context, urls []string, max int) error {
+    sem := make(chan struct{}, max)
+    var wg sync.WaitGroup
+    for _, u := range urls {
+        wg.Add(1)
+        go func(url string) {
+            defer wg.Done()
+            sem <- struct{}{}
+            defer func() { <-sem }()
+            _ = fetch(ctx, url)
+        }(u)
+    }
+    wg.Wait()
+    return nil
+}
+</code></pre>
+
+  <h2>4. Done Channel</h2>
+  <p>Close a channel to signal cancellation to many goroutines at once.</p>
+  <pre><code>done := make(chan struct{})
+// ... launch goroutines that select on <-done
+close(done) // every goroutine receives the signal
+</code></pre>
+
+  <h2>5. Context Propagation</h2>
+  <p>Pass <code>ctx</code> as the first parameter. Check <code>ctx.Err()</code> before work.</p>
+  <pre><code>func doWork(ctx context.Context) error {
+    if err := ctx.Err(); err != nil {
+        return err
+    }
+    // ... do work
+    return nil
+}
+</code></pre>
+
+  <h2>When to Use Which</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Use when</th>
+        <th>Avoid when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Worker pool</td>
+        <td>You have a steady stream of similar jobs and want predictable memory use.</td>
+        <td>Jobs are bursty and have very different durations; a semaphore may be simpler.</td>
+      </tr>
+      <tr>
+        <td>Semaphore</td>
+        <td>You need to limit concurrency in one section of existing code with minimal changes.</td>
+        <td>You need to observe or manage individual workers; use a pool instead.</td>
+      </tr>
+      <tr>
+        <td>Generator</td>
+        <td>One goroutine produces a sequence that others consume.</td>
+        <td>Multiple producers need coordination; consider a job queue instead.</td>
+      </tr>
+      <tr>
+        <td>Done channel</td>
+        <td>You need a one-shot "stop everything" signal.</td>
+        <td>You need deadlines or request-scoped cancellation; use context.</td>
+      </tr>
+      <tr>
+        <td>Context propagation</td>
+        <td>Any function that does I/O or runs in a request lifecycle.</td>
+        <td>Passing optional configuration; use a struct instead.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://gobyexample.com/worker-pools" target="_blank">Go by Example — Worker Pools</a></li>
+      <li><a href="https://go.dev/blog/pipelines" target="_blank">The Go Blog — Pipelines and cancellation</a></li>
+      <li><a href="https://pkg.go.dev/sync" target="_blank">Go standard library: sync</a></li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>
