@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: When to Point, When to Copy — Go Pointers</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta" data-audio="0001-pointers-in-go.mp3">
+    <span class="tag">Lesson 1</span>
+    <span>Go Pointers: When to Point, When to Copy</span>
+    <span>~35 min</span>
+    <span><a href="../index.html">Course home</a></span>
+  </div>
+
+  <h1>When to Point, When to Copy</h1>
+
+  <p>
+    Go is <strong>pass-by-value</strong>. Every time you hand a variable to a function, Go makes a copy unless you explicitly ask it to pass the address instead.
+    In this lesson you will build the same small feature twice: once with values, once with pointers. The first version will look correct but silently fail. The second version will work, and you will know exactly why.
+  </p>
+
+  <p>
+    The real-world scenario is a <strong>task status updater</strong>. A background worker needs to mark a task as completed and record when it finished. If the update function receives a copy, the caller's task never changes. That is the bug you are here to fix.
+  </p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+flowchart LR
+    subgraph caller["main: task"]
+      T1["status: pending"]
+    end
+    subgraph byvalue["UpdateTask(task)"]
+      T2["status: completed<br/>(a copy)"]
+    end
+    subgraph byptr["UpdateTask(&task)"]
+      T3["status: completed<br/>(same memory)"]
+    end
+    T1 -->|copy| T2
+    T1 -->|address| T3
+    style T1 fill:#e6f7fb,stroke:#007d9c,stroke-width:2px
+    style T2 fill:#fff0ee,stroke:#c0392b,stroke-width:2px
+    style T3 fill:#e6f9ec,stroke:#1e7e34,stroke-width:2px
+    </div>
+    <div class="diagram-caption">
+      Figure 1.1 — By value, the function edits a copy. By pointer, it edits the original.
+    </div>
+  </div>
+
+  <h2>The Three Symbols</h2>
+
+  <p>
+    Pointers in Go use only three symbols. Learn them in this order:
+  </p>
+
+  <table>
+    <tr>
+      <th>Symbol</th>
+      <th>Where it appears</th>
+      <th>Meaning</th>
+    </tr>
+    <tr>
+      <td><code>&amp;x</code></td>
+      <td>In front of a variable</td>
+      <td>Give me the address of <code>x</code></td>
+    </tr>
+    <tr>
+      <td><code>*T</code></td>
+      <td>In a type declaration</td>
+      <td>A pointer to a value of type <code>T</code></td>
+    </tr>
+    <tr>
+      <td><code>*p</code></td>
+      <td>In front of a pointer variable</td>
+      <td>Give me the value stored at the address <code>p</code></td>
+    </tr>
+  </table>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      <code>*T</code> is a type. <code>*p</code> is a read. <code>&amp;x</code> is a write that asks "where is this stored?".
+      The same star character plays two different roles, so pay attention to whether it is on the left side (type) or the right side (dereference) of an expression.
+    </p>
+  </div>
+
+  <h2>Attempt 1: Without Pointers</h2>
+
+  <p>
+    Here is the natural first attempt. The function takes a <code>Task</code>, marks it complete, and sets a timestamp.
+    Run it in your head before you run it on your machine.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "time"
+)
+
+type Task struct {
+    ID        int
+    Title     string
+    Status    string
+    Completed time.Time
+}
+
+func UpdateTask(t Task) {
+    t.Status = "completed"
+    t.Completed = time.Now()
+    fmt.Printf("inside UpdateTask:  %s at %s\n", t.Status, t.Completed.Format("15:04:05"))
+}
+
+func main() {
+    task := Task{ID: 1, Title: "Send welcome email", Status: "pending"}
+    UpdateTask(task)
+    fmt.Printf("back in main:      %s\n", task.Status)
+}
+</code></pre>
+
+  <p>
+    The output will look like this:
+  </p>
+
+  <pre><code>inside UpdateTask:  completed at 14:32:10
+back in main:      pending
+</code></pre>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      <code>UpdateTask</code> modified a copy of the task. The original <code>task</code> in <code>main</code> is untouched.
+      This is the single most common source of confusion for new Go programmers.
+    </p>
+  </div>
+
+  <h2>Attempt 2: With Pointers</h2>
+
+  <p>
+    To make the function modify the caller's task, change the parameter type to <code>*Task</code> and pass the address of the task with <code>&amp;task</code>.
+    Inside the function, <code>t.Status</code> still works because Go automatically dereferences struct pointers for field access.
+  </p>
+
+  <pre><code>package main
+
+import (
+    "fmt"
+    "time"
+)
+
+type Task struct {
+    ID        int
+    Title     string
+    Status    string
+    Completed time.Time
+}
+
+func UpdateTask(t *Task) {
+    t.Status = "completed"
+    t.Completed = time.Now()
+    fmt.Printf("inside UpdateTask:  %s at %s\n", t.Status, t.Completed.Format("15:04:05"))
+}
+
+func main() {
+    task := Task{ID: 1, Title: "Send welcome email", Status: "pending"}
+    UpdateTask(&task)
+    fmt.Printf("back in main:      %s\n", task.Status)
+}
+</code></pre>
+
+  <p>
+    Now the output is consistent:
+  </p>
+
+  <pre><code>inside UpdateTask:  completed at 14:32:10
+back in main:      completed
+</code></pre>
+
+  <div class="callout info">
+    <div class="label">WHY THIS WORKS</div>
+    <p>
+      <code>&amp;task</code> gives the address of the struct in <code>main</code>. <code>UpdateTask</code> receives that address as <code>t *Task</code>.
+      When it writes <code>t.Status</code>, it is writing to the same memory as <code>task.Status</code> in <code>main</code>.
+    </p>
+  </div>
+
+  <h2>Where the Pointer Lives in Memory</h2>
+
+  <p>
+    A pointer is just a variable that holds a memory address. You can print it with <code>%p</code> to see that the address in the caller and the address inside the function are the same.
+  </p>
+
+  <pre><code>func UpdateTask(t *Task) {
+    fmt.Printf("address inside:   %p\n", t)
+    t.Status = "completed"
+}
+
+func main() {
+    task := Task{Status: "pending"}
+    fmt.Printf("address in main:  %p\n", &task)
+    UpdateTask(&task)
+}
+</code></pre>
+
+  <p>
+    Both prints will show the same address. That is the connection between the caller and the function.
+  </p>
+
+  <h2>Pointer Receivers: Methods That Mutate</h2>
+
+  <p>
+    The same idea applies to methods. A method with a value receiver operates on a copy. A method with a pointer receiver operates on the original value.
+    In real Go code, you will see methods like <code>func (t *Task) Complete()</code> far more often than global functions like <code>UpdateTask</code>.
+  </p>
+
+  <pre><code>func (t *Task) Complete() {
+    t.Status = "completed"
+    t.Completed = time.Now()
+}
+
+func main() {
+    task := Task{ID: 1, Title: "Send welcome email", Status: "pending"}
+    task.Complete()
+    fmt.Println(task.Status) // completed
+}
+</code></pre>
+
+  <div class="callout key">
+    <div class="label">KEY INSIGHT</div>
+    <p>
+      Go automatically converts between values and pointers for method calls, but only when the address can be taken.
+      You can call <code>task.Complete()</code> on a value, and the compiler will take <code>&amp;task</code> for you.
+      But you cannot call a pointer-receiver method on a value that is not addressable, such as a map element.
+    </p>
+  </div>
+
+  <h2>When to Use a Pointer: A Decision Table</h2>
+
+  <p>
+    Use this table as a first draft of your intuition. The full reference card is linked at the end of the lesson.
+  </p>
+
+  <table>
+    <tr>
+      <th>Choose <code>*T</code> when the function needs to</th>
+      <th>Choose <code>T</code> when the value is</th>
+    </tr>
+    <tr>
+      <td>mutate the caller's data</td>
+      <td>small and read-only, or the caller does not need to see changes</td>
+    </tr>
+    <tr>
+      <td>avoid copying a large struct</td>
+      <td>a slice, map, or channel (already a reference-like header)</td>
+    </tr>
+    <tr>
+      <td>signal that the value might be absent (<code>nil</code> is meaningful)</td>
+      <td>guaranteed to exist</td>
+    </tr>
+    <tr>
+      <td>share a single value across many callers</td>
+      <td>a local intermediate result</td>
+    </tr>
+    <tr>
+      <td>keep a <code>sync.Mutex</code> or other synchronizer un-copied</td>
+      <td>a basic type (int, string, bool) or a small struct</td>
+    </tr>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">COMMON MISTAKE</div>
+    <p>
+      Do not use a pointer just to avoid copying a few bytes. For small structs, the copy is cheap and the pointer adds the risk of aliasing and nil dereference.
+      The Go Wiki advice is: if in doubt, use a pointer, but there are times when a value receiver makes sense, such as for small unchanging structs or values of basic type.
+    </p>
+  </div>
+
+  <h2>Watch First</h2>
+
+  <div class="callout info video-embed">
+    <div class="video-meta">
+      <div class="label">Best video on this topic</div>
+      <strong>TomDoesTech — A Practical Guide to Pointers in Go</strong><br>
+      <span style="font-size:0.82rem; color: var(--muted);">~10 min · focuses on when and why to use pointers</span>
+    </div>
+    <div class="video-iframe">
+      <iframe
+        src="https://www.youtube.com/embed/PR4BwsZaJY0"
+        title="TomDoesTech — A Practical Guide to Pointers in Go"
+        allowfullscreen>
+      </iframe>
+    </div>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 1em;">Answer from memory, then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="What happens when you pass a struct to a function by value?"
+         data-correct="A"
+         data-feedback-correct="Correct. The function receives a copy, so changes inside the function do not affect the caller's variable."
+         data-feedback-wrong="Think about whether the function and the caller share the same memory or two separate copies.">
+      <div class="quiz-option" data-key="A">The function receives a copy.</div>
+      <div class="quiz-option" data-key="B">The function changes the caller.</div>
+      <div class="quiz-option" data-key="C">The compiler rejects the call.</div>
+      <div class="quiz-option" data-key="D">The original becomes read-only.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which symbol takes the address of a variable in Go?"
+         data-correct="A"
+         data-feedback-correct="Correct. &x returns the memory address of x."
+         data-feedback-wrong="Look for the symbol that asks 'where is this stored?' rather than the one that asks 'what is stored here?'.">
+      <div class="quiz-option" data-key="A">The ampersand symbol &x.</div>
+      <div class="quiz-option" data-key="B">The star symbol *x.</div>
+      <div class="quiz-option" data-key="C">The at symbol @x.</div>
+      <div class="quiz-option" data-key="D">The dollar sign $x.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What does *T represent in Go?"
+         data-correct="A"
+         data-feedback-correct="Correct. *T is the type of a pointer to a value of type T."
+         data-feedback-wrong="Remember that * means two different things: a type when it is next to a type name, and a read when it is next to a variable name.">
+      <div class="quiz-option" data-key="A">A pointer to type T.</div>
+      <div class="quiz-option" data-key="B">A copy of type T.</div>
+      <div class="quiz-option" data-key="C">The value at address T.</div>
+      <div class="quiz-option" data-key="D">A generic parameter for T.</div>
+    </div>
+
+    <div class="quiz"
+         data-question="When should a method use a pointer receiver?"
+         data-correct="A"
+         data-feedback-correct="Correct. A pointer receiver is required when the method must mutate the receiver."
+         data-feedback-wrong="A value receiver gives the method a copy. If it mutates, it mutates the copy, not the original.">
+      <div class="quiz-option" data-key="A">When the method must mutate.</div>
+      <div class="quiz-option" data-key="B">When the method only reads.</div>
+      <div class="quiz-option" data-key="C">When the receiver is small.</div>
+      <div class="quiz-option" data-key="D">When the method returns errors.</div>
+    </div>
+  </div>
+
+  <div class="lesson-nav">
+    <span></span>
+    <a href="../reference/pointer-decision-table.html">Pointer Decision Table →</a>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://gobyexample.com/pointers" target="_blank">Go by Example — Pointers</a></li>
+      <li><a href="https://go.dev/tour/moretypes/1" target="_blank">A Tour of Go — Pointers</a></li>
+      <li><a href="https://gobyexample.com/methods" target="_blank">Go by Example — Methods</a></li>
+      <li><a href="https://go.dev/wiki/CodeReviewComments#receiver-type" target="_blank">Go Wiki — Code Review Comments: Receiver Type</a></li>
+      <li><a href="https://go.dev/wiki/MethodSets" target="_blank">Go Wiki — MethodSets</a></li>
+      <li><a href="https://www.youtube.com/watch?v=PR4BwsZaJY0" target="_blank">TomDoesTech — A Practical Guide to Pointers in Go (YouTube)</a></li>
+    </ul>
+  </div>
+
+  <h2>Go Exercises</h2>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Two exercises, each with a broken <code>problem.go</code> and a working <code>solution.go</code>.
+    Pick an exercise, toggle between problem and solution, then run it locally.
+  </p>
+
+  <div style="background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 1em; font-size:0.82rem; margin-bottom: 1.2em;">
+    <strong>Setup:</strong>
+    <code>go version</code> &nbsp;·&nbsp;
+    <code>cd exercises/lesson-01-pointers/01-...</code>
+  </div>
+
+  <div class="exercise-viewer"
+       data-base="../exercises/lesson-01-pointers/"
+       data-exercises='[
+         {"id":"01-fix-the-swap","label":"01 — Fix the Swap","description":"BUG: Swap receives two ints by value, so main still sees the original values. FIX: pass pointers and swap through the addresses."},
+         {"id":"02-nil-safe-receiver","label":"02 — Nil-Safe Receiver","description":"BUG: calling a method on a nil pointer panics. FIX: add a nil check inside the method so it returns gracefully."}
+       ]'>
+  </div>
+
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-top: 1.5em;">
+    Ask a follow-up question if anything is unclear. The next lesson will build on this one with slices, maps, and the standard library's pointer APIs.
+  </p>
+
+</div>
+<script src="../assets/mermaid-init.js"></script>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/exercise-viewer.js"></script>
+<script src="../assets/audio-player.js"></script>
+</body>
+</html>

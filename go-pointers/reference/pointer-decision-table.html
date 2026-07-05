@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pointer Decision Table — Go Pointers</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Reference</span>
+    <span><a href="../index.html">Course home</a></span>
+    <span><a href="../lessons/0001-pointers-in-go.html">← Lesson 1</a></span>
+  </div>
+
+  <h1>Pointer Decision Table</h1>
+
+  <p>
+    A one-page cheat sheet for choosing between <code>T</code> and <code>*T</code> in functions, methods, and return values.
+  </p>
+
+  <h2>Quick Rules</h2>
+
+  <table>
+    <tr>
+      <th>Use <code>*T</code> when</th>
+      <th>Use <code>T</code> when</th>
+    </tr>
+    <tr>
+      <td>The function/method must mutate the caller's value.</td>
+      <td>small and read-only, or the caller does not need to see changes</td>
+    </tr>
+    <tr>
+      <td>The struct is large and copying it is expensive.</td>
+      <td>The struct is small and cheap to copy.</td>
+    </tr>
+    <tr>
+      <td>The value may be absent (<code>nil</code> is meaningful).</td>
+      <td>The value is guaranteed to exist.</td>
+    </tr>
+    <tr>
+      <td>Multiple callers must share the same value.</td>
+      <td>Each caller should have its own independent copy.</td>
+    </tr>
+    <tr>
+      <td>The struct contains a <code>sync.Mutex</code> or similar synchronizer.</td>
+      <td>The value is a basic type (int, string, bool) or a small struct.</td>
+    </tr>
+  </table>
+
+  <h2>The Three Symbols</h2>
+
+  <table>
+    <tr>
+      <th>Symbol</th>
+      <th>Context</th>
+      <th>Meaning</th>
+    </tr>
+    <tr>
+      <td><code>&amp;x</code></td>
+      <td>Expression</td>
+      <td>Address of <code>x</code></td>
+    </tr>
+    <tr>
+      <td><code>*T</code></td>
+      <td>Type</td>
+      <td>Pointer to <code>T</code></td>
+    </tr>
+    <tr>
+      <td><code>*p</code></td>
+      <td>Expression</td>
+      <td>Value at address <code>p</code></td>
+    </tr>
+  </table>
+
+  <h2>Function Parameters</h2>
+
+  <table>
+    <tr>
+      <th>Signature</th>
+      <th>Can mutate caller?</th>
+      <th>Typical use</th>
+    </tr>
+    <tr>
+      <td><code>func f(t T)</code></td>
+      <td>No</td>
+      <td>Read-only helpers, small inputs</td>
+    </tr>
+    <tr>
+      <td><code>func f(t *T)</code></td>
+      <td>Yes</td>
+      <td>Mutators, large structs, optional values</td>
+    </tr>
+  </table>
+
+  <h2>Method Receivers</h2>
+
+  <table>
+    <tr>
+      <th>Receiver</th>
+      <th>Can mutate?</th>
+      <th>Notes</th>
+    </tr>
+    <tr>
+      <td><code>func (t T) M()</code></td>
+      <td>No</td>
+      <td>Operates on a copy; safe for small, immutable values.</td>
+    </tr>
+    <tr>
+      <td><code>func (t *T) M()</code></td>
+      <td>Yes</td>
+      <td>Can be called on a value if the address is addressable; cannot be called on a non-addressable map element.</td>
+    </tr>
+  </table>
+
+  <h2>Common Mistakes</h2>
+
+  <ul>
+    <li><strong>Expecting mutation after passing by value.</strong> If a function receives <code>T</code>, changes inside it are lost.</li>
+    <li><strong>Dereferencing a nil pointer.</strong> Always check <code>if p == nil</code> before reading <code>*p</code> or pointer fields.</li>
+    <li><strong>Pointer receivers on non-addressable values.</strong> You cannot call <code>func (t *T) M()</code> on a map element or an interface value whose concrete value is not addressable.</li>
+    <li><strong>Unintended aliasing.</strong> Two pointers to the same value can overwrite each other unexpectedly.</li>
+  </ul>
+
+  <h2>Standard-Library Examples</h2>
+
+  <ul>
+    <li><code>flag.String</code> returns <code>*string</code>; you must dereference it with <code>*word</code>.</li>
+    <li><code>json.Unmarshal(data, &v)</code> takes a pointer so it can fill <code>v</code>.</li>
+    <li><code>time.Time</code> methods use value receivers because the type is designed to be immutable.</li>
+    <li><code>bytes.Buffer</code> methods use pointer receivers because the buffer must mutate.</li>
+  </ul>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary References</div>
+    <ul>
+      <li><a href="https://gobyexample.com/pointers" target="_blank">Go by Example — Pointers</a></li>
+      <li><a href="https://gobyexample.com/methods" target="_blank">Go by Example — Methods</a></li>
+      <li><a href="https://go.dev/wiki/CodeReviewComments#receiver-type" target="_blank">Go Wiki — Receiver Type</a></li>
+      <li><a href="https://go.dev/wiki/MethodSets" target="_blank">Go Wiki — MethodSets</a></li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>
