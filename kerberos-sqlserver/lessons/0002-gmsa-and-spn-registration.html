@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2: gMSA and SPN Registration</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 2</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~30 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>gMSA and SPN Registration</h1>
+
+  <p>Lesson 1 showed why Kerberos lives or dies by the service identity. This lesson turns that into operations: choosing a Group Managed Service Account, registering SPNs, granting the right AD permissions, and verifying everything before restarting SQL Server.</p>
+
+  <h2>1. Why a gMSA Beats a Domain User Account</h2>
+
+  <p>A Group Managed Service Account is an AD account that multiple servers can use, with automatic password rotation and simplified SPN management. For SQL Server it is the Microsoft-recommended replacement for manually maintained domain user service accounts.</p>
+
+  <table>
+    <thead>
+      <tr><th>Characteristic</th><th>Domain user</th><th>gMSA</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Password management</td><td>Manual or custom script</td><td>AD rotates automatically</td></tr>
+      <tr><td>Usable on multiple servers</td><td>Risky shared credential</td><td>Designed for it</td></tr>
+      <tr><td>SPN registration</td><td>Usually manual setspn</td><td>Can self-register if granted permission</td></tr>
+      <tr><td>Restart after password change</td><td>Often required</td><td>Not required</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>gMSA requires Windows Server 2012 R2 or later for the domain functional level and a KDS root key. Failover clusters support gMSA for SQL Server 2016 and later. See Microsoft Learn: Manage Group Managed Service Accounts.</p>
+  </div>
+
+  <h2>2. Create and Install a gMSA</h2>
+
+  <p>Run these on a domain-joined machine with the AD PowerShell module:</p>
+
+  <pre><code><span class="cm"># 1. Create a security group for the servers that will use the gMSA</span>
+New-ADGroup -Name "SQL Server Hosts" -GroupScope Global -Path "OU=Groups,DC=corp,DC=local"
+
+<span class="cm"># 2. Add the computer accounts of the SQL Server nodes</span>
+Add-ADGroupMember -Identity "SQL Server Hosts" -Members sql01$, sql02$
+
+<span class="cm"># 3. Create the gMSA (KDS root key must already exist)</span>
+New-ADServiceAccount `
+  -Name sqlsvc `
+  -DNSHostName sqlsvc.corp.local `
+  -PrincipalsAllowedToRetrieveManagedPassword "SQL Server Hosts"
+
+<span class="cm"># 4. On each SQL Server node, install the gMSA</span>
+Install-ADServiceAccount -Identity sqlsvc
+
+<span class="cm"># 5. Verify</span>
+Test-ADServiceAccount -Identity sqlsvc</code></pre>
+
+  <p>When you change the SQL Server service account in SQL Server Configuration Manager, leave the password blank. The host retrieves it automatically from AD.</p>
+
+  <h2>3. Grant Permission to Register SPNs</h2>
+
+  <p>By default, SQL Server tries to register its SPN at startup. With a gMSA you can let it self-register, but the service account needs <code>Validated write to service principal name</code>, plus <code>Read servicePrincipalName</code> and <code>Write servicePrincipalName</code> on its own AD object.</p>
+
+  <pre><code><span class="cm"># Delegated via PowerShell — run as Domain Admin or account operator with rights</span>
+$gMSA = Get-ADServiceAccount -Identity sqlsvc
+$acl = Get-Acl -Path "AD:\$($gMSA.DistinguishedName)"
+
+$sid = [System.Security.Principal.SecurityIdentifier] (New-Object System.Security.Principal.NTAccount "CORP\sqlsvc$").Translate([System.Security.Principal.SecurityIdentifier])
+
+$rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+  $sid, "WriteProperty", "Allow", [GUID] "f3a64788-5306-11d1-a9c5-0000f80367c1", "Self"
+<span class="cm"># The GUID is the schemaIDGuid for the servicePrincipalName attribute.</span>
+
+$acl.AddAccessRule($rule)
+Set-Acl -Path "AD:\$($gMSA.DistinguishedName)" -AclObject $acl</code></pre>
+
+  <div class="callout warning">
+    <div class="label">Practical Tip</div>
+    <p>In many organizations, AD admins prefer to register SPNs themselves and disable self-registration. Either path works, but the gMSA still wins on password management. If AD manages SPNs, keep the register/unregister permissions restricted and document the ticket path for SPN changes.</p>
+  </div>
+
+  <h2>4. Register SPNs Manually with setspn</h2>
+
+  <p>Whether SQL Server self-registers or AD does it, the SPNs must exist and must be correct. Use <code>setspn -S</code> to add only if the SPN is not already present elsewhere.</p>
+
+  <pre><code><span class="cm"># Default instance, TCP</span>
+setspn -S MSSQLSvc/sql01.corp.local:1433 CORP\sqlsvc$
+setspn -S MSSQLSvc/sql01.corp.local CORP\sqlsvc$
+
+<span class="cm"># Named instance on static port 51433</span>
+setspn -S MSSQLSvc/sql02.corp.local:51433 CORP\sqlsvc$
+setspn -S MSSQLSvc/sql02.corp.local:INSTANCE CORP\sqlsvc$
+
+<span class="cm"># Always On availability group listener</span>
+setspn -S MSSQLSvc/aglistener.corp.local:1433 CORP\sqlsvc$
+setspn -S MSSQLSvc/aglistener.corp.local CORP\sqlsvc$</code></pre>
+
+  <div class="callout danger">
+    <div class="label">Critical</div>
+    <p>SPNs must be unique across the entire AD forest. <code>setspn -X</code> finds duplicates. A duplicate SPN causes intermittent authentication failures or forces NTLM fallback depending on which account the KDC returns first.</p>
+  </div>
+
+  <h2>5. Verify Everything</h2>
+
+  <p>After SPN registration, verify from the SQL Server host:</p>
+
+  <pre><code><span class="cm"># List SPNs on the gMSA</span>
+setspn -L CORP\sqlsvc$
+
+<span class="cm"># Check for duplicates</span>
+setspn -X
+
+<span class="cm"># Restart SQL Server and watch the error log for the registration message</span>
+<span class="cm"># "The SQL Server Network Interface library successfully registered ..."</span></code></pre>
+
+  <p>Then test a remote connection and check the DMV:</p>
+
+  <pre><code><span class="cm">-- From a remote client using Windows Authentication</span>
+<span class="kw">SELECT</span> net_transport, auth_scheme
+<span class="kw">FROM</span> sys.dm_exec_connections
+<span class="kw">WHERE</span> session_id = @@SPID;</code></pre>
+
+  <h2>6. PostgreSQL Keytab Counterpart</h2>
+
+  <p>SQL Server stores its service key in the LSA secret associated with the gMSA. PostgreSQL has no LSA; it uses a keytab file. The operational parallel is:</p>
+
+  <table>
+    <thead>
+      <tr><th>SQL Server</th><th>PostgreSQL</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>SPN on gMSA: <code>MSSQLSvc/sql01.corp.local:1433</code></td><td>Principal in keytab: <code>postgres/sql01.corp.local@CORP.LOCAL</code></td></tr>
+      <tr><td>Service account password managed by AD</td><td>Keytab file protected by filesystem permissions</td></tr>
+      <tr><td>Verify with <code>setspn -L</code> and DMV</td><td>Verify with <code>klist -k</code> and PostgreSQL log</td></tr>
+    </tbody>
+  </table>
+
+  <h2>7. Do You Need to Restart SQL Server for AD Changes?</h2>
+
+  <p>Usually no. SPN changes are read by the KDC immediately. A running SQL Server instance does not cache its own SPN list. However, if you change the <em>service account</em> that SQL Server runs under, a service restart is required. Changing only the SPNs or delegation settings does not require a restart.</p>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Impact</div>
+    <p>Existing client connections are not dropped by an SPN change. Only new connections will use the new Kerberos path. That means you can fix an SPN during business hours without restarting SQL Server, as long as you verify from a fresh remote connection.</p>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Configure Windows Service Accounts and Permissions:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/configure-windows-service-accounts-and-permissions?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../configure-windows-service-accounts-and-permissions</a><br><br>
+    <strong>Microsoft Learn — Manage Group Managed Service Accounts:</strong>
+    <a href="https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/manage-group-managed-service-accounts" target="_blank">learn.microsoft.com/.../manage-group-managed-service-accounts</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="Which AD permission allows a gMSA to register or modify its own SPNs?"
+         data-correct="B"
+         data-feedback-correct="Correct. The gMSA needs Validated write to service principal name plus Read/Write servicePrincipalName on its own AD object."
+         data-feedback-wrong="Not quite. The correct answer is B. Kerberos delegation settings control credential forwarding, not SPN registration. Domain Admin is overprivileged and not required.">
+      <div class="quiz-option" data-key="A">Domain Admin membership on the gMSA account</div>
+      <div class="quiz-option" data-key="B">Validated write to service principal name and Read/Write servicePrincipalName</div>
+      <div class="quiz-option" data-key="C">Unconstrained Kerberos delegation enabled</div>
+      <div class="quiz-option" data-key="D">Log on as a service local right on the SQL Server host</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You add an SPN for the Always On listener FQDN. Must you restart SQL Server for the change to take effect?"
+         data-correct="B"
+         data-feedback-correct="Correct. SPN and delegation changes are consumed by the KDC and clients immediately. Restart SQL Server only when you change the service account itself."
+         data-feedback-wrong="Not quite. The correct answer is B. SPN changes do not require a SQL Server restart. Existing connections continue; new connections use the updated SPN.">
+      <div class="quiz-option" data-key="A">Yes, every AD-side SPN change requires a SQL Server restart</div>
+      <div class="quiz-option" data-key="B">No, SPN changes take effect for new connections without a restart</div>
+      <div class="quiz-option" data-key="C">Only if the listener is also changing IP addresses</div>
+      <div class="quiz-option" data-key="D">Only on the primary replica, not the secondaries</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the correct command to add a SQL Server SPN only if it is not already present in the forest?"
+         data-correct="C"
+         data-feedback-correct="Correct. setspn -S creates the SPN only after confirming it is unique. -A bypasses the uniqueness check and is discouraged."
+         data-feedback-wrong="Not quite. The correct answer is C. setspn -S (capital S) performs a duplicate check. setspn -A does not, which risks creating duplicate SPNs.">
+      <div class="quiz-option" data-key="A">setspn -A MSSQLSvc/sql01.corp.local:1433 CORP\sqlsvc$</div>
+      <div class="quiz-option" data-key="B">setspn -D MSSQLSvc/sql01.corp.local:1433 CORP\sqlsvc$</div>
+      <div class="quiz-option" data-key="C">setspn -S MSSQLSvc/sql01.corp.local:1433 CORP\sqlsvc$</div>
+      <div class="quiz-option" data-key="D">setspn -L MSSQLSvc/sql01.corp.local:1433 CORP\sqlsvc$</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "How do I delegate SPN permissions to a non-domain-admin DBA?", "What happens if two accounts have the same SPN?", or "Can I use one gMSA for every SQL Server instance in the domain?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0001-what-kerberos-means-for-sql-server-and-postgresql.html">&larr; Lesson 1: What Kerberos Means</a>
+    <a href="0003-named-instances-ag-listeners-and-the-1200-spn-limit.html">Lesson 3: Named Instances, AG Listeners, and the 1200 SPN Limit &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

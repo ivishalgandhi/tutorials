@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reference: SPN Formats for SQL Server and PostgreSQL Keytabs</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="page">
+
+  <p class="lede">Quick reference for the Kerberos course.</p>
+  <h1>SPN Formats for SQL Server and PostgreSQL Keytabs</h1>
+
+  <h2>SQL Server Database Engine</h2>
+  <table>
+    <thead>
+      <tr><th>Connection type</th><th>SPN format</th><th>Example</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Default instance, TCP with port</td><td><code>MSSQLSvc/FQDN:port</code></td><td><code>MSSQLSvc/sql01.corp.local:1433</code></td></tr>
+      <tr><td>Default instance, TCP no port</td><td><code>MSSQLSvc/FQDN</code></td><td><code>MSSQLSvc/sql01.corp.local</code></td></tr>
+      <tr><td>Named pipes / shared memory</td><td><code>MSSQLSvc/FQDN</code></td><td><code>MSSQLSvc/sql01.corp.local</code></td></tr>
+      <tr><td>Named instance, TCP with static port</td><td><code>MSSQLSvc/FQDN:port</code></td><td><code>MSSQLSvc/sql02.corp.local:51433</code></td></tr>
+      <tr><td>Named instance, non-TCP</td><td><code>MSSQLSvc/FQDN:InstanceName</code></td><td><code>MSSQLSvc/sql02.corp.local:APPDB</code></td></tr>
+      <tr><td>Dedicated Admin Connection (DAC)</td><td><code>MSSQLSvc/FQDN:InstanceName</code></td><td><code>MSSQLSvc/sql02.corp.local:APPDB</code></td></tr>
+      <tr><td>AG listener</td><td><code>MSSQLSvc/ListenerFQDN:port</code></td><td><code>MSSQLSvc/AgListener.corp.local:1433</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>SQL Server related services</h2>
+  <table>
+    <thead>
+      <tr><th>Service</th><th>Service class</th><th>Example</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Reporting Services / Power BI Report Server (HTTP)</td><td><code>HTTP</code></td><td><code>HTTP/reports.corp.local</code></td></tr>
+      <tr><td>Analysis Services default instance</td><td><code>MSOLAPSvc.3</code></td><td><code>MSOLAPSvc.3/ssas01.corp.local</code></td></tr>
+      <tr><td>Analysis Services named instance</td><td><code>MSOLAPSvc.3</code></td><td><code>MSOLAPSvc.3/ssas01.corp.local:TABULAR</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>PostgreSQL keytab principal</h2>
+  <table>
+    <thead>
+      <tr><th>Platform</th><th>Principal format</th><th>Example</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Linux / GSSAPI</td><td><code>service/FQDN@REALM</code></td><td><code>postgres/sql01.corp.local@CORP.LOCAL</code></td></tr>
+      <tr><td>Windows / SSPI</td><td><code>service/FQDN@REALM</code></td><td><code>postgres/sql01.corp.local@CORP.LOCAL</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Useful commands</h2>
+  <table>
+    <thead>
+      <tr><th>Task</th><th>Command</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>List SPNs for an account</td><td><code>setspn -L DOMAIN\AccountName$</code></td></tr>
+      <tr><td>Search for duplicate SPNs</td><td><code>setspn -X</code></td></tr>
+      <tr><td>Add an SPN only if unique</td><td><code>setspn -S MSSQLSvc/FQDN:port DOMAIN\AccountName$</code></td></tr>
+      <tr><td>Delete an SPN</td><td><code>setspn -D MSSQLSvc/FQDN:port DOMAIN\AccountName$</code></td></tr>
+      <tr><td>List keytab principals</td><td><code>klist -k /path/to/postgres.keytab</code></td></tr>
+      <tr><td>Check your own Kerberos tickets</td><td><code>klist</code></td></tr>
+      <tr><td>Request a specific service ticket</td><td><code>kinit user@CORP.LOCAL; kvno postgres/sql01.corp.local@CORP.LOCAL</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Remember</h2>
+  <ul>
+    <li>SPNs must be unique across the entire AD forest.</li>
+    <li>SPNs are tied to the account running the service, not necessarily the computer object.</li>
+    <li>Use FQDNs in SPNs and connection strings. IP addresses do not work for Kerberos.</li>
+    <li>The practical limit for SPNs on one AD object is about 1200 entries.</li>
+    <li>PostgreSQL uses a keytab file, not AD SPN registration, but the same FQDN-matching rule applies.</li>
+  </ul>
+
+  <div class="lesson-nav">
+    <a href="../lessons/0001-what-kerberos-means-for-sql-server-and-postgresql.html">← Lesson 1</a>
+    <a href="../lessons/0002-gmsa-and-spn-registration.html">Lesson 2 →</a>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,18 @@
+Solution 03 — Write the correct PostgreSQL pg_hba.conf line
+
+  hostssl  appdb  +app_users  10.0.1.0/24  gss  map=domain2pg
+
+Breakdown:
+  hostssl    — require TLS on the client-to-server connection
+  appdb      — apply only to the appdb database
+  +app_users — apply only to members of the group role app_users
+  10.0.1.0/24 — allow only the application subnet
+  gss        — use GSSAPI / Kerberos authentication
+  map=domain2pg — translate incoming principal names via pg_ident.conf
+
+Important notes:
+- gss only authenticates; it does not encrypt traffic. hostssl provides the encryption.
+- The keytab file (KRB5_KTNAME) must contain a principal such as
+  postgres/pg-server-fqdn@CORP.LOCAL matching the hostname clients use.
+- Reload PostgreSQL after changing pg_hba.conf:
+    SELECT pg_reload_conf();

@@ -1,0 +1,17 @@
+Exercise 01 — Identify the right Kerberos identity type
+
+Scenario A:
+You have a SQL Server 2022 default instance named MSSQLSERVER running on sql01.corp.local
+under the gMSA CORP\sqlsvc$. A remote application connects with Windows Authentication
+but gets auth_scheme = NTLM.
+
+Question: What identity object should you verify first — the SQL Server service account, the
+gMSA keytab, or the computer object's SPNs? State the exact command you would run.
+
+Scenario B:
+You have a PostgreSQL 16 instance on pg01.corp.local using GSSAPI authentication.
+A remote psql client with Kerberos tickets cannot connect. The PostgreSQL log shows:
+  LOG:  GSSAPI authentication failed for user "alice"
+
+Question: What file on the PostgreSQL server should you verify next, and what command
+shows its contents?

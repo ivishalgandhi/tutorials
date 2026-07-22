@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3: Named Instances, AG Listeners, and the 1200 SPN Limit</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 3</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~25 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Named Instances, AG Listeners, and the 1200 SPN Limit</h1>
+
+  <p>One default instance is easy. Real environments have named instances, Always On listeners, failover clusters, and many services sharing one gMSA. This lesson shows the exact SPNs each requires and the AD limit that caps how far you can push a single account.</p>
+
+  <h2>1. Named Instances Need Static Ports</h2>
+
+  <p>SQL Server named instances default to dynamic ports. Dynamic ports break Kerberos because the SPN contains the port number; if the port changes at startup, the SPN no longer matches. Before you register SPNs for a named instance, pin it to a static port in SQL Server Configuration Manager.</p>
+
+  <pre><code><span class="cm"># Correct SPNs for a named instance APPDB on sql02.corp.local, static port 51433</span>
+setspn -S MSSQLSvc/sql02.corp.local:51433 CORP\sqlsvc$
+setspn -S MSSQLSvc/sql02.corp.local:APPDB  CORP\sqlsvc$
+
+<span class="cm"># Note: the instance-name SPN is used for named-pipe/shared-memory paths,
+</span>
+<span class="cm"># while the port SPN is used for TCP connections.</span></code></pre>
+
+  <div class="callout warning">
+    <div class="label">Trap</div>
+    <p>If you register an SPN with a port and then the instance later uses dynamic ports, Kerberos will fail after the next restart that picks a different port. Set the static port before you register the SPN, and document it in your build sheet.</p>
+  </div>
+
+  <h2>2. Always On Availability Group Listeners</h2>
+
+  <p>Clients connect to the listener FQDN, not to individual replica hostnames. The SPN must therefore be registered on the listener FQDN and mapped to the account running SQL Server on every replica. All replicas in an AG typically use the same gMSA.</p>
+
+  <pre><code><span class="cm"># SPNs for the AG listener AgListener.corp.local, default port 1433</span>
+setspn -S MSSQLSvc/AgListener.corp.local:1433 CORP\sqlsvc$
+setspn -S MSSQLSvc/AgListener.corp.local      CORP\sqlsvc$
+
+<span class="cm"># Replicas themselves also need their own host SPNs if anyone connects directly</span>
+setspn -S MSSQLSvc/sql01.corp.local:1433        CORP\sqlsvc$
+setspn -S MSSQLSvc/sql02.corp.local:1433        CORP\sqlsvc$</code></pre>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>During a failover, the listener DNS record points to the new primary. The SPN does not move; the account running SQL Server on the new primary already owns it. No SPN change is required at failover time if all replicas share the gMSA and the listener SPNs are already registered.</p>
+  </div>
+
+  <h2>3. FQDN vs. Short Name vs. Port</h2>
+
+  <table>
+    <thead>
+      <tr><th>Connection string uses</th><th>SPN required</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>sql01.corp.local</code> (default instance)</td><td><code>MSSQLSvc/sql01.corp.local</code></td><td>Also add port SPN for TCP</td></tr>
+      <tr><td><code>sql01.corp.local,51433</code> (named instance)</td><td><code>MSSQLSvc/sql01.corp.local:51433</code></td><td>Static port mandatory</td></tr>
+      <tr><td><code>sql01</code> (NetBIOS short name)</td><td><code>MSSQLSvc/sql01</code> or fallback to NTLM</td><td>Prefer FQDN in SPNs</td></tr>
+      <tr><td><code>192.168.1.50,1433</code> (IP address)</td><td>None — cannot use Kerberos</td><td>Will fall back to NTLM</td></tr>
+      <tr><td><code>AgListener.corp.local</code></td><td><code>MSSQLSvc/AgListener.corp.local:1433</code></td><td>Registered on shared gMSA</td></tr>
+    </tbody>
+  </table>
+
+  <h2>4. The ~1200 SPN Practical Limit</h2>
+
+  <p>The <code>servicePrincipalName</code> attribute in Active Directory is multivalued and non-linked. It does not use Linked Value Replication. The practical limit is about 1200 entries per AD object, and the exact ceiling shrinks as individual SPNs grow longer.</p>
+
+  <div class="callout danger">
+    <div class="label">Risk</div>
+    <p>If you put every SQL Server instance, listener, SSRS web site, and SSAS instance in one gMSA, you will eventually hit the limit. Symptoms include SPN registration failures, LDAP error 0x00000b (LDAP_ADMIN_LIMIT_EXCEEDED), and replication issues for that object.</p>
+  </div>
+
+  <p>Mitigation strategies:</p>
+  <ul>
+    <li>Use separate gMSAs per environment or per application tier.</li>
+    <li>Prefer port-based SPNs over host-based duplicates when clients can be standardized.</li>
+    <li>Audit SPNs regularly: <code>setspn -L</code> and <code>setspn -X</code>.</li>
+    <li>Delete obsolete SPNs when servers are decommissioned.</li>
+  </ul>
+
+  <h2>5. PostgreSQL Keytab Parallel</h2>
+
+  <p>PostgreSQL does not register SPNs in AD. Instead, the DBA or AD team creates the principal in AD and exports it into the PostgreSQL keytab. Each PostgreSQL server has its own keytab; there is no single AD object accumulating hundreds of SPN entries.</p>
+
+  <pre><code><span class="cm"># On Windows, export a keytab for the postgres principal</span>
+ktpass /princ postgres/sql01.corp.local@CORP.LOCAL `
+       /mapuser CORP\pgdb01$ `
+       /crypto AES256-SHA1 `
+       /ptype KRB5_NT_SRV_HST `
+       /out c:\postgres.keytab `
+       -SetPass +rndPass
+
+<span class="cm"># On Linux, ktutil can also import the keytab and verify the principal</span>
+klist -k /etc/postgresql/16/main/postgres.keytab</code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>Because PostgreSQL uses per-host keytabs, the 1200-SPN limit is not a PostgreSQL problem directly. However, the same AD object can still accumulate SPNs if it hosts other Windows services. Keep the keytab principal distinct from other service SPNs.</p>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Listeners and Kerberos (SPNs):</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/listeners-client-connectivity-application-failover?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../listeners-client-connectivity-application-failover</a><br><br>
+    <strong>Microsoft TechCommunity — Service Principal Name Attribute Limitations:</strong>
+    <a href="https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/service-principal-name-attribute-limitations/ba-p/257489" target="_blank">techcommunity.microsoft.com/.../service-principal-name-attribute-limitations</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="What must you do before registering Kerberos SPNs for a SQL Server named instance?"
+         data-correct="C"
+         data-feedback-correct="Correct. Dynamic ports change on restart, so the port-based SPN becomes invalid. Set a static port first."
+         data-feedback-wrong="Not quite. The correct answer is C. Static ports are mandatory for named-instance Kerberos SPNs. Restarting the service does not pin the port.">
+      <div class="quiz-option" data-key="A">Enable SQL Server Browser and restart the service</div>
+      <div class="quiz-option" data-key="B">Register an HTTP SPN on the same host</div>
+      <div class="quiz-option" data-key="C">Set the named instance to use a static TCP port</div>
+      <div class="quiz-option" data-key="D">Create a separate gMSA for every named instance</div>
+    </div>
+
+    <div class="quiz"
+         data-question="An Always On listener named AgListener.corp.local fails over from sql01 to sql02. Which SPN change is required?"
+         data-correct="A"
+         data-feedback-correct="Correct. The listener SPN stays the same because all replicas use the same gMSA and the SPN is already registered on that account."
+         data-feedback-wrong="Not quite. The correct answer is A. No SPN change is needed at failover time. The DNS pointer for the listener moves, but the Kerberos principal mapping is already valid for sql02's service account.">
+      <div class="quiz-option" data-key="A">None, if both replicas use the same gMSA and the listener SPN is already registered</div>
+      <div class="quiz-option" data-key="B">Move the listener SPN from sql01's account to sql02's account</div>
+      <div class="quiz-option" data-key="C">Register a new listener SPN on sql02's computer object</div>
+      <div class="quiz-option" data-key="D">Restart the KDC on the domain controller</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the practical limit for the number of SPNs on a single AD object?"
+         data-correct="B"
+         data-feedback-correct="Correct. The servicePrincipalName attribute is non-linked multivalued and has a practical limit around 1200 entries."
+         data-feedback-wrong="Not quite. The correct answer is B. The 1200-entry practical limit is well documented for the servicePrincipalName attribute. The exact number shrinks with long SPN values.">
+      <div class="quiz-option" data-key="A">500 entries per forest</div>
+      <div class="quiz-option" data-key="B">Approximately 1200 entries per AD object</div>
+      <div class="quiz-option" data-key="C">Unlimited when using a gMSA</div>
+      <div class="quiz-option" data-key="D">2500 entries when the forest level is Windows Server 2016+</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "Do I need both host and port SPNs?", "How do I know if I am near the 1200 limit?", or "What SPNs does a failover cluster instance need?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0002-gmsa-and-spn-registration.html">&larr; Lesson 2: gMSA and SPN Registration</a>
+    <a href="0004-ssrs-ssas-and-power-bi-kerberos.html">Lesson 4: SSRS, SSAS, and Power BI &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

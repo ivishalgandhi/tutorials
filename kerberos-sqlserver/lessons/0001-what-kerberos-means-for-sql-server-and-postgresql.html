@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1: What Kerberos Means for SQL Server and PostgreSQL</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 1</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~25 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>What Kerberos Means for SQL Server and PostgreSQL</h1>
+
+  <p>Your organization is deprecating NTLMv2. For the databases you run, that means every Windows-integrated or AD-backed connection must now negotiate Kerberos instead of silently falling back to NTLM. This lesson explains the mechanics in one picture, and shows you how to verify that Kerberos is actually being used on both SQL Server and PostgreSQL.</p>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>1. The Kerberos Ticket Flow</h2>
+
+  <p>Kerberos is not a password exchange. It is a ticket exchange. A client proves its identity once to Active Directory, receives a ticket-granting ticket, and then uses that ticket to request service-specific tickets from the Key Distribution Center. The database service proves itself by decrypting the service ticket with a secret only it possesses.</p>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant K as AD Key Distribution Center
+    participant S as SQL Server / PostgreSQL
+
+    C->>K: AS-REQ: authenticate me (password or smart card)
+    K-->>C: AS-REP: Ticket-Granting Ticket (TGT)
+    Note over C: User opens connection to sql01.corp.local
+    C->>K: TGS-REQ: service ticket for MSSQLSvc/sql01.corp.local
+    K-->>C: TGS-REP: service ticket
+    C->>S: Connect + present service ticket
+    S->>S: Decrypt ticket with service account key
+    S-->>C: Connection accepted
+    </div>
+    <p class="diagram-caption">Figure 1. Kerberos authentication flow. The user's password never crosses the network after the initial TGT request.</p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>For the KDC to issue a service ticket, it must know which AD account owns the service. That mapping is the <strong>Service Principal Name</strong> (SPN). Without the right SPN, the ticket cannot be issued, Kerberos fails, and the client falls back to NTLM.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>2. How SQL Server Uses Kerberos</h2>
+
+  <p>SQL Server's Database Engine service runs under an account. If that account has the correct SPN registered, remote clients can request and present a Kerberos service ticket. If the SPN is missing or wrong, Windows integrated connections fall back to NTLM.</p>
+
+  <p>Verify the authentication scheme from a <em>remote</em> machine:</p>
+
+  <pre><code><span class="cm">-- Run this while connected with Windows Authentication</span>
+<span class="kw">SELECT</span> net_transport, auth_scheme
+<span class="kw">FROM</span> sys.dm_exec_connections
+<span class="kw">WHERE</span> session_id = @@SPID;</code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>auth_scheme</th>
+        <th>Meaning</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>KERBEROS</code></td>
+        <td>Remote Kerberos ticket exchange succeeded.</td>
+        <td>Desired state.</td>
+      </tr>
+      <tr>
+        <td><code>NTLM</code></td>
+        <td>Kerberos failed; NTLM challenge-response is being used.</td>
+        <td>Check SPN, DNS name, and service account permissions.</td>
+      </tr>
+      <tr>
+        <td><code>Windows</code> / <code>Negotiate</code> variants</td>
+        <td>SSPI negotiated a package; inspect further with DMV.</td>
+        <td>Use <code>auth_scheme</code> to see the final choice.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant K as AD KDC
+    participant S as SQL Server
+
+    C->>S: Connect using 192.168.1.50
+    C->>K: Request service ticket for MSSQLSvc/192.168.1.50
+    K-->>C: No such SPN found
+    Note over C: SSPI falls back to NTLM
+    C->>S: NTLM challenge-response
+    S->>S: Verify credential against local SAM/LSA
+    S-->>C: Connection accepted (auth_scheme = NTLM)
+    </div>
+    <p class="diagram-caption">Figure 2. When the client uses an IP address, the KDC cannot find an SPN, Kerberos fails, and the client falls back to NTLM challenge-response with the SQL Server host.</p>
+  </div>
+
+  <div class="callout mssql">
+    <div class="label">SQL Server Note</div>
+    <p>Local connections from the server itself often show <code>NTLM</code> even when everything is correct, because Windows prefers NTLM for local loopback. Always test from a remote client.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>3. How PostgreSQL Uses Kerberos</h2>
+
+  <p>PostgreSQL does not have native Windows Authentication. Instead it uses <strong>GSSAPI</strong> (the cross-platform Kerberos API) via the <code>gss</code> authentication method, or SSPI on Windows. On Linux, the PostgreSQL server needs a <strong>keytab file</strong> that contains the long-term key for the database's service principal. The keytab lets PostgreSQL prove it owns the <code>postgres/sql01.corp.local@CORP.LOCAL</code> principal. No keytab means no Kerberos authentication.</p>
+
+  <p>On the PostgreSQL server, the keytab path is usually set via the <code>KRB5_KTNAME</code> environment variable before the postmaster starts:</p>
+
+  <pre><code><span class="cm"># /etc/postgresql/16/main/environment or a systemd drop-in</span>
+KRB5_KTNAME=/etc/postgresql/16/main/postgres.keytab
+
+<span class="cm"># Create the keytab on a domain-joined machine with ktutil or ktpass</span>
+ktutil
+ktutil:  read_kt /tmp/primary.keytab
+ktutil:  read_kt /tmp/secondary.keytab
+ktutil:  write_kt /etc/postgresql/16/main/postgres.keytab
+ktutil:  quit</code></pre>
+
+  <p>The matching <code>pg_hba.conf</code> entry is one line:</p>
+
+  <pre><code><span class="cm"># GSSAPI / Kerberos over TLS for the application subnet</span>
+<span class="nm">hostssl</span>  appdb  <span class="kw">+app_users</span>  <span class="st">10.0.1.0/24</span>  <span class="fn">gss</span>
+<span class="cm"># Include a username map if AD usernames differ from PostgreSQL role names</span>
+<span class="nm">hostssl</span>  appdb  <span class="kw">all</span>         <span class="st">10.0.1.0/24</span>  <span class="fn">gss</span>  map=domain2pg</code></pre>
+
+  <p>Verify a PostgreSQL Kerberos connection by checking the log. A successful GSSAPI connection logs an authentication message with the principal name. You can also query <code>pg_stat_activity</code> for the active user; the connection method itself is not exposed there, so logs and packet captures are the authoritative source.</p>
+
+  <div class="callout warning">
+    <div class="label">Common Trap</div>
+    <p>PostgreSQL's <code>gss</code> method does not encrypt the connection. It only authenticates it. Pair it with <code>hostssl</code> (or use GSSAPI encryption) to protect data in transit. Authentication without encryption is like checking ID at the door and then shouting secrets in the hallway.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>4. The SPN Is the Whole Game</h2>
+
+  <p>For SQL Server, the SPN tells AD: "MSSQLSvc/sql01.corp.local:1433 is owned by CORP\gMSA$." For PostgreSQL, the equivalent principal in the keytab is usually <code>postgres/sql01.corp.local@CORP.LOCAL</code>. The name the client uses in its connection string must match the SPN or principal registered in AD.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>SQL Server</th>
+        <th>PostgreSQL</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Service identity registered in AD</td>
+        <td>SPN on service account</td>
+        <td>Principal in PostgreSQL keytab</td>
+      </tr>
+      <tr>
+        <td>Client connection name</td>
+        <td>FQDN or registered host name</td>
+        <td>FQDN matching the keytab principal</td>
+      </tr>
+      <tr>
+        <td>IP address allowed?</td>
+        <td>No</td>
+        <td>No</td>
+      </tr>
+      <tr>
+        <td>Fallback if Kerberos fails</td>
+        <td>NTLM (if enabled)</td>
+        <td>Connection refused, or next pg_hba rule</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>5. Three Requirements for Database Kerberos</h2>
+
+  <ol>
+    <li><strong>Same AD forest or trusted forest.</strong> The client, the database server, and the KDC must all trust the same domain hierarchy.</li>
+    <li><strong>A valid service identity.</strong> SPN for SQL Server; keytab principal for PostgreSQL.</li>
+    <li><strong>Client connects by the registered name.</strong> FQDN recommended. IP addresses and <code>localhost</code> do not work.</li>
+  </ol>
+
+  <div class="callout danger">
+    <div class="label">NTLM Fallback Is Now a Failure Mode</div>
+    <p>Before the migration, NTLM fallback was harmless redundancy. After the migration, it is a policy violation. Every connection that silently falls back to NTLM is a connection that must be fixed: SPN, DNS name, or service account.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>6. Try It</h2>
+
+  <div class="callout info">
+    <div class="label">Your First Action</div>
+    <p>Pick one SQL Server instance and one PostgreSQL instance. From a remote client, connect by FQDN. On SQL Server run the DMV query above. On PostgreSQL check the log for GSSAPI success or failure. Write down: (1) the connection name used, (2) whether Kerberos succeeded, and (3) the first error or fallback indicator you see.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Register a Service Principal Name for Kerberos Connections:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/register-a-service-principal-name-for-kerberos-connections?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../register-a-service-principal-name-for-kerberos-connections</a><br><br>
+    <strong>PostgreSQL Documentation — GSSAPI Authentication:</strong>
+    <a href="https://www.postgresql.org/docs/current/gssapi-auth.html" target="_blank">postgresql.org/docs/current/gssapi-auth.html</a>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+    <p>Answer from memory. Then read the explanation.</p>
+
+    <div class="quiz"
+         data-question="Which auth_scheme value from sys.dm_exec_connections indicates a successful Kerberos connection from a remote SQL Server client?"
+         data-correct="B"
+         data-feedback-correct="Correct. auth_scheme = KERBEROS is the proof that SQL Server accepted a Kerberos service ticket. NTLM means fallback."
+         data-feedback-wrong="Not quite. The correct answer is B: KERBEROS. The other values indicate fallback, SSPI negotiation, or a local connection that may not reflect the SPN state.">
+      <div class="quiz-option" data-key="A">NTLM</div>
+      <div class="quiz-option" data-key="B">KERBEROS</div>
+      <div class="quiz-option" data-key="C">Windows</div>
+      <div class="quiz-option" data-key="D">SQL</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which client connection name will reliably use Kerberos for both SQL Server and PostgreSQL?"
+         data-correct="A"
+         data-feedback-correct="Correct. Kerberos requires a name registered in AD. FQDN is the only reliable choice. IP addresses, localhost, and NetBIOS names typically force fallback or fail."
+         data-feedback-wrong="Not quite. The correct answer is A: the FQDN. Kerberos SPNs and keytab principals are registered against DNS names, not IP addresses or short names.">
+      <div class="quiz-option" data-key="A">The FQDN of the database server</div>
+      <div class="quiz-option" data-key="B">The IP address of the database server</div>
+      <div class="quiz-option" data-key="C">localhost or 127.0.0.1</div>
+      <div class="quiz-option" data-key="D">The NetBIOS short name</div>
+    </div>
+
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <h2>Exercises</h2>
+  <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.8em;">
+    Three short exercises. Read the problem, write or select your answer, then open the solution. No live AD environment required.
+  </p>
+
+  <div id="ex-viewer" style="border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+    <div style="display:flex; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="ex-tab ex-tab-active" data-ex="01-identify-keytab">01 — Keytab vs. SPN</button>
+      <button class="ex-tab" data-ex="02-write-sql-spn">02 — Write a SQL SPN</button>
+      <button class="ex-tab" data-ex="03-write-pg-hba">03 — PostgreSQL pg_hba line</button>
+    </div>
+    <div id="ex-desc" style="padding: 0.6em 1em; background: #fffdf5; border-bottom: 1px solid var(--border); font-size: 0.82rem; color: var(--muted);"></div>
+    <div style="display:flex; align-items:center; gap:0.5em; padding: 0.5em 1em; border-bottom: 1px solid var(--border); background: var(--code-bg);">
+      <button class="file-toggle file-toggle-active" data-file="problem" style="font-size:0.8rem;">problem.txt</button>
+      <button class="file-toggle" data-file="solution" style="font-size:0.8rem;">solution.txt</button>
+      <span id="ex-copy-btn" style="margin-left:auto; cursor:pointer; font-size:0.78rem; color: var(--muted); user-select:none;" title="Copy to clipboard">⎘ copy</span>
+    </div>
+    <div style="position:relative; max-height: 520px; overflow-y: auto;">
+      <pre id="ex-code" style="margin:0; padding: 1em 1.2em; font-size: 0.8rem; line-height: 1.6; background: #1e1e2e; color: #cdd6f4; overflow-x: auto; white-space: pre;"><code id="ex-code-inner">Loading…</code></pre>
+    </div>
+    <div id="ex-status" style="padding: 0.4em 1em; background: var(--code-bg); border-top: 1px solid var(--border); font-size: 0.76rem; color: var(--muted);"></div>
+  </div>
+
+  <style>
+    .ex-tab { flex: 1; padding: 0.65em 0.5em; font-size: 0.8rem; font-weight: 600; border: none; border-right: 1px solid var(--border); background: transparent; cursor: pointer; color: var(--muted); transition: background 0.1s; }
+    .ex-tab:last-child { border-right: none; }
+    .ex-tab:hover { background: #eee; color: var(--text); }
+    .ex-tab-active { background: #fff; color: var(--accent); border-bottom: 2px solid var(--accent); }
+    .file-toggle { padding: 0.3em 0.8em; font-size: 0.8rem; font-weight: 600; border: 1px solid var(--border); border-radius: 4px; background: transparent; cursor: pointer; color: var(--muted); }
+    .file-toggle:hover { background: #e8f0fe; color: var(--accent); }
+    .file-toggle-active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  </style>
+
+  <script>
+  (function () {
+    const BASE = '../exercises/lesson-01-kerberos-basics/';
+    const descriptions = {
+      '01-identify-keytab': 'Given a scenario, identify whether SQL Server needs an SPN or PostgreSQL needs a keytab entry.',
+      '02-write-sql-spn': 'Write the correct setspn command for a named SQL Server instance listening on a static port.',
+      '03-write-pg-hba': 'Write the correct pg_hba.conf line that enables Kerberos (gss) for the app subnet over TLS.',
+    };
+
+    let currentEx = '01-identify-keytab';
+    let currentFile = 'problem';
+
+    function setStatus(msg) { document.getElementById('ex-status').textContent = msg; }
+
+    function actualFile() { return currentFile; }
+
+    async function loadFile() {
+      const path = `${BASE}${currentEx}/${actualFile()}.txt`;
+      setStatus(`Loading ${path}…`);
+      try {
+        const r = await fetch(path);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        document.getElementById('ex-code-inner').textContent = text;
+        setStatus(`${path} · ${text.split('\n').length} lines · ${(text.length / 1024).toFixed(1)} KB`);
+      } catch (e) {
+        document.getElementById('ex-code-inner').textContent = `Could not load file: ${e.message}\n\nIf opening from file://, serve via:\n  python3 -m http.server 8000\nthen open http://localhost:8000/lessons/0001-what-kerberos-means-for-sql-server-and-postgresql.html`;
+        setStatus('Error loading file — see note above');
+      }
+    }
+
+    document.querySelectorAll('.ex-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.ex-tab').forEach(b => b.classList.remove('ex-tab-active'));
+        btn.classList.add('ex-tab-active');
+        currentEx = btn.dataset.ex;
+        currentFile = 'problem';
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        document.querySelector('.file-toggle[data-file="problem"]').classList.add('file-toggle-active');
+        document.getElementById('ex-desc').textContent = descriptions[currentEx] || '';
+        loadFile();
+      });
+    });
+
+    document.querySelectorAll('.file-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.file-toggle').forEach(b => b.classList.remove('file-toggle-active'));
+        btn.classList.add('file-toggle-active');
+        currentFile = btn.dataset.file;
+        loadFile();
+      });
+    });
+
+    document.getElementById('ex-copy-btn').addEventListener('click', () => {
+      const text = document.getElementById('ex-code-inner').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('ex-copy-btn');
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = '⎘ copy'; }, 1500);
+      });
+    });
+
+    document.getElementById('ex-desc').textContent = descriptions[currentEx];
+    loadFile();
+  })();
+  </script>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "How is a PostgreSQL keytab different from an SPN?", "Why does my local SQL Server connection show NTLM even after I registered the SPN?", or "Do I need a separate SPN for the Always On listener and each replica?"
+  </div>
+
+  <div class="lesson-nav">
+    <span style="color: var(--muted); font-size: 0.85rem;">&#8592; No previous lesson</span>
+    <a href="0002-gmsa-and-spn-registration.html">Lesson 2: gMSA and SPN Registration &#8594;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 6: PostgreSQL Keytab Setup and Verification</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 6</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~30 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>PostgreSQL Keytab Setup and Verification</h1>
+
+  <p>SQL Server stores its service key in the account secret managed by AD. PostgreSQL on Linux has no LSA, so it keeps its service key in a keytab file. This lesson walks through creating the principal, exporting the keytab, wiring it into PostgreSQL, and proving that GSSAPI authentication is working.</p>
+
+  <h2>1. The Keytab Is the PostgreSQL SPN</h2>
+
+  <p>For SQL Server, the KDC looks up an SPN registered in AD. For PostgreSQL, the server itself looks up the principal in its keytab. The client and the server must agree on the same principal name, and that name must match the FQDN the client used to connect.</p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>SQL Server</th><th>PostgreSQL</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Service identity lives in</td><td>AD <code>servicePrincipalName</code> attribute</td><td>Keytab file on the server host</td></tr>
+      <tr><td>Client target</td><td><code>MSSQLSvc/FQDN:port</code></td><td><code>postgres/FQDN@REALM</code></td></tr>
+      <tr><td>Server proves identity with</td><td>AD-managed service account secret</td><td>Long-term key read from keytab</td></tr>
+      <tr><td>Common verification</td><td><code>setspn -L</code> + DMV</td><td><code>klist -k</code> + PostgreSQL log</td></tr>
+    </tbody>
+  </table>
+
+  <h2>2. Create the AD Principal and Keytab</h2>
+
+  <p>On a domain-joined Windows machine with domain-admin rights, create a user or gMSA mapped to the PostgreSQL service principal, then export the keytab.</p>
+
+  <pre><code><span class="cm"># Create a dedicated AD user for the PostgreSQL host (one per server is cleanest)</span>
+New-ADUser -Name pgdb01 -SamAccountName pgdb01 -UserPrincipalName pgdb01@corp.local `
+  -AccountPassword (Read-Host -AsSecureString "Password") -Enabled $true
+
+<span class="cm"># Export a keytab for the postgres principal using ktpass</span>
+ktpass /princ postgres/pg01.corp.local@CORP.LOCAL `
+       /mapuser CORP\pgdb01 `
+       /crypto AES256-SHA1 `
+       /ptype KRB5_NT_SRV_HST `
+       /out c:\postgres.keytab `
+       -SetPass +rndPass</code></pre>
+
+  <div class="callout warning">
+    <div class="label">Trap</div>
+    <p>The <code>-SetPass +rndPass</code> option randomizes the AD password and writes the current key into the keytab. If you reset the AD password later without re-exporting the keytab, authentication breaks. Treat the keytab and the AD account password as one object.</p>
+  </div>
+
+  <p>After moving the keytab to the PostgreSQL server, inspect it:</p>
+
+  <pre><code><span class="cm"># List principals in the keytab</span>
+klist -k /etc/postgresql/16/main/postgres.keytab
+
+<span class="cm"># Expected output includes a line like:</span>
+<span class="cm">#    1  postgres/pg01.corp.local@CORP.LOCAL</span></code></pre>
+
+  <h2>3. Configure the PostgreSQL Server</h2>
+
+  <p>PostgreSQL needs two things: the path to the keytab and the right <code>pg_hba.conf</code> line.</p>
+
+  <p>Set the environment variable before the postmaster starts. On systemd systems, use a drop-in file:</p>
+
+  <pre><code><span class="cm"># /etc/systemd/system/postgresql@16-main.service.d/kerberos.conf</span>
+[Service]
+Environment=KRB5_KTNAME=/etc/postgresql/16/main/postgres.keytab</code></pre>
+
+  <p>Reload systemd and restart PostgreSQL so it reads the variable:</p>
+
+  <pre><code><span class="nm">sudo</span> systemctl daemon-reload
+<span class="nm">sudo</span> systemctl restart postgresql@16-main</code></pre>
+
+  <p>Then add the <code>pg_hba.conf</code> entry. Use <code>hostssl</code> because <code>gss</code> authenticates but does not encrypt:</p>
+
+  <pre><code><span class="cm"># /etc/postgresql/16/main/pg_hba.conf</span>
+<span class="nm">hostssl</span>  appdb  +app_users  10.0.1.0/24  <span class="fn">gss</span>  map=domain2pg</code></pre>
+
+  <p>If Active Directory usernames differ from PostgreSQL role names, add a map in <code>pg_ident.conf</code>:</p>
+
+  <pre><code><span class="cm"># /etc/postgresql/16/main/pg_ident.conf</span>
+<span class="cm"># mapname    system-username      database-username</span>
+domain2pg    /^(.*)@CORP\.LOCAL$   \1</code></pre>
+
+  <p>Reload the configuration:</p>
+
+  <pre><code><span class="kw">SELECT</span> pg_reload_conf();</code></pre>
+
+  <div class="callout pg">
+    <div class="label">PostgreSQL Note</div>
+    <p>The keytab file must be readable by the <code>postgres</code> OS user and no one else. A common mistake is copying it with <code>root:root</code> permissions. Use <code>chown postgres:postgres</code> and <code>chmod 600</code>.</p>
+  </div>
+
+  <h2>4. Verify the Connection</h2>
+
+  <p>From a domain-joined client with a Kerberos ticket, connect by FQDN:</p>
+
+  <pre><code><span class="cm"># Acquire a ticket first if you do not have one</span>
+kinit alice@CORP.LOCAL
+
+<span class="cm"># Connect by FQDN; psql will use GSSAPI automatically</span>
+psql "host=pg01.corp.local dbname=appdb user=alice sslmode=require"</code></pre>
+
+  <p>Confirm on the server side from the PostgreSQL log:</p>
+
+  <pre><code><span class="cm"># A successful GSSAPI connection logs something like:</span>
+LOG:  connection authorized: user=alice database=appdb</code></pre>
+
+  <p>You can also request the ticket before connecting to prove the principal is resolvable:</p>
+
+  <pre><code><span class="cm"># Ask the KDC for a ticket for the PostgreSQL principal</span>
+kvno postgres/pg01.corp.local@CORP.LOCAL</code></pre>
+
+  <p>If <code>kvno</code> succeeds but <code>psql</code> fails, the problem is on the PostgreSQL server side: keytab path, permissions, <code>pg_hba.conf</code>, or principal name mismatch.</p>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>The principal in the keytab must exactly match what the client requests. If the client connects to <code>pg01</code> while the keytab contains <code>postgres/pg01.corp.local@CORP.LOCAL</code>, GSSAPI will fail. Standardize on FQDN everywhere.</p>
+  </div>
+
+  <h2>5. Quick Troubleshooting Map</h2>
+
+  <table>
+    <thead>
+      <tr><th>Symptom</th><th>Most likely cause</th><th>Check</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>kvno</code> fails</td><td>AD principal missing or DNS wrong</td><td>AD user/gMSA and FQDN</td></tr>
+      <tr><td><code>psql</code> asks for password</td><td>Client did not offer GSSAPI ticket</td><td><code>klist</code> on client, FQDN in connection string</td></tr>
+      <tr><td><code>GSSAPI authentication failed</code></td><td>Keytab mismatch or permissions</td><td><code>klist -k</code>, file owner, <code>pg_hba.conf</code></td></tr>
+      <tr><td><code>role "alice@CORP.LOCAL" does not exist</code></td><td>Username map missing or wrong</td><td><code>pg_ident.conf</code>, map name in pg_hba</td></tr>
+    </tbody>
+  </table>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>PostgreSQL Documentation — GSSAPI Authentication:</strong>
+    <a href="https://www.postgresql.org/docs/current/gssapi-auth.html" target="_blank">postgresql.org/docs/current/gssapi-auth.html</a><br><br>
+    <strong>Microsoft Learn — Manage Group Managed Service Accounts:</strong>
+    <a href="https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/manage-group-managed-service-accounts" target="_blank">learn.microsoft.com/.../manage-group-managed-service-accounts</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="Which environment variable tells PostgreSQL where to find its Kerberos keytab?"
+         data-correct="B"
+         data-feedback-correct="Correct. KRB5_KTNAME is the standard environment variable that points PostgreSQL to the keytab file before the postmaster starts."
+         data-feedback-wrong="Not quite. The correct answer is B: KRB5_KTNAME. PGKRBTGT and KRB5CCNAME are not the right variables for the service keytab.">
+      <div class="quiz-option" data-key="A">PGKRBTGT</div>
+      <div class="quiz-option" data-key="B">KRB5_KTNAME</div>
+      <div class="quiz-option" data-key="C">KRB5CCNAME</div>
+      <div class="quiz-option" data-key="D">PGGSSAPIKEY</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Why should the pg_hba.conf line for GSSAPI authentication use hostssl instead of host?"
+         data-correct="C"
+         data-feedback-correct="Correct. The gss method only authenticates. hostssl requires TLS so data in transit is encrypted. Authentication without transport encryption is not enough."
+         data-feedback-wrong="Not quite. The correct answer is C: because gss authenticates but does not encrypt the connection. hostssl provides the encryption layer that gss lacks.">
+      <div class="quiz-option" data-key="A">Because hostssl disables password prompts</div>
+      <div class="quiz-option" data-key="B">Because Kerberos tickets cannot pass over a plain TCP socket</div>
+      <div class="quiz-option" data-key="C">Because gss authenticates but does not encrypt traffic</div>
+      <div class="quiz-option" data-key="D">Because host is deprecated in PostgreSQL 16</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What command proves the KDC can issue a ticket for the PostgreSQL principal before you even open psql?"
+         data-correct="A"
+         data-feedback-correct="Correct. kvno requests a service ticket for the principal and shows its KVNO. If it succeeds, AD and DNS are correct; the remaining problem is on the PostgreSQL server side."
+         data-feedback-wrong="Not quite. The correct answer is A: kvno. It asks the KDC for a ticket for postgres/FQDN@REALM, isolating the AD side from the PostgreSQL server configuration.">
+      <div class="quiz-option" data-key="A">kvno postgres/pg01.corp.local@CORP.LOCAL</div>
+      <div class="quiz-option" data-key="B">setspn -L postgres/pg01.corp.local</div>
+      <div class="quiz-option" data-key="C">kinit postgres/pg01.corp.local@CORP.LOCAL</div>
+      <div class="quiz-option" data-key="D">pg_ctl reload</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "Can I use a gMSA for PostgreSQL instead of a regular AD user?", "What happens if I change the AD password without re-exporting the keytab?", or "How do I map domain groups to PostgreSQL roles with pg_ident.conf?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0005-linked-server-double-hop.html">&larr; Lesson 5: Linked Server Double-Hop and Delegation</a>
+    <a href="0007-detecting-ntlm-fallback-and-change-impact.html">Lesson 7: Detecting Silent NTLM Fallback and Change Impact &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

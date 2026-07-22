@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 4: SSRS, SSAS, and Power BI Kerberos</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 4</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~25 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>SSRS, SSAS, and Power BI Kerberos</h1>
+
+  <p>The Database Engine is only part of the estate. Reporting Services, Analysis Services, and Power BI also authenticate through Windows integrated security, and each needs the right SPN or gateway configuration. This lesson covers the SPN shapes and service settings that keep them on Kerberos instead of NTLM.</p>
+
+  <h2>1. Reporting Services Needs an HTTP SPN</h2>
+
+  <p>SQL Server Reporting Services runs as a web application. Clients connect to a URL, so the service class is <code>HTTP</code>, not <code>MSSQLSvc</code>. The SPN belongs on the account running the Report Server service — a gMSA, a domain user, or the computer account if it runs as NETWORK SERVICE.</p>
+
+  <pre><code><span class="cm"># SSRS on the default web site, FQDN reports.corp.local, default port 80</span>
+setspn -S HTTP/reports.corp.local CORP\ssrs$
+
+<span class="cm"># If you also accept connections by NetBIOS short name, add it sparingly</span>
+setspn -S HTTP/reports CORP\ssrs$</code></pre>
+
+  <p>The Report Server <code>rsreportserver.config</code> controls which authentication types are advertised:</p>
+
+  <pre><code><span class="kw">&lt;AuthenticationTypes&gt;</span>
+  <span class="kw">&lt;RSWindowsNegotiate/&gt;</span>
+  <span class="kw">&lt;RSWindowsKerberos/&gt;</span>
+  <span class="kw">&lt;RSWindowsNTLM/&gt;</span>
+<span class="kw">&lt;/AuthenticationTypes&gt;</span></code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Setting</th><th>Behavior</th><th>When to use it</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>RSWindowsNegotiate</code></td><td>SSPI picks Kerberos if an SPN exists, otherwise NTLM.</td><td>Default. Allows graceful fallback during migration.</td></tr>
+      <tr><td><code>RSWindowsKerberos</code></td><td>Kerberos only.</td><td>After migration, to block silent NTLM fallback.</td></tr>
+      <tr><td><code>RSWindowsNTLM</code></td><td>NTLM only.</td><td>Remove after migration.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">Trap</div>
+    <p>If the HTTP SPN is missing or registered on the wrong account, browsers will silently fall back to NTLM and SSRS will work — until your organization disables NTLMv2. Verify the scheme by inspecting the <code>Authorization</code> header in a network trace or by temporarily forcing <code>RSWindowsKerberos</code> and confirming access still works.</p>
+  </div>
+
+  <h2>2. Analysis Services Uses MSOLAPSvc.3</h2>
+
+  <p>Analysis Services has its own service class. The SPN format is <code>MSOLAPSvc.3/FQDN[:instance]</code>. The <code>.3</code> corresponds to the SSAS version lineage; do not shorten it to <code>MSOLAPSvc</code> alone.</p>
+
+  <pre><code><span class="cm"># SSAS default instance on ssas01.corp.local</span>
+setspn -S MSOLAPSvc.3/ssas01.corp.local CORP\ssas$
+
+<span class="cm"># SSAS named instance TABULAR on the same host</span>
+setspn -S MSOLAPSvc.3/ssas01.corp.local:TABULAR CORP\ssas$</code></pre>
+
+  <p>Clients such as Excel or Power BI Desktop connect to <code>ssas01.corp.local</code> or <code>ssas01.corp.local\TABULAR</code>. The same FQDN rule applies: IP addresses and short names will fall back or fail.</p>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>If SSAS runs on a failover cluster, register the SPN on the shared service account or gMSA, not on individual computer objects. The virtual network name needs its own SPN just like an Always On listener.</p>
+  </div>
+
+  <h2>3. Power BI and the Double-Hop Problem</h2>
+
+  <p>Power BI has two common Kerberos touch points:</p>
+  <ul>
+    <li><strong>Power BI Desktop</strong> connecting directly to SSAS or SQL Server — this is a single hop from the analyst's machine to the data source. Just ensure the data source SPN is correct.</li>
+    <li><strong>Power BI Report Server or the on-premises data gateway</strong> refreshing reports or answering DirectQuery requests — this is often a double hop: user → gateway/service → data source. It needs delegation.</li>
+  </ul>
+
+  <p>For the gateway scenario, the service account that runs the gateway or Power BI Report Server must be trusted for constrained delegation to the target SPNs:</p>
+
+  <pre><code><span class="cm"># Delegation targets the gateway service account must be allowed to present tickets for</span>
+MSSQLSvc/sql01.corp.local:1433
+MSOLAPSvc.3/ssas01.corp.local</code></pre>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>Constrained delegation says: "The gateway service account is allowed to forward a user's Kerberos ticket to these specific downstream services." Without it, the second hop falls back to NTLM or fails entirely when NTLM is disabled.</p>
+  </div>
+
+  <h2>4. A Common Verification Pattern</h2>
+
+  <p>For every service, the verification chain is the same:</p>
+  <ol>
+    <li>Confirm the SPN is registered on the account running the service.</li>
+    <li>Confirm the client connects by FQDN.</li>
+    <li>Confirm no duplicate SPN exists with <code>setspn -X</code>.</li>
+    <li>Temporarily force Kerberos-only in the service config; confirm access still works.</li>
+    <li>Audit connections for NTLM fallback before removing the fallback option.</li>
+  </ol>
+
+  <table>
+    <thead>
+      <tr><th>Service</th><th>Service class</th><th>Config file / location</th><th>Fallback control</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Database Engine</td><td><code>MSSQLSvc</code></td><td>SQL Server Configuration Manager</td><td>SQL Server does not expose a Kerberos-only switch; audit <code>sys.dm_exec_connections</code></td></tr>
+      <tr><td>Reporting Services</td><td><code>HTTP</code></td><td><code>rsreportserver.config</code></td><td><code>RSWindowsKerberos</code> removes NTLM</td></tr>
+      <tr><td>Analysis Services</td><td><code>MSOLAPSvc.3</code></td><td>SSAS service account</td><td>Audit client connections and network traces</td></tr>
+      <tr><td>Power BI Gateway</td><td><code>MSSQLSvc</code> / <code>MSOLAPSvc.3</code></td><td>Gateway service account + AD delegation</td><td>Gateway Kerberos advanced settings</td></tr>
+    </tbody>
+  </table>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Register a Service Principal Name (SPN) for a report server:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/reporting-services/report-server/register-a-service-principal-name-spn-for-a-report-server?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../register-a-service-principal-name-spn-for-a-report-server</a><br><br>
+    <strong>Microsoft Learn — Configure Windows authentication on the report server:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/reporting-services/security/configure-windows-authentication-on-the-report-server?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../configure-windows-authentication-on-the-report-server</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="What is the correct service class for a Reporting Services SPN?"
+         data-correct="B"
+         data-feedback-correct="Correct. SSRS is a web application, so the SPN uses the HTTP service class. MSSQLSvc is for the Database Engine and MSOLAPSvc.3 is for Analysis Services."
+         data-feedback-wrong="Not quite. The correct answer is B: HTTP. Reporting Services listens over HTTP/HTTPS, so its SPN class is HTTP, not MSSQLSvc or MSOLAPSvc.3.">
+      <div class="quiz-option" data-key="A">MSSQLSvc</div>
+      <div class="quiz-option" data-key="B">HTTP</div>
+      <div class="quiz-option" data-key="C">MSOLAPSvc.3</div>
+      <div class="quiz-option" data-key="D">HOST</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which SSRS authentication setting forces Kerberos and removes the NTLM fallback path?"
+         data-correct="C"
+         data-feedback-correct="Correct. RSWindowsKerberos tells SSRS to accept only Kerberos tickets. RSWindowsNegotiate allows fallback, and RSWindowsNTLM is the fallback itself."
+         data-feedback-wrong="Not quite. The correct answer is C: RSWindowsKerberos. RSWindowsNegotiate lets SSPI fall back to NTLM, while RSWindowsNTLM is NTLM only.">
+      <div class="quiz-option" data-key="A">RSWindowsNegotiate</div>
+      <div class="quiz-option" data-key="B">RSWindowsNTLM</div>
+      <div class="quiz-option" data-key="C">RSWindowsKerberos</div>
+      <div class="quiz-option" data-key="D">RSWindowsBasic</div>
+    </div>
+
+    <div class="quiz"
+         data-question="A Power BI on-premises data gateway refreshes a report that queries SQL Server. What must the gateway service account be allowed to do?"
+         data-correct="B"
+         data-feedback-correct="Correct. The gateway must forward the user's ticket to the downstream SQL Server SPN. That is constrained delegation. A correct SPN alone is not enough for the second hop."
+         data-feedback-wrong="Not quite. The correct answer is B: be trusted for constrained delegation to the SQL Server SPN. The gateway is the middle tier in a double-hop; it needs permission to present the user's ticket to the next service.">
+      <div class="quiz-option" data-key="A">Run as a local administrator on the gateway machine</div>
+      <div class="quiz-option" data-key="B">Be trusted for constrained delegation to the SQL Server SPN</div>
+      <div class="quiz-option" data-key="C">Hold membership in the Domain Admins group</div>
+      <div class="quiz-option" data-key="D">Register an HTTP SPN for the gateway URL</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "Do I need separate HTTP SPNs for the SSRS web portal and the web service?", "Can I use one gMSA for SSRS, SSAS, and the Database Engine?", or "How do I verify Kerberos is actually being used by Power BI Desktop?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0003-named-instances-ag-listeners-and-the-1200-spn-limit.html">&larr; Lesson 3: Named Instances, AG Listeners, and the 1200 SPN Limit</a>
+    <a href="0005-linked-server-double-hop.html">Lesson 5: Linked Server Double-Hop and Delegation &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

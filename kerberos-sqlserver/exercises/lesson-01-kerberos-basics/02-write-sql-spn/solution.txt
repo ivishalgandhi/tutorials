@@ -1,0 +1,20 @@
+Solution 02 — Write the correct setspn commands
+
+For TCP connections, register the static port SPN:
+
+  setspn -S MSSQLSvc/sql03.corp.local:51433 CORP\sqlsvc$
+
+For named-pipe and shared-memory paths, register the instance-name SPN:
+
+  setspn -S MSSQLSvc/sql03.corp.local:PRODDB CORP\sqlsvc$
+
+Why both?
+- The SQL Server client driver constructs an SPN based on the connection string.
+- If the connection string uses the port (sql03.corp.local,51433), the driver builds
+  MSSQLSvc/sql03.corp.local:51433.
+- If the connection string uses the instance name (sql03.corp.local\PRODDB) or uses
+  named pipes/shared memory, the driver builds MSSQLSvc/sql03.corp.local:PRODDB.
+
+After running the commands, verify with:
+  setspn -L CORP\sqlsvc$
+  setspn -X

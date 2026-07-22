@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 5: Linked Server Double-Hop and Delegation</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 5</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~30 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Linked Server Double-Hop and Delegation</h1>
+
+  <p>A user runs a query on SQL Server A. That query pulls data from a linked server, SQL Server B. The user's credential must travel from the client to A, then from A to B. This is the double-hop. Kerberos handles it through delegation; NTLM cannot. When it fails, the linked server logs in as <code>ANONYMOUS LOGON</code> and the query fails with login denied.</p>
+
+  <h2>1. The Double-Hop in One Picture</h2>
+
+  <div class="mermaid-diagram">
+    <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant A as SQL Server A
+    participant B as SQL Server B
+    participant K as AD KDC
+
+    C->>K: Give me a ticket for MSSQLSvc/sqlA.corp.local
+    K-->>C: Service ticket for A
+    C->>A: Query + ticket
+    Note over A: Linked server needs data from B
+    A->>K: Delegate this ticket to MSSQLSvc/sqlB.corp.local
+    Note over K: Only allowed if A is trusted for delegation
+    K-->>A: Forwarded ticket for B
+    A->>B: Connect + forwarded ticket
+    B->>B: Verify ticket, check user is authorized
+    B-->>A: Result set
+    </div>
+    <p class="diagram-caption">Figure 1. Double-hop flow. SQL Server A must be trusted to forward the user's ticket to SQL Server B.</p>
+  </div>
+
+  <div class="callout key">
+    <div class="label">Key Concept</div>
+    <p>Delegation is a permission on the <em>middle tier</em> service account, not on the end user or the destination server. It says: "SQL Server A is allowed to reuse the user's Kerberos ticket to talk to SQL Server B."</p>
+  </div>
+
+  <h2>2. Constrained Delegation: The Modern Default</h2>
+
+  <p>There are two practical ways to configure delegation today:</p>
+  <ul>
+    <li><strong>Kerberos constrained delegation (KCD)</strong> — classic, configured in Active Directory Users and Computers on the middle-tier account. You list the exact SPNs the account may delegate to.</li>
+    <li><strong>Resource-based constrained delegation (RBCD)</strong> — configured on the destination account. The destination says: "I trust SQL Server A's account to delegate users to me." This does not require Domain Admin privileges on the middle-tier account object.</li>
+  </ul>
+
+  <pre><code><span class="cm"># Example SPNs to allow SQL Server A's gMSA to delegate to</span>
+MSSQLSvc/sqlB.corp.local:1433
+MSSQLSvc/sqlB.corp.local
+
+<span class="cm"># With RBCD, on sqlB's account or gMSA you set msDS-AllowedToActOnBehalfOfOtherIdentity</span>
+<span class="cm"># to include CORP\sqlA$</span></code></pre>
+
+  <div class="callout warning">
+    <div class="label">Trap</div>
+    <p>Unconstrained delegation allows the middle tier to forward tickets to <em>any</em> service. Avoid it. Use constrained delegation or resource-based constrained delegation, and list only the SPNs your linked servers actually need.</p>
+  </div>
+
+  <h2>3. The Linked Server SPN Checklist</h2>
+
+  <p>When a double-hop fails, every SPN in the chain must be correct. Work backwards from the error:</p>
+
+  <table>
+    <thead>
+      <tr><th>Check</th><th>Command / location</th><th>Failure symptom</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Client can get a ticket for A</td><td><code>klist</code> on the client; <code>setspn -L CORP\sqlA$</code></td><td>Client connection to A already falls back to NTLM.</td></tr>
+      <tr><td>A can get a ticket for B</td><td><code>klist</code> on A; <code>setspn -L CORP\sqlB$</code></td><td>Linked server query returns login failed for ANONYMOUS LOGON.</td></tr>
+      <tr><td>A is trusted for delegation to B</td><td>ADUC Delegation tab or PowerShell RBCD check</td><td>Ticket forwarding is rejected by the KDC; connection falls back to NTLM.</td></tr>
+      <tr><td>SPNs are unique in the forest</td><td><code>setspn -X</code></td><td>Intermittent failures; sometimes Kerberos, sometimes NTLM.</td></tr>
+      <tr><td>Linked server uses current security context</td><td><code>EXEC sp_helplinkedsrvlogin</code> or SSMS Linked Server Properties</td><td>Query runs under a fixed SQL login instead of the Windows user.</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code><span class="cm">-- On SQL Server A, see how the linked server is mapped</span>
+<span class="kw">EXEC</span> sp_helplinkedsrvlogin @rmtsrvname = N<span class="st">'SQLB'</span>;
+
+<span class="cm">-- On both servers, see the auth_scheme for incoming connections</span>
+<span class="kw">SELECT</span> session_id, net_transport, auth_scheme, client_net_address
+<span class="kw">FROM</span> sys.dm_exec_connections
+<span class="kw">WHERE</span> auth_scheme <span class="kw">IN</span> (<span class="st">'KERBEROS'</span>, <span class="st">'NTLM'</span>);</code></pre>
+
+  <h2>4. PostgreSQL Has No Double-Hop, But the Rule Still Applies</h2>
+
+  <p>PostgreSQL does not host linked servers the way SQL Server does. A PostgreSQL query cannot natively forward a user's identity to a second PostgreSQL server. However, a SQL Server linked server that points to PostgreSQL via the PostgreSQL ODBC driver <em>can</em> double-hop: client → SQL Server A → PostgreSQL. The same delegation rules apply to SQL Server A's service account.</p>
+
+  <div class="callout pg">
+    <div class="label">PostgreSQL Note</div>
+    <p>For SQL Server → PostgreSQL double-hop, the PostgreSQL side only needs a valid keytab and <code>pg_hba.conf</code> entry for the SQL Server's Windows principal. The SQL Server side needs the SPN for PostgreSQL registered or delegated. Most teams instead run the linked server under a fixed remote credential to avoid Kerberos delegation to PostgreSQL.</p>
+  </div>
+
+  <h2>5. Fixing the Intermittent Case</h2>
+
+  <p>The most frustrating double-hop bug is intermittent <code>ANONYMOUS LOGON</code>. It often happens after a Kerberos ticket expires and the middle tier tries to reuse a stale service ticket. The fix is usually:</p>
+  <ol>
+    <li>Confirm all SPNs in the chain are registered and unique.</li>
+    <li>Purge tickets on the middle tier with <code>klist purge</code>.</li>
+    <li>Confirm constrained delegation covers every SPN form the client may request.</li>
+    <li>Restart the middle-tier SQL Server service only if the service account itself changed.</li>
+  </ol>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Linked Servers (Database Engine):</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/relational-databases/linked-servers/linked-servers-database-engine?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../linked-servers-database-engine</a><br><br>
+    <strong>Microsoft TechCommunity — Intermittent ANONYMOUS LOGON of SQL Server linked server double hop:</strong>
+    <a href="https://techcommunity.microsoft.com/blog/sqlserversupport/intermittent-anonymous-logon-of-sql-server-linked-server-double-hop/3694876" target="_blank">techcommunity.microsoft.com/.../intermittent-anonymous-logon-of-sql-server-linked-server-double-hop</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="In a linked-server double-hop, where must delegation be configured?"
+         data-correct="B"
+         data-feedback-correct="Correct. Delegation is a permission on the middle-tier service account — the SQL Server that receives the first connection and forwards it to the next hop."
+         data-feedback-wrong="Not quite. The correct answer is B: on the SQL Server A service account. The middle tier must be trusted to forward the user's ticket to the destination.">
+      <div class="quiz-option" data-key="A">On the client's user account in Active Directory</div>
+      <div class="quiz-option" data-key="B">On the SQL Server A service account</div>
+      <div class="quiz-option" data-key="C">On the destination SQL Server B service account</div>
+      <div class="quiz-option" data-key="D">In the SQL Server linked server login mapping</div>
+    </div>
+
+    <div class="quiz"
+         data-question="What is the classic symptom of a failed double-hop when Kerberos delegation is missing?"
+         data-correct="C"
+         data-feedback-correct="Correct. ANONYMOUS LOGON means the forwarded credential was stripped or never obtained, so SQL Server B rejects the connection."
+         data-feedback-wrong="Not quite. The correct answer is C: login failed for ANONYMOUS LOGON. That message tells you the second hop lost the user's identity and fell back to an anonymous context.">
+      <div class="quiz-option" data-key="A">The client receives a certificate warning</div>
+      <div class="quiz-option" data-key="B">The query returns wrong data for the linked server</div>
+      <div class="quiz-option" data-key="C">Login failed for ANONYMOUS LOGON</div>
+      <div class="quiz-option" data-key="D">The linked server catalog cannot be enumerated</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which delegation style lets the destination service control which middle-tier accounts may forward users to it?"
+         data-correct="D"
+         data-feedback-correct="Correct. Resource-based constrained delegation is configured on the destination account. It removes the need for Domain Admin rights on the middle-tier account object."
+         data-feedback-wrong="Not quite. The correct answer is D: resource-based constrained delegation. In RBCD, the destination service's AD object lists the allowed middle-tier accounts, rather than the middle-tier account listing destinations.">
+      <div class="quiz-option" data-key="A">Unconstrained delegation</div>
+      <div class="quiz-option" data-key="B">Protocol transition</div>
+      <div class="quiz-option" data-key="C">Kerberos constrained delegation (KCD)</div>
+      <div class="quiz-option" data-key="D">Resource-based constrained delegation (RBCD)</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "How do I configure resource-based constrained delegation with PowerShell?", "Why does my double-hop fail only after 10 hours?", or "Should I use a fixed SQL login for linked servers to avoid delegation entirely?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0004-ssrs-ssas-and-power-bi-kerberos.html">&larr; Lesson 4: SSRS, SSAS, and Power BI Kerberos</a>
+    <a href="0006-postgresql-keytab-setup-and-verification.html">Lesson 6: PostgreSQL Keytab Setup and Verification &rarr;</a>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

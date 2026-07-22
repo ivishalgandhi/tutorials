@@ -1,0 +1,29 @@
+Solution 01 — Identify the right Kerberos identity type
+
+Scenario A — SQL Server
+The identity object to verify is the gMSA (the account running the SQL Server service).
+SPNs are registered on that account, not on the computer object (unless SQL runs as
+NETWORK SERVICE/LOCAL SYSTEM).
+
+Command:
+  setspn -L CORP\sqlsvc$
+
+Also verify there is a matching SPN for the FQDN and port:
+  MSSQLSvc/sql01.corp.local:1433
+  MSSQLSvc/sql01.corp.local
+
+If those SPNs are missing or point to a different account, Kerberos will fail or fall
+back to NTLM.
+
+Scenario B — PostgreSQL
+The file to verify is the PostgreSQL keytab file, pointed to by KRB5_KTNAME (commonly
+/etc/postgresql/16/main/postgres.keytab).
+
+Command to list the principals it contains:
+  klist -k /etc/postgresql/16/main/postgres.keytab
+
+You should see a principal matching the client's target host, such as:
+  postgres/pg01.corp.local@CORP.LOCAL
+
+If the keytab is missing, has wrong permissions, or does not contain the exact
+principal the client requests, GSSAPI authentication fails.

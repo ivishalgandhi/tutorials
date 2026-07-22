@@ -1,0 +1,12 @@
+Exercise 03 — Write the correct PostgreSQL pg_hba.conf line
+
+You are enabling Kerberos authentication for an application subnet 10.0.1.0/24 on a
+PostgreSQL 16 instance. Requirements:
+
+- Only database appdb should accept these connections.
+- All members of the PostgreSQL group role app_users may connect.
+- Connections must use TLS.
+- Authentication must use GSSAPI (Kerberos).
+- The mapping name is domain2pg, in case AD usernames differ from PostgreSQL role names.
+
+Write a single pg_hba.conf line that satisfies all of these requirements.

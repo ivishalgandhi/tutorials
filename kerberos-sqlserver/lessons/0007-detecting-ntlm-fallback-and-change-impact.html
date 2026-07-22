@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 7: Detecting Silent NTLM Fallback and Change Impact</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+<div class="page">
+
+  <div class="lesson-meta">
+    <span class="tag">Lesson 7</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>~25 min</span>
+    <span><a href="../reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+    <span><a href="../index.html">Course Index</a></span>
+  </div>
+
+  <h1>Detecting Silent NTLM Fallback and Change Impact</h1>
+
+  <p>After the migration, NTLM fallback is no longer a safety net — it is a silent failure. This lesson shows how to find fallback connections before they break, and how to predict whether an AD, SPN, keytab, or service change will disrupt applications.</p>
+
+  <h2>1. Why Silent NTLM Fallback Is Now a Bug</h2>
+
+  <p>Before the migration, clients that fell back to NTLM still worked. After NTLMv2 is disabled, those same clients will fail outright. The only safe path is to discover and fix every fallback connection while NTLM is still enabled.</p>
+
+  <div class="callout danger">
+    <div class="label">Risk</div>
+    <p>Do not wait for users to report login failures. Audit first, fix the SPNs and connection names, then disable NTLM fallback as a final step.</p>
+  </div>
+
+  <h2>2. Detect NTLM on SQL Server</h2>
+
+  <p>The fastest signal is the Database Engine's own DMV. Query it from every production instance and record the result:</p>
+
+  <pre><code><span class="cm">-- All integrated-security connections and their scheme</span>
+<span class="kw">SELECT</span>
+    @@SERVERNAME <span class="kw">AS</span> server_name,
+    c.session_id,
+    s.login_name,
+    c.client_net_address,
+    c.auth_scheme,
+    c.net_transport,
+    DB_NAME(s.database_id) <span class="kw">AS</span> database_name
+<span class="kw">FROM</span> sys.dm_exec_connections c
+<span class="kw">JOIN</span> sys.dm_exec_sessions s <span class="kw">ON</span> c.session_id = s.session_id
+<span class="kw">WHERE</span> c.auth_scheme <span class="kw">IN</span> (<span class="st">'KERBEROS'</span>, <span class="st">'NTLM'</span>)
+  <span class="kw">AND</span> s.login_name <span class="kw">NOT</span> <span class="kw">LIKE</span> <span class="st">'NT AUTHORITY%'</span>
+<span class="kw">ORDER</span> <span class="kw">BY</span> c.auth_scheme, s.login_name;</code></pre>
+
+  <p>Treat every <code>auth_scheme = NTLM</code> row as a ticket. The ticket needs one of three fixes:</p>
+  <ul>
+    <li>Register the missing SPN.</li>
+    <li>Change the application connection string from IP/short name to FQDN.</li>
+    <li>Fix delegation if it is a double-hop scenario.</li>
+  </ul>
+
+  <h2>3. Detect Non-Kerberos Connections on PostgreSQL</h2>
+
+  <p>PostgreSQL does not expose <code>auth_scheme</code> in a DMV, but the log does. Enable log_connections temporarily during the audit window and grep for the authentication method:</p>
+
+  <pre><code><span class="cm"># /etc/postgresql/16/main/postgresql.conf</span>
+log_connections = on
+
+<span class="cm"># After reload, look for GSSAPI vs password or md5 entries</span>
+<span class="nm">grep</span> -i <span class="st">"connection authorized\|authentication failed\|GSSAPI"</span> /var/log/postgresql/postgresql-16-main.log</code></pre>
+
+  <p>For a programmatic check, inspect <code>pg_stat_activity</code> for clients that should be using Kerberos but are not, and cross-reference with your <code>pg_hba.conf</code> lines. If a subnet is allowed both <code>gss</code> and <code>scram-sha-256</code>, password connections can still slip through.</p>
+
+  <div class="callout pg">
+    <div class="label">PostgreSQL Note</div>
+    <p>The cleanest audit is to put Kerberos-only subnets in a separate <code>pg_hba.conf</code> rule and remove password methods for those sources. Then any password connection attempt is immediately visible as a fallback.</p>
+  </div>
+
+  <h2>4. Change Impact Matrix</h2>
+
+  <p>Use this table before you make a change. It tells you whether existing connections drop, new connections fail, or nothing happens.</p>
+
+  <table>
+    <thead>
+      <tr><th>Change</th><th>SQL Server impact</th><th>PostgreSQL impact</th><th>Needs restart?</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Add or remove an SPN</td><td>New connections use the new path; existing connections stay up.</td><td>N/A — no SPNs in AD.</td><td>No</td></tr>
+      <tr><td>Change SQL Server service account</td><td>Service restart required; all connections drop during restart.</td><td>N/A.</td><td>Yes</td></tr>
+      <tr><td>Change PostgreSQL keytab file</td><td>N/A.</td><td>Reload reads the new path; existing GSSAPI sessions stay up until they close. To pick up a new key, restart.</td><td>Reload or restart</td></tr>
+      <tr><td>Change PostgreSQL service account or keytab password in AD</td><td>N/A.</td><td>Restart required so the new ticket/key is loaded.</td><td>Yes</td></tr>
+      <tr><td>Change delegation settings</td><td>New linked-server connections use new delegation; existing ones may fail at next ticket renewal.</td><td>N/A.</td><td>No</td></tr>
+      <tr><td>Disable NTLM fallback</td><td>Any remaining NTLM-only connection will fail.</td><td>Password fallback methods in pg_hba must be removed first.</td><td>No</td></tr>
+    </tbody>
+  </table>
+
+  <h2>5. Communication Plan</h2>
+
+  <p>Most application teams do not know they connect by IP address or short name. Before you disable NTLM, send them a checklist:</p>
+
+  <ol>
+    <li>Connection strings must use the database server's FQDN.</li>
+    <li>No IP addresses or <code>localhost</code> aliases.</li>
+    <li>Report any linked server, SSRS subscription, or Power BI refresh that uses pass-through authentication.</li>
+    <li>Test in the pre-production environment with NTLM disabled first.</li>
+  </ol>
+
+  <div class="callout info">
+    <div class="label">Practical Tip</div>
+    <p>Run the DMV and log audit weekly during the migration. When the NTLM count hits zero and stays there for two full business cycles, schedule the NTLM disable window.</p>
+  </div>
+
+  <h2>6. Try It</h2>
+
+  <div class="callout info">
+    <div class="label">Your Action</div>
+    <p>Pick your busiest SQL Server instance and run the DMV query above. Export the results to a spreadsheet. Sort by <code>auth_scheme</code>. For every NTLM row, identify whether the fix is an SPN, a connection-string change, or a delegation change. Do the same for one PostgreSQL instance by turning on <code>log_connections</code> for one hour and reviewing the log.</p>
+  </div>
+
+  <div class="primary-source">
+    <div class="ps-label">Primary Sources</div>
+    <strong>Microsoft Learn — Using Kerberos Configuration Manager for SQL Server:</strong>
+    <a href="https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/connect/using-kerberosmngr-sqlserver" target="_blank">learn.microsoft.com/.../using-kerberosmngr-sqlserver</a><br><br>
+    <strong>Microsoft Learn — Register a Service Principal Name for Kerberos Connections:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/register-a-service-principal-name-for-kerberos-connections?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../register-a-service-principal-name-for-kerberos-connections</a>
+  </div>
+
+  <div class="quiz-section">
+    <h2>Quiz — Check Your Understanding</h2>
+
+    <div class="quiz"
+         data-question="You add a missing SPN for a SQL Server instance. Do existing client connections drop?"
+         data-correct="B"
+         data-feedback-correct="Correct. SPN changes only affect new Kerberos ticket requests. Existing connections stay open because the service ticket was already issued and validated."
+         data-feedback-wrong="Not quite. The correct answer is B: no. SPN changes are consumed by the KDC for new tickets, so existing TCP connections continue unaffected.">
+      <div class="quiz-option" data-key="A">Yes, all current connections must re-authenticate</div>
+      <div class="quiz-option" data-key="B">No, only new connections use the new SPN</div>
+      <div class="quiz-option" data-key="C">Yes, but only Windows Authentication connections</div>
+      <div class="quiz-option" data-key="D">Only if the SQL Server service is restarted</div>
+    </div>
+
+    <div class="quiz"
+         data-question="Which DMV column is the authoritative signal that a SQL Server connection is using Kerberos?"
+         data-correct="C"
+         data-feedback-correct="Correct. auth_scheme from sys.dm_exec_connections reports KERBEROS, NTLM, or other values. It is the single best source for auditing fallback."
+         data-feedback-wrong="Not quite. The correct answer is C: auth_scheme in sys.dm_exec_connections. net_transport tells you the network protocol, not the authentication package.">
+      <div class="quiz-option" data-key="A">net_transport in sys.dm_exec_sessions</div>
+      <div class="quiz-option" data-key="B">encrypt_option in sys.dm_exec_connections</div>
+      <div class="quiz-option" data-key="C">auth_scheme in sys.dm_exec_connections</div>
+      <div class="quiz-option" data-key="D">program_name in sys.dm_exec_sessions</div>
+    </div>
+
+    <div class="quiz"
+         data-question="You change the AD password of the account mapped to a PostgreSQL keytab. What must you do next?"
+         data-correct="D"
+         data-feedback-correct="Correct. The keytab contains the old long-term key. You must re-export the keytab after any AD password change, then restart PostgreSQL so it loads the new key."
+         data-feedback-wrong="Not quite. The correct answer is D: re-export the keytab and restart PostgreSQL. A keytab is a snapshot of the account's key; it does not follow AD password rotation automatically.">
+      <div class="quiz-option" data-key="A">Run SELECT pg_reload_conf()</div>
+      <div class="quiz-option" data-key="B">Run kinit on the PostgreSQL server</div>
+      <div class="quiz-option" data-key="C">Update pg_hba.conf and reload</div>
+      <div class="quiz-option" data-key="D">Re-export the keytab and restart PostgreSQL</div>
+    </div>
+
+  </div>
+
+  <div class="teacher-note">
+    <strong>Ask your teacher anything.</strong> For example: "How do I automate the weekly NTLM audit?", "What should I tell application owners about connection-string changes?", or "Can I disable NTLM on just one SQL Server instance to test?"
+  </div>
+
+  <div class="lesson-nav">
+    <a href="0006-postgresql-keytab-setup-and-verification.html">&larr; Lesson 6: PostgreSQL Keytab Setup and Verification</a>
+    <span style="color: var(--muted); font-size: 0.85rem;">No next lesson &#8594;</span>
+  </div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+<script src="../assets/mermaid-init.js"></script>
+</body>
+</html>

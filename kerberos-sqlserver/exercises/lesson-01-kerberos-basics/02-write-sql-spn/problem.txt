@@ -1,0 +1,9 @@
+Exercise 02 — Write the correct setspn commands
+
+You are onboarding a new SQL Server named instance PRODDB on host sql03.corp.local.
+The instance has been set to static TCP port 51433. The service runs under the gMSA
+CORP\sqlsvc$. No SPNs exist yet for this instance.
+
+Write the exact setspn commands you would run to register the SPNs needed for both
+TCP connections and named-pipe/shared-memory connections. Use the -S switch so the
+operation is aborted if the SPN already exists somewhere else in the forest.
