@@ -6,58 +6,217 @@
   <title>Kerberos for SQL Server and PostgreSQL</title>
   <link rel="stylesheet" href="assets/style.css">
   <style>
+    .course-index { max-width: 760px; margin: 0 auto; }
+
+    .section { margin: 2.5rem 0; }
+    .section h2 {
+      font-size: 1.05rem;
+      margin-bottom: 0.8rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    .course-list { list-style: none; padding: 0; display: grid; gap: 0.8rem; }
+    .course-list li a {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      padding: 1rem 1.2rem;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      color: inherit;
+      transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .course-list li a:hover {
+      box-shadow: 0 3px 12px rgba(0,0,0,0.07);
+      border-color: var(--accent);
+    }
+
+    .item-num {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: #fff;
+      background: var(--elephant);
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .item-title  { font-weight: 600; font-size: 0.95rem; }
+    .item-meta   { font-size: 0.82rem; color: var(--muted); margin-top: 0.15rem; }
+
     .back-link {
       display: inline-block;
-      margin: 1.5rem 0 0 1rem;
+      margin-bottom: 1.5rem;
       font-size: 0.85rem;
       color: var(--accent);
       text-decoration: none;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     }
     .back-link:hover { text-decoration: underline; }
+
+    .lede {
+      font-size: 1.05rem;
+      color: var(--muted);
+      margin: 1rem 0 0.5rem;
+    }
   </style>
 </head>
 <body>
-<a class="back-link" href="../index.html">← All Courses</a>
+<div class="page course-index">
 
-<div class="course-index">
+  <a class="back-link" href="../index.html">← All Courses</a>
+
+  <div class="lesson-meta">
+    <span class="tag">Course</span>
+    <span>Kerberos for SQL Server and PostgreSQL</span>
+    <span>7 lessons · ~2.5 hours</span>
+    <span><a href="reference/0001-spn-formats-for-sql-server.html">Reference</a></span>
+  </div>
 
   <h1>Kerberos for SQL Server and PostgreSQL</h1>
   <p class="lede">A practical course for DBAs moving an estate from NTLMv2 to Kerberos.</p>
 
   <div class="section">
     <h2>Start here</h2>
-    <ul>
-      <li><a href="MISSION.md">Mission</a> <span class="meta">— why this course exists and what success looks like</span></li>
-      <li><a href="RESOURCES.md">Resources</a> <span class="meta">— high-trust sources and communities</span></li>
+    <ul class="course-list">
+      <li>
+        <a href="MISSION.md">
+          <span class="item-num">M</span>
+          <div>
+            <span class="item-title">Mission</span>
+            <div class="item-meta">Why this course exists and what success looks like</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="RESOURCES.md">
+          <span class="item-num">R</span>
+          <div>
+            <span class="item-title">Resources</span>
+            <div class="item-meta">High-trust sources and communities</div>
+          </div>
+        </a>
+      </li>
     </ul>
   </div>
 
   <div class="section">
     <h2>Lessons</h2>
-    <ul>
-      <li><a href="lessons/0001-what-kerberos-means-for-sql-server-and-postgresql.html">Lesson 1: What Kerberos Means for SQL Server and PostgreSQL</a> <span class="meta">~25 min</span></li>
-      <li><a href="lessons/0002-gmsa-and-spn-registration.html">Lesson 2: gMSA and SPN Registration</a> <span class="meta">~30 min</span></li>
-      <li><a href="lessons/0003-named-instances-ag-listeners-and-the-1200-spn-limit.html">Lesson 3: Named Instances, AG Listeners, and the 1200 SPN Limit</a> <span class="meta">~25 min</span></li>
-      <li><a href="lessons/0004-ssrs-ssas-and-power-bi-kerberos.html">Lesson 4: SSRS, SSAS, and Power BI Kerberos</a> <span class="meta">~25 min</span></li>
-      <li><a href="lessons/0005-linked-server-double-hop.html">Lesson 5: Linked Server Double-Hop and Delegation</a> <span class="meta">~30 min</span></li>
-      <li><a href="lessons/0006-postgresql-keytab-setup-and-verification.html">Lesson 6: PostgreSQL Keytab Setup and Verification</a> <span class="meta">~30 min</span></li>
-      <li><a href="lessons/0007-detecting-ntlm-fallback-and-change-impact.html">Lesson 7: Detecting Silent NTLM Fallback and Change Impact</a> <span class="meta">~25 min</span></li>
+    <ul class="course-list">
+      <li>
+        <a href="lessons/0001-what-kerberos-means-for-sql-server-and-postgresql.html">
+          <span class="item-num">01</span>
+          <div>
+            <span class="item-title">What Kerberos Means for SQL Server and PostgreSQL</span>
+            <div class="item-meta">Ticket flow · auth_scheme · keytab basics · FQDN rule · ~25 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0002-gmsa-and-spn-registration.html">
+          <span class="item-num">02</span>
+          <div>
+            <span class="item-title">gMSA and SPN Registration</span>
+            <div class="item-meta">Group Managed Service Accounts · setspn · AD permissions · ~30 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0003-named-instances-ag-listeners-and-the-1200-spn-limit.html">
+          <span class="item-num">03</span>
+          <div>
+            <span class="item-title">Named Instances, AG Listeners, and the 1200 SPN Limit</span>
+            <div class="item-meta">Static ports · listeners · FQDN vs IP · SPN ceiling · ~25 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0004-ssrs-ssas-and-power-bi-kerberos.html">
+          <span class="item-num">04</span>
+          <div>
+            <span class="item-title">SSRS, SSAS, and Power BI Kerberos</span>
+            <div class="item-meta">HTTP SPNs · MSOLAPSvc.3 · constrained delegation · ~25 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0005-linked-server-double-hop.html">
+          <span class="item-num">05</span>
+          <div>
+            <span class="item-title">Linked Server Double-Hop and Delegation</span>
+            <div class="item-meta">KCD · RBCD · ANONYMOUS LOGON · intermittent failures · ~30 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0006-postgresql-keytab-setup-and-verification.html">
+          <span class="item-num">06</span>
+          <div>
+            <span class="item-title">PostgreSQL Keytab Setup and Verification</span>
+            <div class="item-meta">ktpass · KRB5_KTNAME · pg_hba.conf · klist · ~30 min</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="lessons/0007-detecting-ntlm-fallback-and-change-impact.html">
+          <span class="item-num">07</span>
+          <div>
+            <span class="item-title">Detecting Silent NTLM Fallback and Change Impact</span>
+            <div class="item-meta">DMV audit · PostgreSQL logs · change impact matrix · ~25 min</div>
+          </div>
+        </a>
+      </li>
     </ul>
   </div>
 
   <div class="section">
     <h2>Reference</h2>
-    <ul>
-      <li><a href="reference/0001-spn-formats-for-sql-server.html">SPN Formats for SQL Server and PostgreSQL Keytabs</a></li>
+    <ul class="course-list">
+      <li>
+        <a href="reference/0001-spn-formats-for-sql-server.html">
+          <span class="item-num">REF</span>
+          <div>
+            <span class="item-title">SPN Formats for SQL Server and PostgreSQL Keytabs</span>
+            <div class="item-meta">Cheatsheet for SPNs, keytab principals, and useful commands</div>
+          </div>
+        </a>
+      </li>
     </ul>
   </div>
 
   <div class="section">
     <h2>Learning records</h2>
-    <ul>
-      <li><a href="learning-records/0001-initial-session.md">0001 — Initial session</a></li>
-      <li><a href="learning-records/0003-lesson-set-completed.md">0003 — Lesson set completed</a></li>
+    <ul class="course-list">
+      <li>
+        <a href="learning-records/0001-initial-session.md">
+          <span class="item-num">LR1</span>
+          <div>
+            <span class="item-title">Initial session</span>
+            <div class="item-meta">Mission established and baseline knowledge</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="learning-records/0002-postgres-and-keytab-scope-added.md">
+          <span class="item-num">LR2</span>
+          <div>
+            <span class="item-title">PostgreSQL and keytab scope added</span>
+            <div class="item-meta">Scope expanded to include PostgreSQL GSSAPI</div>
+          </div>
+        </a>
+      </li>
+      <li>
+        <a href="learning-records/0003-lesson-set-completed.md">
+          <span class="item-num">LR3</span>
+          <div>
+            <span class="item-title">Lesson set completed</span>
+            <div class="item-meta">All lessons authored against the mission</div>
+          </div>
+        </a>
+      </li>
     </ul>
   </div>
 
