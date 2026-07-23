@@ -15,3 +15,17 @@ Primary sources:
 - Microsoft Learn, "Prerequisites, restrictions, and recommendations for Always On availability groups": the domain administrator needs to manually register an SPN for the VNN of the AG listener.
 - Microsoft Learn, "Register a Service Principal Name for Kerberos connections": automatic SPN registration is for the local SQL Server service; listener SPNs are registered manually.
 - Microsoft Learn, "Using Kerberos Configuration Manager for SQL Server": in clustered environments, automatic SPN registration is not recommended.
+
+## Required privileges for listener SPN registration
+
+The listener SPN is registered on the shared SQL Server service account (gMSA or domain user), not on the listener's Virtual Computer Object.
+
+Three ways to get the rights to run `setspn -S MSSQLSvc/AgListener.corp.local:1433 CORP\sqlsvc$`:
+
+| Path | Required privilege |
+|------|-------------------|
+| Domain Admin | Full control over AD objects; can register on any account. |
+| Account Operator | Can create/modify computer and user accounts; can run `setspn`. |
+| Delegated (preferred) | Grant on the specific service account: `Validated write to service principal name`, `Read servicePrincipalName`, and `Write servicePrincipalName`. |
+
+The Microsoft-recommended minimum for production is delegation on the specific service account rather than granting Domain Admin. The SQL Server service account itself does not need listener-SPN self-registration rights because SQL Server does not auto-register listener SPNs at startup.

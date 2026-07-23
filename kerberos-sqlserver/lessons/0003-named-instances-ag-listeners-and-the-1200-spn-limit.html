@@ -53,7 +53,27 @@ setspn -S MSSQLSvc/sql02.corp.local:1433        CORP\sqlsvc$</code></pre>
 
   <div class="callout info">
     <div class="label">Auto-registration does not cover listeners</div>
-    <p>Even when the SQL Server service account (or gMSA) has permission to register its own SPNs, SQL Server only auto-registers SPNs for the <em>local instance's host name and port</em>. The AG listener SPN must be registered manually with <code>setspn</code> by someone with rights to modify the service account in AD — typically a domain administrator. Microsoft explicitly documents this for Always On listeners.</p>
+    <p>Even when the SQL Server service account (or gMSA) has permission to register its own SPNs, SQL Server only auto-registers SPNs for the <em>local instance's host name and port</em>. The AG listener SPN must be registered manually with <code>setspn</code> by someone with rights to modify the service account in AD. Microsoft explicitly documents this for Always On listeners.</p>
+  </div>
+
+  <h3>2.1 Who can register the listener SPN?</h3>
+
+  <p>The SPN is written on the shared SQL Server service account, not on the listener's Virtual Computer Object. You need permission to modify <code>servicePrincipalName</code> on that account. The three practical paths are:</p>
+
+  <table>
+    <thead>
+      <tr><th>Path</th><th>Required privilege</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Domain Admin</td><td>Full control over AD objects.</td></tr>
+      <tr><td>Account Operator</td><td>Can create/modify accounts and run <code>setspn</code>.</td></tr>
+      <tr><td>Delegated (preferred)</td><td>On the specific service account: <code>Validated write to service principal name</code>, plus <code>Read servicePrincipalName</code> and <code>Write servicePrincipalName</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="label">Practical Tip</div>
+    <p>For production, ask your AD team to delegate the three SPN permissions on the gMSA instead of handing out Domain Admin. The SQL Server service account itself does not need listener-SPN self-registration rights — SQL Server never auto-registers listener SPNs anyway.</p>
   </div>
 
   <div class="callout key">
