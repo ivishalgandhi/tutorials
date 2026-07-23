@@ -58,7 +58,12 @@
     </thead>
     <tbody>
       <tr><td>List SPNs for an account</td><td><code>setspn -L DOMAIN\AccountName$</code></td></tr>
-      <tr><td>Search for duplicate SPNs</td><td><code>setspn -X</code></td></tr>
+      <tr><td>Search for duplicate SPNs in current domain</td><td><code>setspn -X</code></td></tr>
+      <tr><td>Search for duplicate SPNs across the forest</td><td><code>setspn -F -X</code></td></tr>
+      <tr><td>Search duplicates in a specific domain</td><td><code>setspn -T domain.example -X</code></td></tr>
+      <tr><td>Query a specific SPN in current domain</td><td><code>setspn -Q MSSQLSvc/FQDN:port</code></td></tr>
+      <tr><td>Query a specific SPN across the forest</td><td><code>setspn -F -Q MSSQLSvc/FQDN:port</code></td></tr>
+      <tr><td>Query a specific SPN in one domain</td><td><code>setspn -T domain.example -Q MSSQLSvc/FQDN:port</code></td></tr>
       <tr><td>Add an SPN only if unique</td><td><code>setspn -S MSSQLSvc/FQDN:port DOMAIN\AccountName$</code></td></tr>
       <tr><td>Delete an SPN</td><td><code>setspn -D MSSQLSvc/FQDN:port DOMAIN\AccountName$</code></td></tr>
       <tr><td>List keytab principals</td><td><code>klist -k /path/to/postgres.keytab</code></td></tr>

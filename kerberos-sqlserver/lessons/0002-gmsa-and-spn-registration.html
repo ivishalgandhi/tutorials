@@ -117,11 +117,32 @@ setspn -S MSSQLSvc/aglistener.corp.local CORP\sqlsvc$</code></pre>
   <pre><code><span class="cm"># List SPNs on the gMSA</span>
 setspn -L CORP\sqlsvc$
 
-<span class="cm"># Check for duplicates</span>
+<span class="cm"># Check for duplicates in the current domain</span>
 setspn -X
+
+<span class="cm"># Query a specific SPN across the entire forest (useful for multi-domain environments)</span>
+setspn -F -Q MSSQLSvc/sql01.corp.local:1433
 
 <span class="cm"># Restart SQL Server and watch the error log for the registration message</span>
 <span class="cm"># "The SQL Server Network Interface library successfully registered ..."</span></code></pre>
+
+  <h3>5.1 Discovering SPNs across domains</h3>
+
+  <p>In a single-domain forest, <code>setspn -X</code> and <code>setspn -Q</code> look at your own domain by default. In a multi-domain forest you often need to target a specific domain. Use the <code>-T</code> switch with the DNS name of the domain you want to query:</p>
+
+  <pre><code><span class="cm"># List every SPN registered in a specific trusted domain</span>
+setspn -T eu.corp.local -Q */*
+
+<span class="cm"># Look for duplicate SPNs in a specific domain</span>
+setspn -T eu.corp.local -X
+
+<span class="cm"># Find every MSSQLSvc SPN in a specific domain</span>
+setspn -T eu.corp.local -Q MSSQLSvc/*</code></pre>
+
+  <div class="callout info">
+    <div class="label">Info</div>
+    <p>The <code>-T</code> switch is not emphasized in current Microsoft Learn docs, but it is widely used in the field to scope SPN discovery to one domain instead of running a heavy forest-wide query. For a full forest search, combine <code>-F</code> with <code>-Q</code> or <code>-X</code>. In very large forests, <code>setspn -X -F</code> can time out; targeting one domain with <code>-T</code> is often faster and gentler on the Global Catalog.</p>
+  </div>
 
   <p>Then test a remote connection and check the DMV:</p>
 
