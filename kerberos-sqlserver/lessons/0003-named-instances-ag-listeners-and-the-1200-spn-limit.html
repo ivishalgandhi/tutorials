@@ -51,6 +51,11 @@ setspn -S MSSQLSvc/AgListener.corp.local      CORP\sqlsvc$
 setspn -S MSSQLSvc/sql01.corp.local:1433        CORP\sqlsvc$
 setspn -S MSSQLSvc/sql02.corp.local:1433        CORP\sqlsvc$</code></pre>
 
+  <div class="callout info">
+    <div class="label">Auto-registration does not cover listeners</div>
+    <p>Even when the SQL Server service account (or gMSA) has permission to register its own SPNs, SQL Server only auto-registers SPNs for the <em>local instance's host name and port</em>. The AG listener SPN must be registered manually with <code>setspn</code> by someone with rights to modify the service account in AD — typically a domain administrator. Microsoft explicitly documents this for Always On listeners.</p>
+  </div>
+
   <div class="callout key">
     <div class="label">Key Concept</div>
     <p>During a failover, the listener DNS record points to the new primary. The SPN does not move; the account running SQL Server on the new primary already owns it. No SPN change is required at failover time if all replicas share the gMSA and the listener SPNs are already registered.</p>
@@ -112,6 +117,8 @@ klist -k /etc/postgresql/16/main/postgres.keytab</code></pre>
     <div class="ps-label">Primary Sources</div>
     <strong>Microsoft Learn — Listeners and Kerberos (SPNs):</strong>
     <a href="https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/listeners-client-connectivity-application-failover?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../listeners-client-connectivity-application-failover</a><br><br>
+    <strong>Microsoft Learn — Register a Service Principal Name for Kerberos Connections:</strong>
+    <a href="https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/register-a-service-principal-name-for-kerberos-connections?view=sql-server-ver17" target="_blank">learn.microsoft.com/.../register-a-service-principal-name-for-kerberos-connections</a><br><br>
     <strong>Microsoft TechCommunity — Service Principal Name Attribute Limitations:</strong>
     <a href="https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/service-principal-name-attribute-limitations/ba-p/257489" target="_blank">techcommunity.microsoft.com/.../service-principal-name-attribute-limitations</a>
   </div>
